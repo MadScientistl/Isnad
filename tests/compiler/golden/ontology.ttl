@@ -1,15 +1,41 @@
+@prefix geo: <http://www.opengis.net/ont/geosparql#> .
 @prefix owl: <http://www.w3.org/2002/07/owl#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
 @prefix sc: <https://example.org/sc#> .
 
 <https://example.org/sc> a owl:Ontology .
 
-sc:Warehouse a owl:Class ;
-    rdfs:subClassOf sc:Facility .
+sc:PurchaseOrder a owl:Class .
+
+sc:affects a owl:ObjectProperty ;
+    rdfs:domain sc:Event ;
+    rdfs:range sc:Port .
+
+sc:billed_by a owl:ObjectProperty ;
+    rdfs:domain sc:Invoice ;
+    rdfs:range sc:Supplier .
+
+sc:invoices_for a owl:ObjectProperty ;
+    rdfs:domain sc:Invoice ;
+    rdfs:range sc:Shipment .
+
+sc:location a owl:DatatypeProperty ;
+    rdfs:range geo:wktLiteral .
 
 sc:operated_by a owl:ObjectProperty ;
     rdfs:domain sc:Shipment ;
     rdfs:range sc:Carrier .
+
+sc:position a owl:DatatypeProperty ;
+    rdfs:range geo:wktLiteral .
+
+sc:ships_from a owl:ObjectProperty ;
+    rdfs:domain sc:Shipment ;
+    rdfs:range sc:Facility .
+
+sc:ships_to a owl:ObjectProperty ;
+    rdfs:domain sc:Shipment ;
+    rdfs:range sc:Warehouse .
 
 sc:ships_via a owl:ObjectProperty ;
     rdfs:domain sc:Shipment ;
@@ -17,7 +43,9 @@ sc:ships_via a owl:ObjectProperty ;
 
 sc:Carrier a owl:Class .
 
-sc:Port a owl:Class ;
+sc:Event a owl:Class .
+
+sc:Warehouse a owl:Class ;
     rdfs:subClassOf sc:Facility .
 
 sc:supplied_by a owl:ObjectProperty,
@@ -31,6 +59,11 @@ sc:supplies a owl:ObjectProperty,
     rdfs:domain sc:Supplier ;
     rdfs:range sc:Supplier ;
     owl:inverseOf sc:supplied_by .
+
+sc:Invoice a owl:Class .
+
+sc:Port a owl:Class ;
+    rdfs:subClassOf sc:Facility .
 
 sc:Facility a owl:Class .
 

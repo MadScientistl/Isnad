@@ -50,7 +50,7 @@ def generate(seed: int = 1, scale: float = 1.0) -> Dataset:
     d.objects["Warehouse"] = [(uid(), {"name": f"WH {k}", "lat": rnd.uniform(-60, 60), "lon": rnd.uniform(-180, 180)})
                               for k in range(n_wh)]
     d.objects["Carrier"] = [(i, {"name": f"Carrier {k}"}) for k, i in enumerate(cars)]
-    d.objects["Shipment"] = [(i, {"ref": f"SH-{k:07d}", "status": rnd.choice(["planned", "in_transit", "delivered"])})
+    d.objects["Shipment"] = [(i, {"ref": f"SH-{k:07d}", "status": rnd.choice(["planned", "in_transit", "arrived"])})
                              for k, i in enumerate(ships)]
     sl = []
     pos = 0

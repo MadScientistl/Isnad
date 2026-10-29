@@ -68,7 +68,7 @@ def test_shacl_detects_violation(conn):
     bt.write_object(conn, "Carrier", car, {"name": "c"}, T0, "t")
     bt.write_object(conn, "Port", port, {"name": "p", "lat": 1.0, "lon": 2.0, "status": "open"}, T0, "t")
     for s in (s_ok, s_bad):
-        bt.write_object(conn, "Shipment", s, {"ref": str(s), "status": "x"}, T0, "t")
+        bt.write_object(conn, "Shipment", s, {"ref": str(s), "status": "planned"}, T0, "t")
         bt.write_link(conn, "ships_via", s, port, T0, "t")
     bt.write_link(conn, "operated_by", s_ok, car, T0, "t")  # s_bad lacks required carrier
     conn.commit()

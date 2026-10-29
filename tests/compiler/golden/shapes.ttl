@@ -10,32 +10,107 @@ sc:CarrierShape a sh:NodeShape ;
             sh:path sc:name ] ;
     sh:targetClass sc:Carrier .
 
-sc:PortShape a sh:NodeShape ;
-    sh:property [ sh:datatype xsd:double ;
+sc:EventShape a sh:NodeShape ;
+    sh:property [ sh:datatype xsd:string ;
             sh:maxCount 1 ;
-            sh:path sc:lon ],
+            sh:path sc:note ],
+        [ sh:datatype xsd:string ;
+            sh:maxCount 1 ;
+            sh:minCount 1 ;
+            sh:path sc:kind ],
+        [ sh:datatype xsd:dateTime ;
+            sh:maxCount 1 ;
+            sh:path sc:ended ],
+        [ sh:datatype xsd:string ;
+            sh:in ( "low" "medium" "high" ) ;
+            sh:maxCount 1 ;
+            sh:path sc:severity ],
+        [ sh:datatype xsd:dateTime ;
+            sh:maxCount 1 ;
+            sh:path sc:started ] ;
+    sh:targetClass sc:Event .
+
+sc:InvoiceShape a sh:NodeShape ;
+    sh:property [ sh:datatype xsd:string ;
+            sh:maxCount 1 ;
+            sh:path sc:currency ],
+        [ sh:datatype xsd:string ;
+            sh:in ( "open" "approved" "paid" "flagged" ) ;
+            sh:maxCount 1 ;
+            sh:path sc:status ],
+        [ sh:maxCount 1 ;
+            sh:path sc:invoices_for ],
+        [ sh:datatype xsd:double ;
+            sh:maxCount 1 ;
+            sh:minCount 1 ;
+            sh:path sc:amount ],
+        [ sh:datatype xsd:string ;
+            sh:maxCount 1 ;
+            sh:path sc:anomaly ],
+        [ sh:maxCount 1 ;
+            sh:path sc:billed_by ],
+        [ sh:datatype xsd:dateTime ;
+            sh:maxCount 1 ;
+            sh:path sc:due ],
+        [ sh:datatype xsd:string ;
+            sh:maxCount 1 ;
+            sh:minCount 1 ;
+            sh:path sc:ref ] ;
+    sh:targetClass sc:Invoice .
+
+sc:PortShape a sh:NodeShape ;
+    sh:property [ sh:datatype xsd:string ;
+            sh:in ( "open" "closed" ) ;
+            sh:maxCount 1 ;
+            sh:path sc:status ],
         [ sh:datatype xsd:string ;
             sh:maxCount 1 ;
             sh:minCount 1 ;
             sh:path sc:name ],
-        [ sh:datatype xsd:string ;
-            sh:in ( "open" "closed" ) ;
-            sh:maxCount 1 ;
-            sh:path sc:status ],
         [ sh:datatype xsd:double ;
             sh:maxCount 1 ;
-            sh:path sc:lat ] ;
+            sh:path sc:lat ],
+        [ sh:datatype xsd:double ;
+            sh:maxCount 1 ;
+            sh:path sc:lon ] ;
     sh:targetClass sc:Port .
 
-sc:ShipmentShape a sh:NodeShape ;
+sc:PurchaseOrderShape a sh:NodeShape ;
     sh:property [ sh:datatype xsd:string ;
+            sh:maxCount 1 ;
+            sh:path sc:status ],
+        [ sh:datatype xsd:string ;
             sh:maxCount 1 ;
             sh:minCount 1 ;
             sh:path sc:ref ],
-        [ sh:maxCount 1 ;
+        [ sh:datatype xsd:double ;
+            sh:maxCount 1 ;
+            sh:path sc:amount ] ;
+    sh:targetClass sc:PurchaseOrder .
+
+sc:ShipmentShape a sh:NodeShape ;
+    sh:property [ sh:maxCount 1 ;
             sh:minCount 1 ;
             sh:path sc:operated_by ],
         [ sh:datatype xsd:string ;
+            sh:maxCount 1 ;
+            sh:minCount 1 ;
+            sh:path sc:ref ],
+        [ sh:datatype xsd:double ;
+            sh:maxCount 1 ;
+            sh:path sc:progress ],
+        [ sh:maxCount 1 ;
+            sh:path sc:ships_from ],
+        [ sh:datatype xsd:double ;
+            sh:maxCount 1 ;
+            sh:path sc:delay_hours ],
+        [ sh:datatype xsd:double ;
+            sh:maxCount 1 ;
+            sh:path sc:cargo_value ],
+        [ sh:maxCount 1 ;
+            sh:path sc:ships_to ],
+        [ sh:datatype xsd:string ;
+            sh:in ( "planned" "in_transit" "delayed" "arrived" ) ;
             sh:maxCount 1 ;
             sh:path sc:status ],
         [ sh:datatype xsd:dateTime ;
@@ -46,23 +121,23 @@ sc:ShipmentShape a sh:NodeShape ;
 sc:SupplierShape a sh:NodeShape ;
     sh:property [ sh:datatype xsd:string ;
             sh:maxCount 1 ;
-            sh:minCount 1 ;
-            sh:path sc:name ],
+            sh:path sc:country ],
         [ sh:datatype xsd:string ;
             sh:maxCount 1 ;
-            sh:path sc:country ] ;
+            sh:minCount 1 ;
+            sh:path sc:name ] ;
     sh:targetClass sc:Supplier .
 
 sc:WarehouseShape a sh:NodeShape ;
     sh:property [ sh:datatype xsd:double ;
             sh:maxCount 1 ;
             sh:path sc:lat ],
-        [ sh:datatype xsd:double ;
-            sh:maxCount 1 ;
-            sh:path sc:lon ],
         [ sh:datatype xsd:string ;
             sh:maxCount 1 ;
             sh:minCount 1 ;
-            sh:path sc:name ] ;
+            sh:path sc:name ],
+        [ sh:datatype xsd:double ;
+            sh:maxCount 1 ;
+            sh:path sc:lon ] ;
     sh:targetClass sc:Warehouse .
 

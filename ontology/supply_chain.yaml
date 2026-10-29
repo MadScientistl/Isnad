@@ -6,11 +6,75 @@ classes:
   Warehouse: {extends: Facility}
 objectTypes:
   Supplier:  {properties: {name: "string!", country: string}}
-  Port:      {properties: {name: "string!", lat: float, lon: float, status: {enum: [open, closed]}}}
-  Warehouse: {properties: {name: "string!", lat: float, lon: float}}
-  Shipment:  {properties: {ref: "string!", eta: timestamp, status: string}}
+  Port:      {properties: {name: "string!", lat: float, lon: float, location: point, status: {enum: [open, closed]}}}
+  Warehouse: {properties: {name: "string!", lat: float, lon: float, location: point}}
+  Shipment:
+    properties:
+      ref: "string!"
+      eta: timestamp
+      status: {enum: [planned, in_transit, delayed, arrived]}
+      position: point
+      progress: float
+      cargo_value: float
+      delay_hours: float
   Carrier:   {properties: {name: "string!"}}
+  Invoice:
+    properties:
+      ref: "string!"
+      amount: "float!"
+      currency: string
+      status: {enum: [open, approved, paid, flagged]}
+      due: timestamp
+      anomaly: string
+  PurchaseOrder: {properties: {ref: "string!", amount: float, status: string}}
+  Event:
+    properties:
+      kind: "string!"
+      severity: {enum: [low, medium, high]}
+      started: timestamp
+      ended: timestamp
+      note: string
 linkTypes:
   ships_via:   {from: Shipment, to: Port,     cardinality: many-to-many}
   supplies:    {from: Supplier, to: Supplier, cardinality: many-to-many, transitive: true, inverse: supplied_by}
   operated_by: {from: Shipment, to: Carrier,  cardinality: many-to-one, required: true}
+  ships_from:  {from: Shipment, to: Facility, cardinality: many-to-one}
+  ships_to:    {from: Shipment, to: Warehouse, cardinality: many-to-one}
+  invoices_for: {from: Invoice, to: Shipment, cardinality: many-to-one}
+  billed_by:   {from: Invoice,  to: Supplier, cardinality: many-to-one}
+  affects:     {from: Event,    to: Port,     cardinality: many-to-many}
+actions:
+  create_object:
+    description: Create an object of any type (generic, used by REST).
+    params: {type: "string!", id: uuid, props: string!}
+  update_object:
+    description: Replace properties of an object.
+    params: {type: "string!", id: "uuid!", props: string!}
+  delete_object:
+    description: End an object's validity.
+    params: {type: "string!", id: "uuid!"}
+  create_link:
+    params: {link: "string!", src: "uuid!", dst: "uuid!"}
+  end_link:
+    params: {link: "string!", src: "uuid!", dst: "uuid!"}
+  ship_depart:
+    description: Shipment leaves origin and becomes in_transit.
+    params: {shipment: "uuid!"}
+  ship_position:
+    description: Update a shipment's position and progress.
+    params: {shipment: "uuid!", position: "point!", progress: "float!"}
+  ship_arrive:
+    description: Shipment arrives at destination.
+    params: {shipment: "uuid!"}
+  delay_shipment:
+    params: {shipment: "uuid!", delay_hours: "float!", reason: string}
+  close_port:
+    params: {port: "uuid!", reason: string, duration_h: float}
+  reopen_port:
+    params: {port: "uuid!"}
+  issue_invoice:
+    params: {shipment: "uuid!", supplier: "uuid!", amount: "float!", currency: string, due: timestamp}
+  flag_invoice:
+    params: {invoice: "uuid!", anomaly: "string!"}
+  pay_invoice:
+    params: {invoice: "uuid!"}
