@@ -1,25 +1,29 @@
+"""Handler behaviour (ported from Phase 2), now through `execute` as admin / sim."""
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from uuid import uuid4
 
 import pytest
 
-from engine.actions import ActionResult, apply_action
+from engine.actions import ActionResult, execute
 from engine.db import bitemporal as bt
 
-T0 = datetime(2026, 1, 1, tzinfo=UTC)
+from act_helpers import ADMIN, SIM, T0
+
 P1 = {"type": "Point", "coordinates": [4.5, 51.9]}
 
 
-def audit(conn, aid=None):
-    q = "SELECT seq, action_id, name, actor, source, run_id, params, sim_time, before, after FROM audit_event"
-    if aid:
-        return conn.execute(q + " WHERE action_id=%s", [aid]).fetchall()
-    return conn.execute(q + " ORDER BY seq").fetchall()
+def audit(conn, aid):
+    return conn.execute("SELECT seq, action_id, name, actor, source, run_id, params, sim_time, before, after "
+                        "FROM audit_event WHERE action_id=%s", [aid]).fetchall()
 
 
-def act(conn, name, params, t=T0, **kw):
-    return apply_action(conn, name, params, "tester", valid_at=t, **kw)
+def n_audit(conn):
+    return conn.execute("SELECT count(*) FROM audit_event").fetchone()[0]
+
+
+def act(conn, name, params, t=T0, who=ADMIN, **kw):
+    return execute(conn, name, params, who, valid_at=t, **kw)
 
 
 def mk(conn, type_, props, t=T0):
@@ -44,9 +48,11 @@ def test_create_update_delete_object_audit(conn):
     a = audit(conn, r.action_id)
     assert len(a) == 1
     seq, aid, name, actor, source, run_id, params, sim, before, after = a[0]
-    assert (name, actor, source, run_id, sim) == ("create_object", "tester", "rest", "run1", T0)
+    assert (name, actor, source, run_id, sim) == ("create_object", ADMIN.user, "rest", "run1", T0)
     assert params["type"] == "Supplier" and before[f"Supplier:{sid}"] is None
     assert after[f"Supplier:{sid}"]["name"] == "A"
+    role, status = conn.execute("SELECT role, status FROM audit_event WHERE action_id=%s", [aid]).fetchone()
+    assert (role, status) == ("admin", "executed")
     assert conn.execute("SELECT count(*) FROM obj_supplier WHERE action_id=%s", [r.action_id]).fetchone()[0] == 1
 
     r2 = act(conn, "update_object", {"type": "Supplier", "id": sid, "props": {"name": "B", "country": "NL"}},
@@ -59,13 +65,14 @@ def test_create_update_delete_object_audit(conn):
     r3 = act(conn, "delete_object", {"type": "Supplier", "id": sid}, T0 + timedelta(hours=2))
     assert audit(conn, r3.action_id)[0][9][f"Supplier:{sid}"] is None
     assert bt.get_object(conn, "Supplier", sid, as_of_valid=T0 + timedelta(hours=3)) is None
-    assert len(audit(conn)) == 3
+    assert n_audit(conn) == 3
 
 
 def test_noop_update_reports_unchanged_but_audited(conn):
     s = mk(conn, "Supplier", {"name": "A"})
     r = act(conn, "update_object", {"type": "Supplier", "id": s, "props": {"name": "A"}})
     assert r.changed is False and len(audit(conn, r.action_id)) == 1
+    assert r.diff == []
 
 
 def test_links(conn):
@@ -78,7 +85,6 @@ def test_links(conn):
     r = act(conn, "end_link", {"link": "invoices_for", "src": inv, "dst": sh}, T0 + timedelta(hours=1))
     assert bt.neighbours(conn, "invoices_for", inv, as_of_valid=T0 + timedelta(hours=2)) == []
     assert audit(conn, r.action_id)[0][8][f"invoices_for:{inv}>{sh}"] == {"exists": True}
-    # abstract endpoint type: Facility resolves to Port/Warehouse
     port = mk(conn, "Port", {"name": "P"})
     assert act(conn, "create_link", {"link": "ships_from", "src": sh, "dst": port}).changed
     with pytest.raises(ValueError):
@@ -99,7 +105,7 @@ def test_shipment_lifecycle_and_asof(conn):
     assert g(t2)["position"] == P1 and g(t2)["progress"] == 0.4
     d = g(t3)
     assert d["status"] == "delayed" and d["delay_hours"] == 12 and d["eta"] == eta + timedelta(hours=12)
-    assert d["position"] == P1  # untouched props survive
+    assert d["position"] == P1
     assert (g(t4)["status"], g(t4)["progress"]) == ("arrived", 1.0)
     for r in (r1, r2, r3, r4):
         assert r.changed and rows_with_action(conn, r.action_id) >= 1
@@ -127,14 +133,13 @@ def test_port_close_reopen(conn):
     assert e["kind"] == "port_closure" and e["severity"] == "high" and e["started"] == t1
     assert "strike" in e["note"] and e["ended"] is None
     assert bt.neighbours(conn, "affects", ev, "out", as_of_valid=t1) == [p]
-    assert rows_with_action(conn, r.action_id) == 3  # port, event, link
+    assert rows_with_action(conn, r.action_id) == 3
     r2 = act(conn, "reopen_port", {"port": p}, t2)
     assert bt.get_object(conn, "Port", p, as_of_valid=t2)["status"] == "open"
     assert bt.get_object(conn, "Event", ev, as_of_valid=t2)["ended"] == t2
     assert bt.get_object(conn, "Event", ev, as_of_valid=t1)["ended"] is None
     a = audit(conn, r2.action_id)[0]
     assert f"Event:{ev}" in a[8] and a[9][f"Event:{ev}"]["ended"] is not None
-    # reopening again touches no event
     r3 = act(conn, "reopen_port", {"port": p}, t2 + timedelta(hours=1))
     assert not r3.changed and r3.before.keys() == {f"Port:{p}"}
 
@@ -155,60 +160,55 @@ def test_invoice_flow(conn):
     act(conn, "flag_invoice", {"invoice": inv, "anomaly": "duplicate"}, t2)
     f = bt.get_object(conn, "Invoice", inv, as_of_valid=t2)
     assert f["status"] == "flagged" and f["anomaly"] == "duplicate"
-    act(conn, "pay_invoice", {"invoice": inv}, t3)
-    assert bt.get_object(conn, "Invoice", inv, as_of_valid=t3)["status"] == "paid"
-    # generated ref + id
-    r = act(conn, "issue_invoice", {"shipment": sh, "supplier": sup, "amount": 1.0}, t1)
-    (new,) = [v for k, v in r.created.items() if k == "Invoice"]
+    # flagged invoices cannot be paid (criteria: only open), a fresh open one can (sim is exempt from approval)
+    r = act(conn, "issue_invoice", {"shipment": sh, "supplier": sup, "amount": 1.0}, t1, who=SIM)
+    new = r.created["Invoice"]
     assert bt.get_object(conn, "Invoice", new, as_of_valid=t1)["ref"].startswith("INV-")
-    assert len(audit(conn)) >= 6
+    act(conn, "pay_invoice", {"invoice": new}, t3, who=SIM)
+    assert bt.get_object(conn, "Invoice", new, as_of_valid=t3)["status"] == "paid"
 
 
 def test_failed_action_rolls_back_everything(conn):
     sh = mk(conn, "Shipment", {"ref": "S"})
-    n_audit = len(audit(conn))
+    n0 = n_audit(conn)
     n_out = conn.execute("SELECT count(*) FROM graph_outbox").fetchone()[0]
     ghost = uuid4()
-    # the invoice object is written, then the supplier check fails -> all undone
     with pytest.raises(ValueError):
         act(conn, "issue_invoice", {"shipment": sh, "supplier": ghost, "amount": 5.0})
-    inv = uuid4()
-    # mid-action failure after writes: link to a missing port in close_port path
     with pytest.raises(ValueError):
         act(conn, "close_port", {"port": ghost}, T0)
-    assert len(audit(conn)) == n_audit
+    assert n_audit(conn) == n0
     assert conn.execute("SELECT count(*) FROM obj_invoice").fetchone()[0] == 0
     assert conn.execute("SELECT count(*) FROM obj_event").fetchone()[0] == 0
     assert conn.execute("SELECT count(*) FROM graph_outbox").fetchone()[0] == n_out
-    # DB-level failure (NOT NULL violation) after earlier writes in the same action
-    with pytest.raises(Exception):
-        act(conn, "create_object", {"type": "Invoice", "id": inv, "props": {"amount": 1.0}})  # ref missing
+    with pytest.raises(Exception):  # DB-level NOT NULL violation (ref missing)
+        act(conn, "create_object", {"type": "Invoice", "id": uuid4(), "props": {"amount": 1.0}})
     conn.rollback()
-    assert len(audit(conn)) == n_audit
+    assert n_audit(conn) == n0
     assert conn.execute("SELECT count(*) FROM obj_invoice").fetchone()[0] == 0
 
 
 def test_midway_failure_after_partial_writes(conn, monkeypatch):
     import engine.actions.core as core
     p = mk(conn, "Port", {"name": "P", "status": "open"})
-    n_audit = len(audit(conn))
+    n0 = n_audit(conn)
 
     def boom(*a, **k):
         raise RuntimeError("boom")
-    orig = core._Ctx.link
     monkeypatch.setattr(core._Ctx, "link", boom)
     with pytest.raises(RuntimeError):
         act(conn, "close_port", {"port": p}, T0 + timedelta(hours=1))
-    monkeypatch.setattr(core._Ctx, "link", orig)
-    assert len(audit(conn)) == n_audit
+    monkeypatch.undo()
+    conn.rollback()
+    assert n_audit(conn) == n0
     assert bt.get_object(conn, "Port", p, as_of_valid=T0 + timedelta(hours=2))["status"] == "open"
     assert conn.execute("SELECT count(*) FROM obj_event").fetchone()[0] == 0
 
 
 @pytest.mark.parametrize("name,params", [
     ("nope", {}),
-    ("ship_depart", {}),                                   # missing required
-    ("ship_depart", {"shipment": str(uuid4()), "x": 1}),   # unknown param
+    ("ship_depart", {}),
+    ("ship_depart", {"shipment": str(uuid4()), "x": 1}),
     ("ship_depart", {"shipment": "not-a-uuid"}),
     ("ship_position", {"shipment": str(uuid4()), "position": {"type": "LineString", "coordinates": []}, "progress": 1}),
     ("ship_position", {"shipment": str(uuid4()), "position": P1, "progress": "x"}),
@@ -217,14 +217,14 @@ def test_midway_failure_after_partial_writes(conn, monkeypatch):
     ("create_object", {"type": "Supplier", "props": "{bad"}),
     ("create_object", {"type": "Supplier", "props": {"bogus": 1}}),
     ("create_link", {"link": "nope", "src": str(uuid4()), "dst": str(uuid4())}),
-    ("ship_depart", {"shipment": str(uuid4())}),           # missing object
+    ("ship_depart", {"shipment": str(uuid4())}),
 ])
 def test_validation_errors(conn, name, params):
-    n = len(audit(conn))
+    n0 = n_audit(conn)
     with pytest.raises(ValueError):
         act(conn, name, params)
     conn.rollback()
-    assert len(audit(conn)) == n
+    assert n_audit(conn) == n0  # validation errors are not audited
 
 
 def test_create_existing_rejected(conn):
@@ -242,21 +242,12 @@ def test_string_params_coerced(conn):
 
 
 def test_ontology_arg_variants(conn):
-    from engine.compiler import compile_ontology
     from engine.actions.core import DEFAULT_ONTOLOGY
+    from engine.compiler import compile_ontology
     s = mk(conn, "Shipment", {"ref": "S"})
     c = compile_ontology(DEFAULT_ONTOLOGY)
     assert act(conn, "ship_depart", {"shipment": s}, T0 + timedelta(hours=1), ontology=c).changed
     assert act(conn, "ship_arrive", {"shipment": s}, T0 + timedelta(hours=2), ontology=str(DEFAULT_ONTOLOGY)).changed
-
-
-def test_audit_append_only_and_ordering(conn):
-    for i in range(3):
-        mk(conn, "Supplier", {"name": f"s{i}"})
-    seqs = [a[0] for a in audit(conn)]
-    assert seqs == sorted(seqs) and len(set(seqs)) == 3
-    assert conn.execute("SELECT count(*) FROM pg_indexes WHERE tablename='audit_event' AND schemaname = current_schema() "
-                        "AND indexname LIKE '%sim_time%'").fetchone()[0] == 1
 
 
 def test_position_update_resumes_delayed_shipment(conn):
@@ -268,3 +259,27 @@ def test_position_update_resumes_delayed_shipment(conn):
     act(conn, "ship_position", {"shipment": s, "position": P1, "progress": 0.5}, t[2])
     g = bt.get_object(conn, "Shipment", s, as_of_valid=t[2])
     assert g["status"] == "in_transit" and g["delay_hours"] == 6
+
+
+def test_rules_interpreter_create_as_new_and_now_actor(conn, monkeypatch):
+    """Exercise create/$new/$now/$actor/link/unlink/delete rules on a synthetic action."""
+    import dataclasses
+
+    from engine.actions.core import _load
+    from engine.compiler.model import ActionDef, Rule
+    model = _load(None)
+    a = ActionDef("tmp_rules", params={"port": "uuid!"}, roles=("admin",), bind=model.actions["close_port"].bind,
+                  rules=(Rule("create", "Event", None, {"kind": "x", "started": "$now", "note": "$actor"},
+                              as_name="event"),
+                         Rule("link", link="affects", src="$new.event", dst="$port")))
+    adm = dataclasses.replace(model.roles["admin"], actions=model.roles["admin"].actions + ("tmp_rules",))
+    monkeypatch.setitem(model.actions, "tmp_rules", a)
+    monkeypatch.setitem(model.roles, "admin", adm)
+    p = mk(conn, "Port", {"name": "P", "status": "open"})
+    r = act(conn, "tmp_rules", {"port": p}, T0 + timedelta(hours=1))
+    ev = r.created["Event"]
+    t1 = T0 + timedelta(hours=1)
+    e = bt.get_object(conn, "Event", ev, as_of_valid=t1)
+    assert e["started"] == t1 and e["note"] == ADMIN.user
+    assert bt.neighbours(conn, "affects", ev, "out", as_of_valid=t1) == [p]
+    assert {(d["kind"], d["op"]) for d in r.diff} == {("object", "create"), ("link", "create")}

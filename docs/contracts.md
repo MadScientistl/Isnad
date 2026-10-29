@@ -68,3 +68,81 @@ Object types: `Invoice` (ref!, amount float!, currency string, status enum[open,
 - `POST /sim/control`: a non-paused speed starts the runner thread, `paused` stops it. `reset` is refused (403) unless `AMARH_ALLOW_RESET=1`; when allowed it truncates obj_*, link_*, graph_outbox and audit_event in the API's schema, reseeds, rebuilds the sync store and resets the runner.
 - The API creates its `SyncPipeline` lazily, syncs and reasons once on first use, and `/graph` (live) syncs again so rows written by another process (headless sim) appear.
 - Benchmark on the PostGIS schema: `bench/results/report_phase2.md` (materialize 18.35 s, 4-hop p95 0.211 s, SHACL 0.30 s, all PASS).
+
+# Phase 3 contracts (owned by the main session; frozen before implementation)
+
+Decisions taken (user accepted defaults): D1 rollback = compensating action; D2 webhook failure never reverts data or graph (retry, dead-letter, manual retry); D3 proposer != approver; D4 current visibility of an object id decides access to all its versions (row filters also apply to the version); D5 SPARQL aggregates rejected for non-admin; D6 inferred edge visible if >= 1 derivation has every supporting fact visible; D7 seed = privileged loader audited as ONE `seed` execution, reset keeps audit; D8 `region` property on Port, Warehouse (enum APAC|EMEA|AMER, assigned by longitude in seed); D9 no hash chain.
+
+## Roles (YAML, top level `roles:`; deny by default)
+```yaml
+roles:
+  planner:
+    description: ...
+    types:                      # absent type = no access
+      Shipment: {read: true, write: true}
+      Invoice:  {read: false}
+      Supplier: {read: true, mask: [country]}      # mask: properties returned as null
+      Port:     {read: true, where: "region = $region"}   # row filter; $region = role.region
+    links: [ships_via, ...] | all                  # readable link types (both endpoints must also be visible)
+    actions: [delay_shipment, ...]                 # may execute (or propose)
+    approves: [action, ...]                        # may approve proposals of these actions
+    region: EMEA                                   # optional, value of $region
+```
+Roles: `planner`, `finance_analyst`, `regional_ops_lead` (region EMEA, row filters on Port/Warehouse by `region`, Shipment via `exists(ships_to, Warehouse: region = $region)`), `admin` (everything, approves everything), `sim` (system role: only the sim action set; never selectable from the UI). The old role name `analyst` is removed.
+Row-filter DSL (compiler parses, no eval, identifiers validated): `prop (=|!=|<|<=|>|>=) (literal|$region)`, `prop in (..)`, `is null`, `and|or|not`, parentheses, and `exists(<link>, <Type>: <expr>)` (outbound link, current version of target). Unknown names fail compile.
+
+## Postgres enforcement
+- DB roles (global, created idempotently): `amarh_app` NOLOGIN, no BYPASSRLS, not owner. Owner/loader/migrations use the connection user (superuser in dev); owner-owned `SECURITY DEFINER` helper functions (`SET search_path FROM CURRENT` at creation) answer "is object id currently visible" so policies avoid self-recursion.
+- Per-request identity (set inside the request transaction): `SET LOCAL ROLE amarh_app; SELECT set_config('amarh.role', <role>, true), set_config('amarh.user', <user>, true), set_config('amarh.region', <region|''>, true)`; also `statement_timeout=5s`, `lock_timeout=2s`. Unset or unknown `amarh.role` => zero rows, writes denied (fail closed).
+- Every `obj_*`, `link_*`, governance table: `ENABLE` + `FORCE ROW LEVEL SECURITY`. Object policy: type readable for role AND the object id's CURRENT version satisfies the role's `where` (D4), applied to all versions. Write policies require `write: true` + filter. Link policy: link type readable AND both endpoint ids visible. `cur_*` views are `security_invoker`.
+- Masking: generated views `rd_obj_<t>` (all versions) and `rd_cur_obj_<t>` (current), `security_invoker`, masked columns are `CASE WHEN <role masks it> THEN NULL ELSE col END` keyed on `current_setting('amarh.role')`. `amarh_app` has SELECT on `rd_*` views and link tables; for base `obj_*` tables it has INSERT/UPDATE (closing ranges) only via the action engine path and SELECT only on non-masked types' columns it needs (engine reads use `rd_*`). Reads in `engine.db.bitemporal` take `masked: bool = True` (default) and read `rd_*`; the owner/loader passes `masked=False`.
+- Security tests assume `amarh_app` cannot UPDATE/DELETE/TRUNCATE audit tables and cannot write obj_/link_ tables outside the engine's grants.
+
+## Governance tables (file `engine/db/governance.sql`, per schema, idempotent, all append-only: BEFORE UPDATE/DELETE trigger raises; no UPDATE/DELETE/TRUNCATE grants; FORCE RLS; SELECT policy = admin all, other roles own rows (actor/proposer/approver = amarh.user) plus rows whose affected objects they can see for diff rows)
+- `audit_event` (= the EXECUTION table; name kept for compatibility with sim and `/events`). Existing columns kept (`seq, action_id, name, actor, source, run_id, params, sim_time, recorded_at, before, after`); added: `role text, on_behalf_of text, proposal_id uuid, status text default 'executed', tool_trace jsonb, parent_execution_id uuid` (set for rollback).
+- `proposal(id uuid pk, seq, action text, params jsonb, proposer, proposer_role, rationale text, dry_run jsonb, created_at, run_id, tool_trace)`; state is derived from approval rows (`approval(id, proposal_id, decision 'approved'|'rejected', approver, approver_role, comment, decided_at, execution_id uuid null)`); a proposal is pending iff it has no approval row.
+- `execution_diff(seq, action_id, kind 'object'|'link', type, key text, op 'create'|'modify'|'delete', before jsonb, after jsonb)`: one row per changed object/link (key = object id or `src>dst`). `audit_event.before/after` stay as the summary.
+- `rollback(id, original_action_id, rollback_action_id, actor, reason, at)`.
+- `webhook_outbox(id uuid pk, action_id, hook text, url text, payload jsonb, idempotency_key text unique, created_at)` plus `webhook_delivery(seq, outbox_id, attempt int, status 'pending'|'delivered'|'retry'|'dead', http_status int, error text, next_attempt_at, at)`: state = latest delivery row for an outbox id; "pending" row is written in the same transaction as the action. Worker uses `FOR UPDATE SKIP LOCKED` over the latest-row view `webhook_state`.
+- `inferred_support(link text, src uuid, dst uuid, derivation_no int, support uuid[] (all node ids involved), data_version bigint)`.
+- Python: `engine/db/principal.py`: `Principal(role, user, region)`, `scoped(conn, principal)` context manager issuing the SET LOCALs above (conn must be in a transaction), `OWNER` sentinel for loader code.
+
+## Actions (YAML)
+```yaml
+actions:
+  flag_invoice:
+    description: ...
+    params: {invoice: "uuid!", anomaly: "string!"}     # existing syntax; `uuid(Type)!` = uuid that must reference a visible object of Type
+    roles: [finance_analyst, admin, sim]               # may execute directly
+    approval: {required: false}                        # or {required: true, approvers: [admin]}; required => execute returns a proposal
+    bind: {inv: {type: Invoice, id: $invoice}}         # objects loaded (under the actor's RLS) for criteria
+    criteria:
+      - {expr: "inv.status != 'paid'", message: "Invoice is already paid"}
+    rules:                                             # applied in order, one transaction, via bitemporal engine
+      - modify: {type: Invoice, id: $invoice, set: {status: flagged, anomaly: $anomaly}}
+      - create: {as: event, type: Event, set: {kind: x, started: $now}}   # $new.event = generated uuid
+      - delete: {type: T, id: $x}
+      - link:   {link: l, src: $a, dst: $b}
+      - unlink: {link: l, src: $a, dst: $b}
+    function: close_port                               # alternative to rules: registered Python function (escape hatch)
+    webhooks: [notify_finance]
+    rollback: compensate | irreversible                # default compensate
+webhooks:
+  notify_finance: {url_env: AMARH_WEBHOOK_FINANCE_URL, method: POST, max_attempts: 5}   # missing env var => delivery marked dead with error "no url"
+```
+Expression language (no eval): `$param`, `$now`, `$actor`, `alias.prop`, literals, `== != < <= > >= in`, `and or not`, `is null`, `is not null`, `+ - * /`. Permission checks run in this order: role may execute action -> params valid -> binds visible under RLS (invisible = "not found") -> criteria -> rules, whose writes are further constrained by write RLS. A denial is audited as an `audit_event` row with `status='denied'` ONLY for permission/criteria failures on API/agent calls (not sim), no data writes.
+- Engine API (`engine/actions/`): `execute(conn, name, params, principal, *, valid_at, source='api', run_id=None, proposal_id=None, tool_trace=None, ontology=None) -> ActionResult` (replaces `apply_action`; `apply_action` kept as thin alias with `principal=Principal(actor-as-role...)` removed once callers migrate); `propose(conn, name, params, principal, rationale, ...) -> proposal_id`; `decide(conn, proposal_id, principal, approve: bool, comment)` (approve executes AS the approver, re-checking everything, D3: proposer != approver; admin can't bypass); `rollback(conn, action_id, principal, reason)` (D1: only if every affected object/link still equals the recorded `after`; else `RollbackConflict` listing keys); `dry_run(...)` returns the diff without committing. Errors: `PermissionDenied`, `CriteriaFailed(failures)`, `ValueError` (validation), `RollbackConflict`. `engine/actions/outbox.py`: `deliver_due(conn_factory, now=None) -> int`, `run_worker(stop_event, interval_s)`; header `Idempotency-Key`, body HMAC `X-Amarh-Signature` with `AMARH_WEBHOOK_SECRET`; backoff 2^n s * jitter up to `max_attempts`, then `dead`; manual retry writes a new `pending` delivery row.
+- Sim: calls `execute(..., Principal('sim','system:sim',''), source='sim')`; the sim event digest is unchanged for the same seed.
+- Seed: runs as OWNER, writes through `bt.*`, then inserts ONE `audit_event` (`name='seed'`, `source='seed'`, params = counts). `/sim/control reset` deletes obj_/link_/graph_outbox/inferred_support rows only, keeps all audit tables, inserts a `reset` audit event.
+
+## API (all routes get `Principal` from `x-role`; unknown/`sim` => 403; every handler runs inside `scoped()`)
+`GET /me` -> `{role, user, region, types:{T:{read,write,masked:[..]}}, actions:[..]}`; `GET /roles` -> selectable roles (no `sim`); `GET /actions?type=&id=` -> `[{name, description, params, requires_approval, allowed: bool, reason: str|null}]`; `POST /actions/{name}/execute {params, valid_at?}` -> 200 `{action_id, status:'executed', changed, webhooks:[..]}` | 202 `{proposal_id, status:'pending_approval'}` | 403 `{code:'permission_denied', detail}` | 422 `{code:'criteria_failed', failures:[{message}]}` or validation; `POST /actions/{name}/propose {params, rationale}` -> 201 `{proposal_id}`; `GET /proposals?state=pending|all`; `POST /proposals/{id}/approve|reject {comment}`; `GET /executions?limit&name&actor&status`, `GET /executions/{action_id}` -> `{execution, diff:[..], webhooks:[{outbox, deliveries}], rollback}`; `POST /executions/{action_id}/rollback {reason}`; `POST /webhooks/{outbox_id}/retry`; `GET /audit?kind=execution|proposal|approval|webhook|rollback&limit` unified feed; `POST /sparql {query}` -> `{vars, rows}` (SELECT/ASK only, 5 s timeout, 1000 rows, rows containing a hidden object IRI dropped, aggregates/GROUP BY/COUNT rejected for non-admin, SERVICE/FROM/UPDATE rejected). Existing REST object/link mutations route to the generic actions (`create_object`, etc.), allowed iff role has `write: true` for the type. `/graph`, `/neighbours`, `/geo`, `/stats/*`, `/events`, history, as_of: all run under RLS; `/graph` additionally filters inferred edges via `inferred_support` (D6), cut paths at hidden nodes; hidden objects look identical to missing ones (404 for by-id reads, never 403).
+
+## Known limitations after Phase 3 review
+- Identity is carried by `amarh.role` / `amarh.user` / `amarh.region` GUCs set with `SET LOCAL` inside a scoped transaction. They are trusted: if arbitrary SQL execution is ever exposed to a request, `set_config(...)` or `RESET ROLE` can forge or drop the identity. Today no endpoint executes caller-supplied SQL. A signed identity context (HMAC over role/user/region/txid verified by the policies) is deferred. Tracked by two `xfail(strict=True)` tests in `tests/security/test_review_fixes.py`.
+- Hardening applied: SECURITY DEFINER helpers use `search_path = pg_catalog, <schema>, public, pg_temp`; `TEMPORARY` on the database is revoked from PUBLIC and `amarh_app`.
+- Masking is view-level only (`rd_*` views and output-time masking of diff/before/after/dry_run/params). Direct SELECT on `obj_*` as `amarh_app` still returns masked columns; engine code must read through `rd_*` (`bitemporal.read_source` now raises when the view is missing under a scoped role).
+- `x-role` is a plain, non-secret header: v1 has no authentication. Anyone who can reach the API can act as any selectable role, including `admin`.
+- A create with an id that already exists (hidden or not) returns a generic 409, so existence of a hidden id is still distinguishable from a free id.
+- SERVICE federation cannot be disabled in pyoxigraph 0.5 (verified); it is blocked by validation only. Add egress filtering in deployment.
+- Runaway SPARQL queries cannot be cancelled in Oxigraph; the worker thread continues after the 5 s timeout (concurrency is capped at 4 requests, 429 beyond).

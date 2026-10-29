@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from collections import deque
 import time
 from dataclasses import dataclass, field
 
@@ -135,3 +136,125 @@ def materialize_owlrl(st: Store, ns: str = iri.DEFAULT_NS) -> MaterializeResult:
                                datatype_axioms=False).expand(g)
         kept, dropped = _write_inferred(st, g, ns, base_keys, "owlrl", get_last_seq(st), t0)
     return MaterializeResult("owlrl", time.perf_counter() - t0, nbase, kept, dropped, get_last_seq(st))
+
+
+# ----------------------------------------------------------------------------------------
+# Derivation support for inferred instance edges (Phase 3, D6)
+# ----------------------------------------------------------------------------------------
+MAX_DERIVATIONS = 50          # derivations stored per inferred edge (shortest first)
+_MAX_PARTIAL_PATHS = 50_000   # search budget per inferred edge
+
+_sem_cache: dict = {}
+
+
+def link_semantics(yaml_path=None) -> dict[str, tuple[str, bool]]:
+    """{inferred link name -> (base link, reversed)} for every link name the reasoner can infer.
+
+    A transitive link L maps to (L, False); an inverse name I of L maps to (I -> (L, True)).
+    `support` paths in inferred_support are ordered along the BASE link (src of L first), so
+    for a reversed name the path runs dst -> src of the inferred edge.
+    """
+    from engine.sync.store import DEFAULT_YAML
+    from engine.compiler import compile_ontology
+    p = str(yaml_path or DEFAULT_YAML)
+    if p not in _sem_cache:
+        m = compile_ontology(p).model
+        sem: dict[str, tuple[str, bool]] = {}
+        for l in m.link_types.values():
+            if l.transitive:
+                sem[l.name] = (l.name, False)
+            if l.inverse:
+                sem[l.inverse] = (l.name, True)
+        _sem_cache[p] = sem
+    return _sem_cache[p]
+
+
+def enumerate_paths(adj: dict, radj_reach: set, s, d, cap: int = MAX_DERIVATIONS,
+                    min_len: int = 1, budget: int = _MAX_PARTIAL_PATHS) -> list[tuple]:
+    """Simple paths s -> d over `adj` (node -> sorted successors), shortest first, at most `cap`.
+    `radj_reach` = nodes from which d is reachable (prunes dead ends)."""
+    out: list[tuple] = []
+    q = deque([(s,)])
+    steps = 0
+    while q and len(out) < cap and steps < budget:
+        path = q.popleft()
+        steps += 1
+        for n in adj.get(path[-1], ()):
+            if n == d:
+                if len(path) >= min_len:
+                    out.append(path + (n,))
+                    if len(out) >= cap:
+                        break
+            elif n not in path and n in radj_reach:
+                q.append(path + (n,))
+    return out
+
+
+def write_support(conn, st: Store, ns: str, yaml_path=None, max_derivations: int = MAX_DERIVATIONS,
+                  data_version: int | None = None) -> dict:
+    """(Re)populate `inferred_support` from the ASSERTED graph for every inferred instance edge.
+
+    Runs as OWNER (loader connection; `amarh_app` has SELECT only). For each inferred edge
+    (s, L, d) of a transitive link or inverse name, stores up to `max_derivations` simple
+    paths over the asserted base-link edges (shortest first) as separate derivations
+    (`derivation_no` 0..), `support` = ordered node ids of the path in base-link direction.
+    Derivations beyond the cap are dropped, which can only HIDE an edge that is visible
+    through a dropped derivation (fail closed), never reveal one. The table is replaced in
+    one transaction. Returns {edges, derivations, no_derivation}.
+    """
+    sem = link_semantics(yaml_path)
+    pre = f"{ns}obj/"
+    n = len(pre)
+    if data_version is None:
+        data_version = get_last_seq(st)
+    adj_by_base: dict[str, dict] = {}
+    radj_by_base: dict[str, dict] = {}
+
+    def graph_of(base):
+        if base not in adj_by_base:
+            pred = NamedNode(f"{ns}{base}")
+            adj: dict = {}
+            radj: dict = {}
+            for q in st.quads_for_pattern(None, pred, None, G_ASSERTED):
+                if isinstance(q.subject, NamedNode) and isinstance(q.object, NamedNode) \
+                        and q.subject.value.startswith(pre) and q.object.value.startswith(pre):
+                    a, b = q.subject.value[n:], q.object.value[n:]
+                    adj.setdefault(a, set()).add(b)
+                    radj.setdefault(b, set()).add(a)
+            adj_by_base[base] = {k: sorted(v) for k, v in adj.items()}
+            radj_by_base[base] = radj
+        return adj_by_base[base], radj_by_base[base]
+
+    def reach_to(radj, d):
+        seen, todo = {d}, [d]
+        while todo:
+            x = todo.pop()
+            for y in radj.get(x, ()):
+                if y not in seen:
+                    seen.add(y)
+                    todo.append(y)
+        return seen
+
+    rows, edges, none = [], 0, 0
+    for link, (base, rev) in sem.items():
+        adj, radj = graph_of(base)
+        pred = NamedNode(f"{ns}{link}")
+        for q in st.quads_for_pattern(None, pred, None, G_INFERRED):
+            if not (isinstance(q.subject, NamedNode) and isinstance(q.object, NamedNode)
+                    and q.subject.value.startswith(pre) and q.object.value.startswith(pre)):
+                continue
+            s, d = q.subject.value[n:], q.object.value[n:]
+            edges += 1
+            bs, bd = (d, s) if rev else (s, d)
+            paths = enumerate_paths(adj, reach_to(radj, bd), bs, bd, max_derivations)
+            if not paths:
+                none += 1
+            for i, p in enumerate(paths):
+                rows.append((link, s, d, i, list(p), data_version))
+    with conn.transaction():
+        conn.execute("DELETE FROM inferred_support")
+        if rows:
+            with conn.cursor() as cur:
+                cur.executemany("INSERT INTO inferred_support (link, src, dst, derivation_no, support, data_version) "
+                                "VALUES (%s, %s::uuid, %s::uuid, %s, %s::uuid[], %s)", rows)
+    return {"edges": edges, "derivations": len(rows), "no_derivation": none}

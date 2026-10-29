@@ -3,7 +3,7 @@
 Open-source, Palantir Foundry/AIP-inspired ontology platform for one simulated use case (supply chain, geospatial events, finance ops). The full design and sources are in `RESEARCH.md`; read it before any work. This file holds the rules that apply every session.
 
 ## Status
-Phase 1 done (M0-M6; gate in `bench/results/report.md`). Phase 2 built and verified (M7-M11): PostGIS + geo types, ontology v2 (Invoice, PurchaseOrder, Event, shipment geometry), minimal action + audit layer (`engine/actions/`), seeded SimPy world (`sim/`), visual API (`/sim`, `/events`, `/geo`, `/stats`, `/graph`), map, graph, dashboard and as-of time slider in `web/`. Gate re-run on the PostGIS schema: all PASS (`bench/results/report_phase2.md`). Phase 2 pending review. Phase 3 (governance, real action engine, RLS) is next; do one phase per session (RESEARCH.md section 10).
+Phase 1 done (M0-M6; gate in `bench/results/report.md`). Phase 2 done (M7-M11; gate re-run `bench/results/report_phase2.md`). Phase 3 built on branch `phase-3` (governance and actions): roles in YAML, FORCE RLS + least-privilege `amarh_app`, masking views, action engine (execute/propose/approve/rollback, criteria, rules, webhook outbox), append-only audit, permission-filtered graph/SPARQL/history, security suite, role switcher + actions panel + audit/approvals UI. Security review done and its blockers fixed; known limitations in `docs/contracts.md` ("Known limitations after Phase 3 review"): identity GUCs are trusted inside a scoped session (2 strict xfail tests), masking is view-level, `x-role` is a non-secret header (no real auth). Phase 3 pending user review (not merged to main). Phase 4 (agent) is next; one phase per session (RESEARCH.md section 10).
 
 ## Commands
 Contracts and conventions: `docs/contracts.md`. Python via `uv` (venv currently CPython 3.14).
@@ -75,3 +75,11 @@ Rules:
 - All writes go through `engine.actions.apply_action` (one transaction, audit row with action_id). Only the seed bootstrap writes with `bt.write_*` directly. A position update resumes a delayed shipment (`ship_position` sets `in_transit`).
 - Inferred edges exist for the live state only (the reasoner materialises current state); the graph view says so when the slider is in the past. Only `supplies` (transitive, inverse) produces inferred edges today.
 - Tests: `uv run pytest` (about 80 s, mostly the 30-day sim tests).
+
+## Phase 3 commands and conventions
+- Schema setup: `engine.db.setup.apply_schema(conn)` (governance.sql + compiled `build/schema.sql`); seed and API startup call it. Recompile after YAML changes: `uv run python -m engine.compiler ontology/supply_chain.yaml build/ --sdk sdk/`.
+- Roles live in `ontology/supply_chain.yaml` (`roles:`): planner, finance_analyst, regional_ops_lead (EMEA), admin, sim (system, never selectable). The UI sends `x-role`; a missing header is 403 unless `AMARH_DEFAULT_ROLE` is set. Every request runs in a transaction under `engine.db.principal.scoped()` (SET LOCAL ROLE amarh_app + `amarh.*` settings).
+- All writes go through `engine.actions.execute/propose/decide/rollback`. Only `engine/db`, `engine/actions` and the seed bootstrap call `bt.write_*`. Audit tables (`audit_event` is the execution table, `proposal`, `approval`, `execution_diff`, `rollback`, `webhook_outbox`, `webhook_delivery`) are append-only (triggers reject UPDATE/DELETE/TRUNCATE); tests use a fresh schema instead of truncating. Reset keeps audit.
+- Webhooks: `AMARH_WEBHOOK_SECRET` is required for delivery; URLs come from the env var named by `url_env` in the YAML; worker disabled with `AMARH_OUTBOX_WORKER=0`. Sim control/inject are admin-only (the UI time bar gets 403 for other roles).
+- Demo: `PYTHONPATH=. uv run python scripts/demo_phase3.py` (same action allowed for one role, denied for another, audited).
+- Tests: `uv run pytest` (about 4 min). Security suite: `tests/security`.

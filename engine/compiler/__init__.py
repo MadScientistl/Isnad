@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .model import Ontology, OntologyError, load_ontology, parse_ontology
-from .ddl import generate_ddl
+from .ddl import generate_base_ddl, generate_ddl, generate_policy_ddl
 from .rdf import owl_turtle, shacl_turtle
 from .codegen import pydantic_source, ts_source
 
@@ -25,6 +25,13 @@ class CompiledOntology:
 
     def ddl(self) -> str:
         return generate_ddl(self.model)
+
+    def base_ddl(self) -> str:
+        return generate_base_ddl(self.model)
+
+    def policy_ddl(self) -> str:
+        """Roles, RLS policies, visibility helpers, masking views and grants (also part of ddl())."""
+        return generate_policy_ddl(self.model)
 
     def owl_turtle(self) -> str:
         return owl_turtle(self.model)

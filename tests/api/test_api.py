@@ -1,7 +1,7 @@
 import time
 from engine.api.seed import _id
 
-H = {"x-role": "planner"}
+H = {"x-role": "admin"}
 
 
 def test_types(client):
@@ -61,7 +61,7 @@ def test_link_create_delete_and_endpoint_check(client):
     assert client.delete(f"/links/supplies?src={a}&dst={b}", headers=H).status_code == 200
     assert client.get(f"/links/supplies?id={a}", headers=H).json() == []
     bad = client.post("/links/supplies", json={"src": a, "dst": "00000000-0000-0000-0000-000000000001"}, headers=H)
-    assert bad.status_code == 422
+    assert bad.status_code == 404  # missing == hidden endpoint: "not found"
 
 
 def test_cors(client):

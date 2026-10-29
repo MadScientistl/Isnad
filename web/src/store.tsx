@@ -1,10 +1,11 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { api, setRole as applyRole, type SimState } from "./api";
+import { SELECTABLE_ROLES } from "@sdk/client";
+import { api, setRole as applyRole, type Me, type SimState } from "./api";
 
 const ls = (k: string, d = "") => { try { return localStorage.getItem(k) ?? d; } catch { return d; } };
 
 interface Ctx {
-  role: string; setRole: (r: string) => void;
+  role: string; setRole: (r: string) => void; me: Me | null; meError: string | null;
   asOf: Date | null; setAsOf: (d: Date | null) => void;
   asOfQ: string | undefined; // debounced iso string for queries; undefined = live
   sim: SimState | null; simError: string | null; setSim: (s: SimState) => void;
@@ -12,7 +13,9 @@ interface Ctx {
 const C = createContext<Ctx | null>(null);
 
 export function AppProvider({ children }: { children: ReactNode }) {
-  const [role, setRoleS] = useState(ls("role", "admin"));
+  const [role, setRoleS] = useState(() => { const r = ls("role", "admin"); return (SELECTABLE_ROLES as string[]).includes(r) ? r : r === "analyst" ? "planner" : "admin"; });
+  const [me, setMe] = useState<Me | null>(null);
+  const [meError, setMeError] = useState<string | null>(null);
   applyRole(role);
   const [asOf, setAsOf] = useState<Date | null>(null);
   const [asOfQ, setAsOfQ] = useState<string | undefined>(undefined);
@@ -25,8 +28,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
     tick(); const h = setInterval(tick, 2000);
     return () => { live = false; clearInterval(h); };
   }, [role]);
+  useEffect(() => {
+    let live = true; setMe(null); setMeError(null);
+    api.me().then((m) => live && setMe(m), (e) => live && setMeError(String(e.message ?? e)));
+    return () => { live = false; };
+  }, [role]);
   const setRole = useCallback((r: string) => { applyRole(r); try { localStorage.setItem("role", r); } catch { /* ignore */ } setRoleS(r); }, []);
-  const v = useMemo(() => ({ role, setRole, asOf, setAsOf, asOfQ, sim, simError, setSim }), [role, setRole, asOf, asOfQ, sim, simError]);
+  const v = useMemo(() => ({ role, setRole, me, meError, asOf, setAsOf, asOfQ, sim, simError, setSim }), [role, setRole, me, meError, asOf, asOfQ, sim, simError]);
   return <C.Provider value={v}>{children}</C.Provider>;
 }
 
@@ -59,3 +67,8 @@ export const fmtT = (iso: string | Date | null | undefined) => {
   const d = typeof iso === "string" ? new Date(iso) : iso;
   return d.toISOString().slice(0, 16).replace("T", " ") + "Z";
 };
+
+/** Tiny toast bus: toast(message, href?) shows a transient notice with an optional link. */
+export interface ToastMsg { id: number; text: string; href?: string; kind: "ok" | "warn" | "err" }
+let tid = 0;
+export const toast = (text: string, href?: string, kind: ToastMsg["kind"] = "ok") => window.dispatchEvent(new CustomEvent("amarh-toast", { detail: { id: ++tid, text, href, kind } }));

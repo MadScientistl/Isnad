@@ -1,25 +1,82 @@
+"""Action engine: permissioned, audited, atomic execution of ontology actions (Phase 3).
+
+Pipeline of ``execute`` (contract, docs/contracts.md "Phase 3 contracts"):
+  role may execute -> params valid (typed) -> approval gate -> binds loaded under the principal's
+  RLS (invisible == not found) -> criteria -> rules interpreter | registered function -> writes via
+  ``engine.db.bitemporal`` only -> audit_event + execution_diff + webhook outbox, ONE transaction.
+
+Transaction boundary (decision): every public entry point (execute, propose, decide, rollback,
+dry_run) opens ``conn.transaction()`` itself, wraps the work in ``scoped(conn, principal)`` (so the
+identity is set per call and reset on exit) and commits the connection on success, exactly like the
+old ``apply_action``. The caller must NOT be inside ``scoped`` already. On any exception nothing
+is written, except the separate committed ``status='denied'`` audit row for permission / criteria
+failures when source is 'api' or 'agent'.
+"""
 from __future__ import annotations
 
+import logging
 import json
+import os
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+import psycopg
+from psycopg import errors as pgerr
+
+from engine.compiler import exprs
 from engine.db import bitemporal as bt
+from engine.db.principal import OWNER, Principal, scoped
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ONTOLOGY = ROOT / "ontology" / "supply_chain.yaml"
-
-# Optional params accepted on top of the YAML registry (see package docstring).
-INTERNAL_PARAMS: dict[str, dict[str, str]] = {
-    "close_port": {"event_id": "uuid"},
-    "issue_invoice": {"invoice_id": "uuid", "ref": "string"},
-}
+SIM = Principal("sim", "system:sim", "")
+DENY_AUDIT_SOURCES = ("api", "agent")
 
 _STRIP = {"id", "valid_during", "recorded_during", "changed_by", "action_id", "scenario_id"}
 _ontology_cache: dict[str, Any] = {}
+
+
+# ------------------------------------------------------------------- errors
+log = logging.getLogger("amarh.actions")
+
+
+class PermissionDenied(Exception):
+    def __init__(self, detail: str):
+        super().__init__(detail)
+        self.detail = detail
+
+
+class CriteriaFailed(Exception):
+    """`failures`: list of {"message", "expr"} (messages of the criteria that evaluated false)."""
+
+    def __init__(self, failures: list[dict]):
+        super().__init__("; ".join(f["message"] for f in failures))
+        self.failures = failures
+
+
+class NotFound(ValueError):
+    """Object (or proposal / execution) missing OR invisible to the caller: identical on purpose."""
+
+
+class ApprovalRequired(Exception):
+    """The action needs approval for this role: use `propose` (the API turns this into a 202)."""
+
+    def __init__(self, action: str, approvers: tuple[str, ...] = ()):
+        super().__init__(f"action {action!r} requires approval; propose it instead")
+        self.action, self.approvers = action, approvers
+
+
+class RollbackConflict(Exception):
+    def __init__(self, keys: list[str]):
+        super().__init__(f"cannot roll back: current state differs from the recorded result for {keys}")
+        self.keys = keys
+
+
+class RollbackRefused(ValueError):
+    """Rollback not possible at all (irreversible action, already rolled back, not an action...)."""
 
 
 @dataclass
@@ -31,11 +88,16 @@ class ActionResult:
     after: dict = field(default_factory=dict)
     audit_seq: int | None = None
     created: dict = field(default_factory=dict)  # e.g. {"Event": uuid, "Invoice": uuid}
+    status: str = "executed"
+    diff: list = field(default_factory=list)  # [{kind,type,key,op,before,after}]
+    webhooks: list = field(default_factory=list)  # hook names enqueued
+    proposal_id: UUID | None = None
 
 
 def ensure_audit_schema(conn) -> None:
-    """Idempotently create audit_event in the connection's current schema."""
-    conn.execute((Path(__file__).parent / "schema.sql").read_text())
+    """Compat: idempotently apply the governance tables (engine/db/governance.sql) and commit."""
+    from engine.db.setup import GOVERNANCE_SQL
+    conn.execute(GOVERNANCE_SQL.read_text())
     conn.commit()
 
 
@@ -50,6 +112,14 @@ def _load(ontology):
             _ontology_cache[k] = compile_ontology(ontology).model
         return _ontology_cache[k]
     return getattr(ontology, "model", ontology)
+
+
+def make_principal(role: str, user: str, ontology=None) -> Principal:
+    """Principal with region and `approves` filled from the ontology's role definition."""
+    r = _load(ontology).roles.get(role)
+    if r is None:
+        return Principal(role, user, "")
+    return Principal(role, user, r.region or "", tuple(r.approves))
 
 
 def _coerce(name: str, typ: str, v: Any) -> Any:
@@ -86,26 +156,23 @@ def _coerce(name: str, typ: str, v: Any) -> Any:
     raise ValueError(f"param {name!r} must be a valid {typ}, got {v!r}")
 
 
-def _validate(model, name: str, params: dict) -> dict:
-    a = model.actions.get(name)
-    if a is None:
-        raise ValueError(f"unknown action {name!r}")
+def _validate(a, params: dict) -> dict:
     if not isinstance(params, dict):
         raise ValueError("params must be an object")
-    decl = {**a.params, **{k: t for k, t in INTERNAL_PARAMS.get(name, {}).items()}}
-    unknown = set(params) - set(decl)
+    specs = {s.name: s for s in a.param_specs()}
+    unknown = set(params) - set(specs)
     if unknown:
-        raise ValueError(f"unknown params for {name}: {sorted(unknown)}")
+        raise ValueError(f"unknown params for {a.name}: {sorted(unknown)}")
     out = {}
-    for k, t in decl.items():
+    for k, s in specs.items():
         if params.get(k) is None:
-            if t.endswith("!"):
-                raise ValueError(f"missing required param {k!r} for {name}")
+            if s.required:
+                raise ValueError(f"missing required param {k!r} for {a.name}")
             continue
-        if k == "props" and isinstance(params[k], dict):  # declared string; dict accepted too
+        if k == "props" and isinstance(params[k], dict):  # declared string; a dict is accepted too
             out[k] = params[k]
             continue
-        out[k] = _coerce(k, t.rstrip("!"), params[k])
+        out[k] = _coerce(k, s.base, params[k])
     return out
 
 
@@ -121,10 +188,32 @@ def _jsonable(o):
     return o
 
 
+def _jdump(o) -> str:
+    return json.dumps(_jsonable(o), default=str)
+
+
+def _vt(valid_at) -> datetime:
+    if not isinstance(valid_at, datetime):
+        raise ValueError("valid_at must be a datetime")
+    return valid_at if valid_at.tzinfo else valid_at.replace(tzinfo=UTC)
+
+
+class _P:
+    """Normalised acting identity."""
+
+    def __init__(self, principal):
+        self.owner = principal is OWNER
+        self.p = Principal("admin", "system:owner", "") if self.owner else principal
+        self.role, self.user = self.p.role, self.p.user
+        if not self.user:
+            raise ValueError("principal.user is required")
+
+
 # ------------------------------------------------------------------- context
 class _Ctx:
-    def __init__(self, conn, model, actor, valid_at, action_id):
-        self.conn, self.model, self.actor = conn, model, actor
+    def __init__(self, conn, model, pr: _P, valid_at, action_id):
+        self.conn, self.model, self.pr = conn, model, pr
+        self.actor = pr.user
         self.vt, self.aid = valid_at, action_id
         self.changed = False
         self.before: dict = {}
@@ -136,15 +225,22 @@ class _Ctx:
         if type_ not in self.model.object_types:
             raise ValueError(f"unknown object type {type_!r}")
 
-    def get(self, type_, id_):
+    def _check_write(self, type_):
+        if self.pr.owner:
+            return
+        r = self.model.roles.get(self.pr.role)
+        if r is None or not r.can_write(type_):
+            raise PermissionDenied(f"role {self.pr.role!r} may not write {type_}")
+
+    def get(self, type_, id_, masked=False):
         self._check_type(type_)
-        r = bt.get_object(self.conn, type_, id_, as_of_valid=self.vt)
+        r = bt.get_object(self.conn, type_, id_, as_of_valid=self.vt, masked=masked)
         return None if r is None else {k: v for k, v in r.items() if k not in _STRIP}
 
     def need(self, type_, id_):
         r = self.get(type_, id_)
         if r is None:
-            raise ValueError(f"{type_} {id_} does not exist at {self.vt.isoformat()}")
+            raise NotFound(f"{type_} {id_} not found at {self.vt.isoformat()}")
         return r
 
     def _snap(self, bucket, key, val):
@@ -152,6 +248,7 @@ class _Ctx:
 
     def put(self, type_, id_, props):
         self._check_type(type_)
+        self._check_write(type_)
         key = f"{type_}:{id_}"
         if key not in self.before:
             self._snap(self.before, key, self.get(type_, id_))
@@ -165,9 +262,11 @@ class _Ctx:
         self.put(type_, id_, cur)
 
     def remove(self, type_, id_):
+        self._check_write(type_)
         key = f"{type_}:{id_}"
         self.need(type_, id_)
-        self._snap(self.before, key, self.get(type_, id_))
+        if key not in self.before:
+            self._snap(self.before, key, self.get(type_, id_))
         self.changed |= bt.delete_object(self.conn, type_, id_, self.vt, self.actor, action_id=self.aid)
         self._snap(self.after, key, None)
 
@@ -185,6 +284,9 @@ class _Ctx:
                 c = self.model.parent_of(c)
         return out
 
+    def visible_any(self, tname, id_) -> bool:
+        return any(bt.get_object(self.conn, t, id_, as_of_valid=self.vt) for t in self._concrete(tname))
+
     def _link_def(self, link):
         lt = self.model.link_types.get(link)
         if lt is None:
@@ -192,8 +294,8 @@ class _Ctx:
         return lt
 
     def _check_end(self, tname, id_):
-        if not any(bt.get_object(self.conn, t, id_, as_of_valid=self.vt) for t in self._concrete(tname)):
-            raise ValueError(f"{tname} {id_} does not exist at {self.vt.isoformat()}")
+        if not self.visible_any(tname, id_):
+            raise NotFound(f"{tname} {id_} not found at {self.vt.isoformat()}")
 
     def _link_exists(self, link, src, dst):
         return dst in bt.neighbours(self.conn, link, src, "out", as_of_valid=self.vt)
@@ -203,16 +305,36 @@ class _Ctx:
         self._check_end(lt.src, src)
         self._check_end(lt.dst, dst)
         key = f"{link}:{src}>{dst}"
-        self._snap(self.before, key, {"exists": self._link_exists(link, src, dst)})
+        if key not in self.before:
+            self._snap(self.before, key, {"exists": self._link_exists(link, src, dst)})
         self.changed |= bt.write_link(self.conn, link, src, dst, self.vt, self.actor, action_id=self.aid)
         self._snap(self.after, key, {"exists": self._link_exists(link, src, dst)})
 
     def unlink(self, link, src, dst):
         self._link_def(link)
         key = f"{link}:{src}>{dst}"
-        self._snap(self.before, key, {"exists": self._link_exists(link, src, dst)})
+        if key not in self.before:
+            self._snap(self.before, key, {"exists": self._link_exists(link, src, dst)})
         self.changed |= bt.end_link(self.conn, link, src, dst, self.vt, self.actor, action_id=self.aid)
         self._snap(self.after, key, {"exists": self._link_exists(link, src, dst)})
+
+    def diff(self) -> list[dict]:
+        out = []
+        for key, b in self.before.items():
+            a = self.after.get(key)
+            if a == b:
+                continue
+            head, _, rest = key.partition(":")
+            if ">" in rest:  # link
+                be, ae = bool((b or {}).get("exists")), bool((a or {}).get("exists"))
+                if be == ae:
+                    continue
+                out.append({"kind": "link", "type": head, "key": rest,
+                            "op": "create" if ae else "delete", "before": b, "after": a})
+            else:
+                op = "create" if b is None else "delete" if a is None else "modify"
+                out.append({"kind": "object", "type": head, "key": rest, "op": op, "before": b, "after": a})
+        return out
 
 
 # ------------------------------------------------------------------- handlers
@@ -230,7 +352,7 @@ def _props_arg(v):
 def _create_object(c, p):
     id_ = p.get("id") or uuid4()
     if c.get(p["type"], id_) is not None:
-        raise ValueError(f"{p['type']} {id_} already exists")
+        raise ValueError(f"{p['type']} already exists")
     c.put(p["type"], id_, _props_arg(p["props"]))
     c.created[p["type"]] = id_
 
@@ -262,6 +384,7 @@ def _ship_arrive(c, p):
 
 
 def _delay_shipment(c, p):
+    from datetime import timedelta
     cur = c.need("Shipment", p["shipment"])
     h = p["delay_hours"]
     ch = {"status": "delayed", "delay_hours": h}
@@ -338,31 +461,452 @@ HANDLERS = {
 }
 
 
-def apply_action(conn, name: str, params: dict, actor: str, *, valid_at: datetime,
-                 source: str = "api", run_id: str | None = None, ontology=None) -> ActionResult:
-    """Validate, write (via bitemporal), audit and commit in ONE transaction.
+# ------------------------------------------------------------ rules interpreter
+def _run_rules(c: _Ctx, a, clean: dict, aliases: dict) -> None:
+    new: dict[str, UUID] = {}
 
-    Raises ValueError on validation problems; any failure rolls back writes and audit row.
-    `ontology`: None (default supply_chain.yaml), a path, or a compiled ontology/model.
+    def res(v):
+        if isinstance(v, str) and v.startswith("$"):
+            n = v[1:]
+            head, _, rest = n.partition(".")
+            if n == "now":
+                return c.vt
+            if n == "actor":
+                return c.actor
+            if head == "new" and rest:
+                return new[rest]
+            if rest:
+                obj = aliases.get(head)
+                return None if obj is None else obj.get(rest)
+            return clean.get(n)
+        return v
+
+    for r in a.rules:
+        if r.kind == "modify":
+            tid = res(r.id)
+            cur = c.need(r.type, tid)
+            cur.update({k: res(v) for k, v in r.set.items()})
+            c.put(r.type, tid, cur)
+        elif r.kind == "create":
+            tid = res(r.id) if r.id is not None else uuid4()
+            if c.get(r.type, tid) is not None:
+                raise ValueError(f"{r.type} already exists")
+            c.put(r.type, tid, {k: res(v) for k, v in r.set.items()})
+            c.created[r.type] = tid
+            if r.as_name:
+                new[r.as_name] = tid
+        elif r.kind == "delete":
+            c.remove(r.type, res(r.id))
+        elif r.kind == "link":
+            c.link(r.link, res(r.src), res(r.dst))
+        elif r.kind == "unlink":
+            c.unlink(r.link, res(r.src), res(r.dst))
+        else:  # pragma: no cover - compiler rejects
+            raise ValueError(f"unknown rule kind {r.kind!r}")
+
+
+# ------------------------------------------------------------------ pipeline
+def _pipeline(conn, model, a, raw_params, pr: _P, valid_at, aid, *, gate: bool):
+    name = a.name
+    if not pr.owner and not model.role_can_execute(pr.role, name):
+        raise PermissionDenied(f"role {pr.role!r} may not execute {name!r}")
+    clean = _validate(a, raw_params)
+    if gate and a.requires_approval and pr.role not in a.approval_exempt:
+        raise ApprovalRequired(name, a.approvers)
+    c = _Ctx(conn, model, pr, valid_at, aid)
+    aliases: dict[str, dict | None] = {}
+    for al, b in a.bind.items():
+        oid = clean.get(b.id[1:]) if b.id.startswith("$") else b.id
+        if oid is None:
+            raise ValueError(f"bind {al!r}: missing id {b.id}")
+        obj = bt.get_object(conn, b.type, oid, as_of_valid=valid_at)
+        if obj is None:
+            raise NotFound(f"{b.type} {oid} not found at {valid_at.isoformat()}")
+        d = {k: v for k, v in obj.items() if k not in _STRIP}
+        d["id"] = oid
+        aliases[al] = d
+    for s in a.param_specs():
+        if s.ref and clean.get(s.name) is not None and not c.visible_any(s.ref, clean[s.name]):
+            raise NotFound(f"{s.ref} {clean[s.name]} not found at {valid_at.isoformat()}")
+    failures = []
+    for cr in a.criteria:
+        ok = exprs.evaluate(cr.ast if cr.ast is not None else exprs.parse_expr(cr.expr),
+                            params=clean, aliases=aliases, now=valid_at, actor=pr.user)
+        if not ok:
+            failures.append({"message": cr.message, "expr": cr.expr})
+    if failures:
+        raise CriteriaFailed(failures)
+    if a.function:
+        fn = HANDLERS.get(a.function)
+        if fn is None:
+            raise ValueError(f"action {name!r}: function {a.function!r} is not registered")
+        fn(c, clean)
+    else:
+        _run_rules(c, a, clean, aliases)
+    return c, clean
+
+
+def _persist(conn, model, a, pr: _P, c: _Ctx, clean, valid_at, aid, *, source, run_id, proposal_id,
+             tool_trace, on_behalf_of, name=None, parent=None, params=None) -> tuple[int, list, list]:
+    diff = c.diff()
+    seq = conn.execute(
+        "INSERT INTO audit_event (action_id, name, actor, source, run_id, params, sim_time, before, after, "
+        "role, on_behalf_of, proposal_id, status, tool_trace, parent_execution_id) "
+        "VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s::jsonb,%s,%s,%s,'executed',%s::jsonb,%s) RETURNING seq",
+        [aid, name or a.name, pr.user, source, run_id, _jdump(params if params is not None else clean),
+         valid_at, json.dumps(c.before), json.dumps(c.after), pr.role, on_behalf_of, proposal_id,
+         None if tool_trace is None else _jdump(tool_trace), parent],
+    ).fetchone()[0]
+    if diff:
+        conn.cursor().executemany(
+            "INSERT INTO execution_diff (action_id, kind, type, key, op, before, after) "
+            "VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb)",
+            [(aid, d["kind"], d["type"], d["key"], d["op"],
+              None if d["before"] is None else json.dumps(d["before"]),
+              None if d["after"] is None else json.dumps(d["after"])) for d in diff])
+    hooks: list[str] = []
+    if a is not None and source != "sim" and c.changed:
+        for hook in a.webhooks:
+            wd = model.webhooks.get(hook)
+            if wd is None:
+                continue
+            oid = uuid4()
+            payload = {"hook": hook, "action": a.name, "action_id": str(aid), "actor": pr.user,
+                       "role": pr.role, "valid_at": valid_at.isoformat(),
+                       "params": _jsonable(clean), "created": _jsonable(c.created)}
+            conn.execute(
+                "INSERT INTO webhook_outbox (id, action_id, hook, url, payload, idempotency_key) "
+                "VALUES (%s,%s,%s,%s,%s::jsonb,%s)",
+                [oid, aid, hook, os.environ.get(wd.url_env) or None, json.dumps(payload), f"{aid}:{hook}"])
+            conn.execute("INSERT INTO webhook_delivery (outbox_id, attempt, status, next_attempt_at) "
+                         "VALUES (%s,0,'pending',NULL)", [oid])
+            hooks.append(hook)
+    return seq, diff, hooks
+
+
+def _do_execute(conn, model, a, raw_params, pr: _P, valid_at, aid, *, source, run_id, proposal_id,
+                tool_trace, on_behalf_of, gate=True) -> ActionResult:
+    """Everything inside the (already open) scoped transaction."""
+    c, clean = _pipeline(conn, model, a, raw_params, pr, valid_at, aid, gate=gate)
+    seq, diff, hooks = _persist(conn, model, a, pr, c, clean, valid_at, aid, source=source, run_id=run_id,
+                                proposal_id=proposal_id, tool_trace=tool_trace, on_behalf_of=on_behalf_of)
+    return ActionResult(aid, c.changed, a.name, c.before, c.after, seq, c.created, "executed", diff, hooks,
+                        proposal_id)
+
+
+def _action(model, name):
+    a = model.actions.get(name)
+    if a is None:
+        raise ValueError(f"unknown action {name!r}")
+    return a
+
+
+def _audit_denied(conn, model, pr: _P, name, params, valid_at, source, run_id, proposal_id, tool_trace,
+                  error: str, failures=None) -> None:
+    """Own committed transaction: a denial leaves a status='denied' audit row, no data writes."""
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+    with conn.transaction():
+        with scoped(conn, OWNER if pr.owner else pr.p):
+            conn.execute(
+                "INSERT INTO audit_event (action_id, name, actor, source, run_id, params, sim_time, before, after, "
+                "role, proposal_id, status, tool_trace) VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,NULL,%s::jsonb,%s,%s,"
+                "'denied',%s::jsonb)",
+                [uuid4(), name, pr.user, source, run_id, _jdump(params), valid_at,
+                 _jdump({"error": error, "failures": failures or []}), pr.role, proposal_id,
+                 None if tool_trace is None else _jdump(tool_trace)])
+    conn.commit()
+
+
+def _guarded(conn, model, pr, name, params, valid_at, source, run_id, proposal_id, tool_trace, fn):
+    try:
+        try:
+            return fn()
+        except pgerr.InsufficientPrivilege as e:
+            log.warning("RLS denied a write: %s", str(e).splitlines()[0])
+            raise PermissionDenied("row-level security denied the write") from e
+    except PermissionDenied as e:
+        if source in DENY_AUDIT_SOURCES:
+            _audit_denied(conn, model, pr, name, params, valid_at, source, run_id, proposal_id, tool_trace,
+                          e.detail)
+        else:
+            _safe_rollback(conn)
+        raise
+    except CriteriaFailed as e:
+        if source in DENY_AUDIT_SOURCES:
+            _audit_denied(conn, model, pr, name, params, valid_at, source, run_id, proposal_id, tool_trace,
+                          str(e), e.failures)
+        else:
+            _safe_rollback(conn)
+        raise
+
+
+def _safe_rollback(conn):
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------- public API
+def execute(conn, name: str, params: dict, principal, *, valid_at: datetime, source: str = "api",
+            run_id: str | None = None, proposal_id: UUID | None = None, tool_trace=None, ontology=None,
+            on_behalf_of: str | None = None) -> ActionResult:
+    """Validate, authorise, write, audit and commit in ONE transaction (see module docstring).
+
+    Raises ValueError/NotFound (validation, missing or invisible object), PermissionDenied,
+    CriteriaFailed, ApprovalRequired (use `propose`).
     """
     model = _load(ontology)
-    if not isinstance(valid_at, datetime):
-        raise ValueError("valid_at must be a datetime")
-    valid_at = valid_at if valid_at.tzinfo else valid_at.replace(tzinfo=UTC)
-    if not actor:
-        raise ValueError("actor is required")
-    clean = _validate(model, name, params)
-    if name not in HANDLERS:
-        raise ValueError(f"action {name!r} has no implementation")
+    a = _action(model, name)
+    valid_at = _vt(valid_at)
+    pr = _P(principal)
     aid = uuid4()
-    ctx = _Ctx(conn, model, actor, valid_at, aid)
-    with conn.transaction():
-        HANDLERS[name](ctx, clean)
-        seq = conn.execute(
-            "INSERT INTO audit_event (action_id, name, actor, source, run_id, params, sim_time, before, after) "
-            "VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s::jsonb) RETURNING seq",
-            [aid, name, actor, source, run_id, json.dumps(_jsonable(clean)), valid_at,
-             json.dumps(ctx.before), json.dumps(ctx.after)],
-        ).fetchone()[0]
-    conn.commit()
-    return ActionResult(aid, ctx.changed, name, ctx.before, ctx.after, seq, ctx.created)
+
+    def go():
+        with conn.transaction():
+            with scoped(conn, principal):
+                r = _do_execute(conn, model, a, params, pr, valid_at, aid, source=source, run_id=run_id,
+                                proposal_id=proposal_id, tool_trace=tool_trace, on_behalf_of=on_behalf_of)
+        conn.commit()
+        return r
+
+    return _guarded(conn, model, pr, name, params, valid_at, source, run_id, proposal_id, tool_trace, go)
+
+
+def dry_run(conn, name: str, params: dict, principal, *, valid_at: datetime, ontology=None) -> ActionResult:
+    """Run the whole pipeline (permissions, criteria, rules) and return the diff; commits nothing.
+    The approval gate is not applied (a dry run is how a proposal previews its effect)."""
+    model = _load(ontology)
+    a = _action(model, name)
+    valid_at = _vt(valid_at)
+    pr = _P(principal)
+    aid = uuid4()
+    with conn.transaction(force_rollback=True):
+        with scoped(conn, principal):
+            c, clean = _pipeline(conn, model, a, params, pr, valid_at, aid, gate=False)
+            return ActionResult(aid, c.changed, name, c.before, c.after, None, c.created, "dry_run", c.diff())
+
+
+def propose(conn, name: str, params: dict, principal, rationale: str | None = None, *, valid_at: datetime,
+            source: str = "api", run_id: str | None = None, tool_trace=None, ontology=None) -> UUID:
+    """Store a proposal (with a dry-run preview). Writes nothing else; the role must be allowed to
+    execute the action. Criteria are checked now so that doomed proposals are refused early."""
+    model = _load(ontology)
+    a = _action(model, name)
+    valid_at = _vt(valid_at)
+    pr = _P(principal)
+    pid = uuid4()
+
+    def go():
+        with conn.transaction():
+            with scoped(conn, principal):
+                try:
+                    with conn.transaction():  # savepoint, rolled back by _Preview: a pure preview
+                        c, clean = _pipeline(conn, model, a, params, pr, valid_at, uuid4(), gate=False)
+                        preview = {"valid_at": valid_at.isoformat(), "changed": c.changed, "diff": c.diff()}
+                        raise _Preview(clean, preview)
+                except _Preview as pv:
+                    clean, preview = pv.clean, pv.preview
+                conn.execute(
+                    "INSERT INTO proposal (id, action, params, proposer, proposer_role, rationale, dry_run, "
+                    "run_id, tool_trace) VALUES (%s,%s,%s::jsonb,%s,%s,%s,%s::jsonb,%s,%s::jsonb)",
+                    [pid, name, _jdump(clean), pr.user, pr.role, rationale, _jdump(preview), run_id,
+                     None if tool_trace is None else _jdump(tool_trace)])
+        conn.commit()
+        return pid
+
+    return _guarded(conn, model, pr, name, params, valid_at, source, run_id, None, tool_trace, go)
+
+
+class _Preview(Exception):
+    def __init__(self, clean, preview):
+        self.clean, self.preview = clean, preview
+
+
+def decide(conn, proposal_id: UUID, principal, approve: bool, comment: str | None = None, *,
+           valid_at: datetime | None = None, source: str = "api", ontology=None,
+           tool_trace=None) -> ActionResult | None:
+    """Approve (executes AS the approver with the full pipeline re-run; returns the ActionResult) or
+    reject (returns None). D3: proposer != approver, admin included. One decision per proposal."""
+    model = _load(ontology)
+    pr = _P(principal)
+    ctx_name = {"n": "approval"}
+
+    def go():
+        with conn.transaction():
+            with scoped(conn, principal):
+                row = conn.execute(
+                    "SELECT action, params, proposer, proposer_role, dry_run, run_id FROM proposal WHERE id=%s",
+                    [proposal_id]).fetchone()
+                if row is None:
+                    raise NotFound(f"proposal {proposal_id} not found")
+                action, params, proposer, _prole, dry, run_id = row
+                ctx_name["n"] = action
+                conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", [str(proposal_id)])
+                if conn.execute("SELECT 1 FROM approval WHERE proposal_id=%s", [proposal_id]).fetchone():
+                    raise ValueError(f"proposal {proposal_id} was already decided")
+                if not pr.owner and not model.role_can_approve(pr.role, action):
+                    raise PermissionDenied(f"role {pr.role!r} may not approve {action!r}")
+                if proposer == pr.user:
+                    raise PermissionDenied("the proposer cannot decide their own proposal")
+                aid = uuid4()
+                res = None
+                if approve:
+                    vt = _vt(valid_at) if valid_at is not None else datetime.fromisoformat(
+                        (dry or {}).get("valid_at") or datetime.now(UTC).isoformat())
+                    res = _do_execute(conn, model, _action(model, action), params, pr, vt, aid, source=source,
+                                      run_id=run_id, proposal_id=proposal_id, tool_trace=tool_trace,
+                                      on_behalf_of=proposer, gate=False)
+                try:
+                    conn.execute(
+                        "INSERT INTO approval (id, proposal_id, decision, approver, approver_role, comment, "
+                        "execution_id) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                        [uuid4(), proposal_id, "approved" if approve else "rejected", pr.user, pr.role, comment,
+                         aid if approve else None])
+                except pgerr.UniqueViolation:
+                    raise ValueError(f"proposal {proposal_id} was already decided") from None
+        conn.commit()
+        return res
+
+    vt0 = _vt(valid_at) if valid_at is not None else datetime.now(UTC)
+    # the denial audit needs the action name, filled in once the proposal row is read
+    try:
+        return _guarded_decide(conn, model, pr, proposal_id, vt0, source, tool_trace, go, ctx_name)
+    finally:
+        pass
+
+
+def _guarded_decide(conn, model, pr, proposal_id, vt0, source, tool_trace, fn, ctx_name):
+    try:
+        try:
+            return fn()
+        except pgerr.InsufficientPrivilege as e:
+            log.warning("RLS denied a write: %s", str(e).splitlines()[0])
+            raise PermissionDenied("row-level security denied the write") from e
+    except PermissionDenied as e:
+        _deny(conn, model, pr, proposal_id, vt0, source, tool_trace, ctx_name, e.detail, None)
+        raise
+    except CriteriaFailed as e:
+        _deny(conn, model, pr, proposal_id, vt0, source, tool_trace, ctx_name, str(e), e.failures)
+        raise
+
+
+def _deny(conn, model, pr, proposal_id, vt0, source, tool_trace, ctx_name, msg, failures):
+    if source in DENY_AUDIT_SOURCES:
+        _audit_denied(conn, model, pr, ctx_name["n"], {"proposal_id": str(proposal_id)}, vt0, source, None,
+                      proposal_id, tool_trace, msg, failures)
+    else:
+        _safe_rollback(conn)
+
+
+# ------------------------------------------------------------------ rollback
+def _revive(model, type_, props: dict | None):
+    """Undo JSON-ification of a recorded snapshot: ISO strings back to datetimes for timestamp props."""
+    if props is None:
+        return None
+    ot = model.object_types[type_]
+    ts = {p.name for p in ot.properties if p.type == "timestamp"}
+    out = dict(props)
+    for k in ts:
+        if isinstance(out.get(k), str):
+            out[k] = datetime.fromisoformat(out[k])
+    return out
+
+
+def rollback(conn, action_id: UUID, principal, reason: str | None = None, *, valid_at: datetime | None = None,
+             source: str = "api", run_id: str | None = None, ontology=None, tool_trace=None) -> ActionResult:
+    """D1 compensating rollback: only if every affected object/link still equals the recorded `after`
+    (as of `valid_at`, default now); else RollbackConflict(keys). The rollback is itself an audited
+    execution (name 'rollback', parent_execution_id) plus a `rollback` row. Webhooks are not undone and
+    are not re-sent. `rollback: irreversible` actions, already rolled back and denied executions refuse.
+
+    Who may roll back: a role that may execute the original action; for approval-gated actions
+    (and roles not exempt) only a role that may approve it.
+    """
+    model = _load(ontology)
+    pr = _P(principal)
+    vt = _vt(valid_at) if valid_at is not None else datetime.now(UTC)
+    aid = uuid4()
+    orig = {"name": "rollback"}
+
+    def go():
+        with conn.transaction():
+            with scoped(conn, principal):
+                row = conn.execute(
+                    "SELECT name, status, params FROM audit_event WHERE action_id=%s", [action_id]).fetchone()
+                if row is None:
+                    raise NotFound(f"execution {action_id} not found")
+                oname, ostatus, _oparams = row
+                orig["name"] = oname
+                a = model.actions.get(oname)
+                if ostatus != "executed" or a is None:
+                    raise RollbackRefused(f"execution {action_id} ({oname}, {ostatus}) cannot be rolled back")
+                if a.rollback == "irreversible":
+                    raise RollbackRefused(f"action {oname!r} is irreversible")
+                if not pr.owner:
+                    if not model.role_can_execute(pr.role, oname):
+                        raise PermissionDenied(f"role {pr.role!r} may not roll back {oname!r}")
+                    if a.requires_approval and pr.role not in a.approval_exempt \
+                            and not model.role_can_approve(pr.role, oname):
+                        raise PermissionDenied(f"role {pr.role!r} may not roll back approval-gated {oname!r}")
+                if conn.execute("SELECT 1 FROM rollback WHERE original_action_id=%s", [action_id]).fetchone():
+                    raise RollbackRefused(f"execution {action_id} was already rolled back")
+                diff = conn.execute(
+                    "SELECT kind, type, key, op, before, after FROM execution_diff WHERE action_id=%s ORDER BY seq",
+                    [action_id]).fetchall()
+                c = _Ctx(conn, model, pr, vt, aid)
+                conflicts = []
+                for kind, typ, key, op, before, after in diff:
+                    if kind == "object":
+                        cur = c.get(typ, UUID(key))
+                        if _jsonable(cur) != after:
+                            conflicts.append(f"{typ}:{key}")
+                    else:
+                        s, d = key.split(">")
+                        ex = c._link_exists(typ, UUID(s), UUID(d))
+                        if ex != bool((after or {}).get("exists")):
+                            conflicts.append(f"{typ}:{key}")
+                if conflicts:
+                    raise RollbackConflict(conflicts)
+                for kind, typ, key, op, before, after in reversed(diff):
+                    if kind == "object":
+                        oid = UUID(key)
+                        if before is None:
+                            c.remove(typ, oid)
+                        else:
+                            c.put(typ, oid, _revive(model, typ, before))
+                    else:
+                        s, d = (UUID(x) for x in key.split(">"))
+                        if before and before.get("exists"):
+                            c.link(typ, s, d)
+                        else:
+                            c.unlink(typ, s, d)
+                params = {"original_action_id": str(action_id), "reason": reason}
+                seq, rdiff, _ = _persist(conn, model, None, pr, c, params, vt, aid, source=source, run_id=run_id,
+                                         proposal_id=None, tool_trace=tool_trace, on_behalf_of=None,
+                                         name="rollback", parent=action_id, params=params)
+                conn.execute(
+                    "INSERT INTO rollback (id, original_action_id, rollback_action_id, actor, reason) "
+                    "VALUES (%s,%s,%s,%s,%s)", [uuid4(), action_id, aid, pr.user, reason])
+        conn.commit()
+        return ActionResult(aid, c.changed, "rollback", c.before, c.after, seq, c.created, "executed", rdiff, [])
+
+    try:
+        try:
+            return go()
+        except pgerr.InsufficientPrivilege as e:
+            log.warning("RLS denied a write: %s", str(e).splitlines()[0])
+            raise PermissionDenied("row-level security denied the write") from e
+    except PermissionDenied as e:
+        if source in DENY_AUDIT_SOURCES:
+            _audit_denied(conn, model, pr, "rollback", {"original_action_id": str(action_id), "reason": reason},
+                          vt, source, run_id, None, tool_trace, e.detail)
+        else:
+            _safe_rollback(conn)
+        raise
+    except Exception:
+        _safe_rollback(conn)
+        raise

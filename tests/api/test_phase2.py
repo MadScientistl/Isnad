@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 import pytest
 from fastapi.testclient import TestClient
 
-from engine.actions import apply_action
+from engine.actions import SIM, execute
 from engine.api import main as api_main
 from engine.api.main import create_app
 from engine.api.seed import _id
@@ -15,7 +15,7 @@ from engine.db import connect
 
 from .conftest import ONTOLOGY
 
-H = {"x-role": "planner"}
+H = {"x-role": "admin"}
 
 
 def T(m, d, h=0):
@@ -40,7 +40,7 @@ def test_mutations_write_audit_rows(client, schema):
     client.delete(f"/objects/Carrier/{cid}", headers=H)
     rows = [r for r in audit(schema, source="api") if r[3].get("id") == cid]
     assert [r[0] for r in rows] == ["create_object", "update_object", "delete_object"]
-    assert {r[1] for r in rows} == {"planner"}
+    assert {r[1] for r in rows} == {"demo-admin"}
 
 
 def test_link_actions_audited_and_abstract_facility(client, schema):
@@ -56,9 +56,9 @@ def test_link_actions_audited_and_abstract_facility(client, schema):
 
 
 def test_error_mapping(client):
-    # missing endpoint -> ValueError -> 422; connection still usable afterwards
+    # missing endpoint -> NotFound -> 404; connection still usable afterwards
     ghost = str(uuid.uuid4())
-    assert client.post("/links/ships_to", json={"src": ghost, "dst": ghost}, headers=H).status_code == 422
+    assert client.post("/links/ships_to", json={"src": ghost, "dst": ghost}, headers=H).status_code == 404
     assert client.post("/objects/Port", json={"name": "x", "valid_from": "garbage"}, headers=H).status_code == 422
     assert client.get("/objects/Port?order_by=nope", headers=H).status_code == 422
     assert client.put(f"/objects/Port/{ghost}", json={"name": "x"}, headers=H).status_code == 404
@@ -101,7 +101,7 @@ def world(make_schema):
     shp, shp2 = uuid.uuid4(), uuid.uuid4()
 
     def act(n, p, at):
-        return apply_action(c, n, p, "sim", valid_at=at, source="sim", run_id="t", ontology=ONTOLOGY)
+        return execute(c, n, p, SIM, valid_at=at, source="sim", run_id="t", ontology=ONTOLOGY)
 
     act("create_object", {"type": "Shipment", "id": shp, "props": {
         "ref": "SHP-T1", "status": "planned", "cargo_value": 1000.0, "eta": T(3, 20),
@@ -174,10 +174,10 @@ def test_series(world):
 # --------------------------------------------------------------- events
 def test_events_feed(world):
     c = world["client"]
-    ev = c.get("/events?limit=100", headers=H).json()
+    ev = [e for e in c.get("/events?limit=100", headers=H).json() if e["name"] != "seed"]
     assert ev[0]["name"] == "ship_arrive" and ev[-1]["name"] == "create_object"
-    assert set(ev[0]) == {"seq", "action_id", "name", "actor", "source", "sim_time", "recorded_at",
-                          "params", "summary"}
+    assert set(ev[0]) == {"seq", "action_id", "name", "actor", "role", "source", "status", "sim_time",
+                          "recorded_at", "params", "summary"}
     assert [e["seq"] for e in ev] == sorted((e["seq"] for e in ev), reverse=True)
     summ = {e["name"]: e["summary"] for e in ev}
     assert summ["close_port"] == "Port Rotterdam closed"
@@ -234,9 +234,10 @@ class FakePipeline:
 
 def test_graph_depth_and_inferred(schema):
     s = [str(_id("Supplier", i)) for i in range(5)]
-    fp = FakePipeline([(s[0], "supplies", s[1]),   # also asserted -> returned once, as asserted
-                       (s[0], "supplies", s[2]),   # new inferred edge between returned nodes
-                       (s[0], "supplies", s[4])])  # endpoint not in the neighbourhood -> dropped
+    U = uuid.UUID  # the real pipeline yields UUIDs
+    fp = FakePipeline([(U(s[0]), "supplies", U(s[1])),   # also asserted -> returned once, as asserted
+                       (U(s[0]), "supplies", U(s[2])),   # new inferred edge between returned nodes
+                       (U(s[0]), "supplies", U(s[4]))])  # endpoint not in the neighbourhood -> dropped
     c = TestClient(create_app(ONTOLOGY, schema=schema, pipeline=fp))
     g = c.get(f"/graph?center={s[1]}&depth=1", headers=H).json()
     assert set(g) == {"center", "as_of", "inferred_available", "truncated", "nodes", "edges"}
@@ -355,7 +356,8 @@ def test_sim_endpoints_with_double(schema, make_schema, monkeypatch):
     assert c2.post("/sim/control", json={"reset": True}, headers=H).json()["tick"] == 0
     assert ("reset",) in r2.calls
     assert {o["name"] for o in c2.get("/objects/Carrier", headers=H).json()} .isdisjoint({"Temp"})  # data wiped, re-seeded
-    assert c2.get("/events", headers=H).json() == []  # audit emptied too
+    names = [e["name"] for e in c2.get("/events", headers=H).json()]
+    assert "reset" in names and "create_object" in names  # audit is kept, not emptied
     port = str(_id("Port", "Dubai"))
     j = c.post("/sim/inject", json={"kind": "port_closure", "target": port, "duration_h": 12}, headers=H).json()
     assert j == {"injected": {"kind": "port_closure", "target": port, "at": "2026-01-01T00:00:00Z"}} or \
@@ -369,8 +371,8 @@ def test_sim_endpoints_with_double(schema, make_schema, monkeypatch):
 def test_sim_unavailable_503(schema, monkeypatch):
     monkeypatch.setitem(sys.modules, "sim.runner", None)  # forces ImportError
     c = TestClient(create_app(ONTOLOGY, schema=schema, pipeline=False))
-    for call in (lambda: c.get("/sim/state"), lambda: c.post("/sim/control", json={"step": True}),
-                 lambda: c.post("/sim/inject", json={"kind": "shipment_delay"})):
+    for call in (lambda: c.get("/sim/state", headers=H), lambda: c.post("/sim/control", json={"step": True}, headers=H),
+                 lambda: c.post("/sim/inject", json={"kind": "shipment_delay"}, headers=H)):
         r = call()
         assert r.status_code == 503 and r.json() == {"detail": "simulation unavailable"}
 
@@ -387,7 +389,7 @@ def test_graph_real_pipeline_syncs_existing_data_on_first_use(make_schema):
     app = create_app(ONTOLOGY, schema=name)  # real, lazily created SyncPipeline
     c = TestClient(app)
     s0 = str(_id("Supplier", 0))  # seeded chain S0 -> S1 -> S2 -> ...
-    g = c.get("/graph", params={"center": s0, "depth": 2}).json()
+    g = c.get("/graph", params={"center": s0, "depth": 2}, headers=H).json()
     assert g["inferred_available"] is True
     inf = [e for e in g["edges"] if e["inferred"]]
     assert inf, "transitive supplies closure should appear as inferred edges"

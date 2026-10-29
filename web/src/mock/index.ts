@@ -12,6 +12,7 @@
  * ({method, path, query, role, body}) so tests can assert what the UI sent. The real fetch path is untouched
  * when the flag is off.
  */
+import * as gov from "./gov";
 const H = 3600000;
 const EPOCH = Date.parse("2026-01-01T00:00:00Z");
 const iso = (h: number) => new Date(EPOCH + h * H).toISOString();
@@ -32,6 +33,8 @@ for (let i = 2; i < NSHIP; i += 5) { const d = dep(i), u = dur(i); base.push({ t
 function dep(i: number) { return 24 + i * 30; }
 function dur(i: number) { return 96 + ((i * 37) % 120); }
 
+const paid = new Set<string>();
+let curRole = "admin";
 const st = { simH: 480, speed: "paused" as "paused" | "1" | "6" | "24", tick: 0, injected: [] as Win[] };
 const wins = () => [...base, ...st.injected];
 const inWin = (target: string, kind: Win["kind"], h: number) => wins().some((w) => w.target === target && w.kind === kind && h >= w.start && h < w.end);
@@ -50,14 +53,15 @@ function shipment(i: number, h: number) {
   return { id: uid("ship", i), ref: `SHP-${String(i + 1).padStart(3, "0")}`, status, progress: +p.toFixed(3), cargo_value: 40000 + i * 13000, delay_hours: status === "delayed" && w ? Math.round(h - w.start) : 0, position: pt(pos) };
 }
 const stamp = { valid_from: iso(0), valid_to: null, changed_by: "mock" };
+const regionOf = (lon: number) => (lon < -20 ? "AMER" : lon <= 60 ? "EMEA" : "APAC");
 function objects(type: string, h: number): Record<string, any>[] {
   switch (type) {
-    case "Port": return PORTS.map((p, i) => ({ id: uid("port", i), name: p[0], lat: p[2], lon: p[1], location: pt([p[1], p[2]]), status: portStatus(i, h), ...stamp }));
-    case "Warehouse": return WHS.map((p, i) => ({ id: uid("wh", i), name: p[0], lat: p[2], lon: p[1], location: pt([p[1], p[2]]), ...stamp }));
+    case "Port": return PORTS.map((p, i) => ({ id: uid("port", i), name: p[0], lat: p[2], lon: p[1], location: pt([p[1], p[2]]), region: regionOf(p[1]), status: portStatus(i, h), ...stamp }));
+    case "Warehouse": return WHS.map((p, i) => ({ id: uid("wh", i), name: p[0], lat: p[2], lon: p[1], location: pt([p[1], p[2]]), region: regionOf(p[1]), ...stamp }));
     case "Carrier": return CARRIERS.map((n, i) => ({ id: uid("car", i), name: n, ...stamp }));
-    case "Supplier": return Array.from({ length: 6 }, (_, i) => ({ id: uid("sup", i), name: `Supplier ${i + 1}`, ...stamp }));
+    case "Supplier": return Array.from({ length: 6 }, (_, i) => ({ id: uid("sup", i), name: `Supplier ${i + 1}`, country: ["DE", "SG", "CN", "US", "AE", "BR"][i], ...stamp }));
     case "Shipment": return Array.from({ length: NSHIP }, (_, i) => ({ ...shipment(i, h), ...stamp }));
-    case "Invoice": return Array.from({ length: 6 }, (_, i) => ({ id: uid("inv", i), ref: `INV-${100 + i}`, amount: 12000 + i * 3500, currency: "USD", status: inWin(uid("inv", i), "inv", h) ? "flagged" : h > 500 ? "paid" : "open", anomaly: inWin(uid("inv", i), "inv", h) ? "amount mismatch" : null, ...stamp }));
+    case "Invoice": return Array.from({ length: 6 }, (_, i) => ({ id: uid("inv", i), ref: `INV-${100 + i}`, amount: 12000 + i * 3500, currency: "USD", status: paid.has(uid("inv", i)) ? "paid" : inWin(uid("inv", i), "inv", h) ? "flagged" : h > 500 ? "paid" : "open", anomaly: inWin(uid("inv", i), "inv", h) ? "amount mismatch" : null, ...stamp }));
     case "Event": return evObjs().map((w, i) => ({ id: uid("ev", i), kind: "port_closure", severity: "high", started: iso(w.start), ended: iso(w.end), note: `Closure of ${PORTS[portIdx(w.target)][0]}`, ...stamp }));
     default: return [];
   }
@@ -65,11 +69,62 @@ function objects(type: string, h: number): Record<string, any>[] {
 const portIdx = (id: string) => Number(id.slice(-12));
 const evObjs = () => wins().filter((w) => w.kind === "port");
 const TYPES: Record<string, string[]> = {
-  Port: ["name", "lat", "lon", "location", "status"], Warehouse: ["name", "lat", "lon", "location"], Carrier: ["name"], Supplier: ["name"],
+  Port: ["name", "lat", "lon", "location", "region", "status"], Warehouse: ["name", "lat", "lon", "location", "region"], Carrier: ["name"], Supplier: ["name", "country"],
   Shipment: ["ref", "status", "progress", "cargo_value", "delay_hours", "position"], Invoice: ["ref", "amount", "currency", "status", "anomaly"],
   Event: ["kind", "severity", "started", "ended", "note"], PurchaseOrder: ["ref", "amount", "status"],
 };
 const ENUMS: Record<string, string[]> = { status: [] };
+
+
+/* ---- role model (mirrors the Phase 3 contract: deny by default, row filters, masking) ---- */
+const REGION: Record<string, string | null> = { admin: null, finance_analyst: null, planner: null, regional_ops_lead: "EMEA" };
+const NO_READ: Record<string, string[]> = { admin: [], planner: ["Invoice", "PurchaseOrder"], finance_analyst: ["Event"], regional_ops_lead: ["Invoice", "PurchaseOrder"] };
+const MASK: Record<string, Record<string, string[]>> = { planner: { Supplier: ["country"] }, regional_ops_lead: { Supplier: ["country"] }, finance_analyst: {}, admin: {} };
+const NO_WRITE: Record<string, string[]> = { admin: [], planner: ["Invoice", "PurchaseOrder"], finance_analyst: ["Port", "Warehouse", "Shipment", "Carrier", "Event"], regional_ops_lead: ["Supplier", "Carrier", "Event", "Invoice"] };
+function visible(role: string, type: string, o: Record<string, any>): boolean {
+  if (!(role in REGION) || NO_READ[role].includes(type)) return false;
+  const reg = REGION[role];
+  if (!reg) return true;
+  if (type === "Port" || type === "Warehouse") return o.region === reg;
+  if (type === "Shipment") return regionOf(WHS[dest(portIdx(o.id))][1]) === reg;
+  return true;
+}
+const mask = (role: string, type: string, o: Record<string, any>) => { const m = MASK[role]?.[type]; if (!m) return o; const c = { ...o }; for (const k of m) c[k] = null; return c; };
+const vobjs = (type: string, h: number) => objects(type, h).filter((o) => visible(curRole, type, o)).map((o) => mask(curRole, type, o));
+const visId = (type: string, id: string, h = st.simH) => objects(type, h).some((o) => o.id === id && visible(curRole, type, o));
+function whoAmI(role: string) {
+  const types: Record<string, { read: boolean; write: boolean; masked: string[] }> = {};
+  for (const t of Object.keys(TYPES)) { const r = !NO_READ[role]?.includes(t); types[t] = { read: r, write: r && !NO_WRITE[role]?.includes(t), masked: MASK[role]?.[t] ?? [] }; }
+  return { role, user: `user:${role}`, region: REGION[role] ?? null, types, actions: [] as string[] };
+}
+const ACT_PROPS = ["status", "anomaly"];
+const pickP = (o: Record<string, any> | undefined) => (o ? Object.fromEntries(ACT_PROPS.filter((k) => k in o).map((k) => [k, o[k]])) : null);
+/** Applies an action's effect on the mock world; returns the diff and an undo, or criteria failures. */
+function applyEffect(name: string, p: Record<string, any>): { diff: any[]; undo: () => void } | { fail: string[]; notFound?: boolean } {
+  const h = st.simH;
+  const one = (type: string, id: string) => objects(type, h).find((o) => o.id === id);
+  const mk = (type: string, id: string, mut: () => (() => void)) => {
+    const before = pickP(one(type, id)); const undo = mut(); const after = pickP(one(type, id));
+    return { diff: [{ kind: "object", type, key: id, op: "modify", before, after }], undo };
+  };
+  const push = (w: Win) => { st.injected.push(w); return () => { st.injected = st.injected.filter((x) => x !== w); }; };
+  switch (name) {
+    case "close_port": { const o = one("Port", p.port); if (!o || !visible(curRole, "Port", o)) return { fail: [], notFound: true }; if (o.status === "closed") return { fail: ["Port is already closed"] };
+      return mk("Port", p.port, () => push({ target: p.port, start: h, end: h + (p.duration_h ?? 24), kind: "port" })); }
+    case "reopen_port": { const o = one("Port", p.port); if (!o || !visible(curRole, "Port", o)) return { fail: [], notFound: true }; if (o.status !== "closed") return { fail: ["Port is not closed"] };
+      const cut = wins().filter((w) => w.target === p.port && w.kind === "port" && h >= w.start && h < w.end).map((w) => [w, w.end] as const);
+      return mk("Port", p.port, () => { cut.forEach(([w]) => (w.end = h)); return () => cut.forEach(([w, e]) => (w.end = e)); }); }
+    case "flag_invoice": { const o = one("Invoice", p.invoice); if (!o || !visible(curRole, "Invoice", o)) return { fail: [], notFound: true }; if (o.status !== "open") return { fail: [`Invoice is ${o.status}, only open invoices can be flagged`] };
+      return mk("Invoice", p.invoice, () => push({ target: p.invoice, start: h, end: h + 100000, kind: "inv" })); }
+    case "pay_invoice": { const o = one("Invoice", p.invoice); if (!o || !visible(curRole, "Invoice", o)) return { fail: [], notFound: true }; if (o.status === "paid") return { fail: ["Invoice is already paid"] }; if (o.status === "flagged") return { fail: ["Invoice is flagged: resolve the anomaly first"] };
+      return mk("Invoice", p.invoice, () => { paid.add(p.invoice); return () => paid.delete(p.invoice); }); }
+    case "delay_shipment": { const o = one("Shipment", p.shipment); if (!o || !visible(curRole, "Shipment", o)) return { fail: [], notFound: true }; if (o.status !== "in_transit") return { fail: [`Shipment is ${o.status}, only in-transit shipments can be delayed`] };
+      return mk("Shipment", p.shipment, () => push({ target: p.shipment, start: h, end: h + (p.delay_hours ?? 12), kind: "ship" })); }
+    default: return { diff: [], undo: () => {} };
+  }
+}
+const currentProps = (type: string, id: string) => pickP(objects(type, st.simH).find((o) => o.id === id));
+gov.setWorld({ apply: applyEffect, current: currentProps, whoAmI, nowIso: () => iso(st.simH), visibleKey: (type, id) => visId(type, id), canSeeObj: (role, type, id) => { const prev = curRole; curRole = role; const r = visId(type, id); curRole = prev; return r; } });
 
 interface Edge { src: string; dst: string; link: string; inferred: boolean }
 function edges(h: number, inferred: boolean): Edge[] {
@@ -90,7 +145,7 @@ function edges(h: number, inferred: boolean): Edge[] {
 }
 const nodeIndex = (h: number) => {
   const m = new Map<string, { id: string; type: string; label: string; status: string | null }>();
-  for (const t of Object.keys(TYPES)) for (const o of objects(t, h)) m.set(o.id, { id: o.id, type: t, label: String(o.name ?? o.ref ?? o.kind), status: t === "Port" || t === "Shipment" || t === "Invoice" ? o.status : null });
+  for (const t of Object.keys(TYPES)) for (const o of vobjs(t, h)) m.set(o.id, { id: o.id, type: t, label: String(o.name ?? o.ref ?? o.kind), status: t === "Port" || t === "Shipment" || t === "Invoice" ? o.status : null });
   return m;
 };
 
@@ -100,7 +155,7 @@ function summary(h: number) {
   const closed = PORTS.filter((_, i) => portStatus(i, h) === "closed").length;
   const risk = sh.filter((s, i) => s.status !== "arrived" && (portStatus(via(i), h) === "closed" || s.status === "delayed")).reduce((a, s) => a + s.cargo_value, 0);
   return { as_of: iso(h), shipments: { planned: cnt("planned"), in_transit: cnt("in_transit"), delayed: cnt("delayed"), arrived: cnt("arrived") }, ports: { open: PORTS.length - closed, closed },
-    invoices: { open: ic("open"), approved: ic("approved"), paid: ic("paid"), flagged: ic("flagged") }, value_at_risk: risk, delay_hours_total: sh.reduce((a, s) => a + s.delay_hours, 0), open_events: evObjs().filter((w) => h >= w.start && h < w.end).length };
+    invoices: NO_READ[curRole]?.includes("Invoice") ? { open: 0, approved: 0, paid: 0, flagged: 0 } : { open: ic("open"), approved: ic("approved"), paid: ic("paid"), flagged: ic("flagged") }, value_at_risk: risk, delay_hours_total: sh.reduce((a, s) => a + s.delay_hours, 0), open_events: evObjs().filter((w) => h >= w.start && h < w.end).length };
 }
 function metric(m: string, h: number) {
   const s = summary(h);
@@ -123,6 +178,8 @@ const hOf = (v: string | null) => (!v || v === "live" ? st.simH : (Date.parse(v)
 function route(method: string, path: string, q: URLSearchParams, body: any): [number, unknown] {
   const asOfH = hOf(q.get("as_of") ?? q.get("as_of_valid"));
   let m: RegExpMatchArray | null;
+  const g = gov.route(method, path, q, body, curRole);
+  if (g) return g;
   if (path === "/sim/state") return [200, simState()];
   if (path === "/sim/control") {
     if (body?.reset) { st.simH = 48; st.tick = 0; st.injected = []; st.speed = "paused"; }
@@ -142,12 +199,12 @@ function route(method: string, path: string, q: URLSearchParams, body: any): [nu
   }
   if (path === "/events") {
     const lim = Number(q.get("limit") ?? 100), to = q.get("to") ? hOf(q.get("to")) : st.simH, from = q.get("from") ? hOf(q.get("from")) : -1;
-    const rows = feed(to).filter((x) => x.t >= from).slice(0, lim).map((x, i, a) => ({ seq: 100000 - i, action_id: `act-${x.name}-${Math.round(x.t)}-${i}`, name: x.name, actor: "sim", source: "sim", sim_time: iso(x.t), recorded_at: iso(x.t), params: { id: x.id, type: x.type }, summary: x.summary }));
+    const rows = feed(to).filter((x) => x.t >= from && (x.type === "Shipment" || x.type === "Port" || x.type === "Invoice" ? visId(x.type, x.id, st.simH) : true)).slice(0, lim).map((x, i, a) => ({ seq: 100000 - i, action_id: `act-${x.name}-${Math.round(x.t)}-${i}`, name: x.name, actor: "sim", source: "sim", sim_time: iso(x.t), recorded_at: iso(x.t), params: { id: x.id, type: x.type }, summary: x.summary }));
     return [200, rows];
   }
   if ((m = path.match(/^\/geo\/(\w+)$/))) {
     const t = m[1];
-    const feats = objects(t, asOfH).filter((o) => o.position ?? o.location).map((o) => {
+    const feats = vobjs(t, asOfH).filter((o) => o.position ?? o.location).map((o) => {
       const { position, location, ...rest } = o; const props: any = { ...rest, type: t };
       if (t === "Shipment") { const i = portIdx(o.id); props.origin = [PORTS[origin(i)][1], PORTS[origin(i)][2]]; props.destination = [WHS[dest(i)][1], WHS[dest(i)][2]]; }
       return { type: "Feature", id: o.id, geometry: position ?? location, properties: props };
@@ -164,6 +221,7 @@ function route(method: string, path: string, q: URLSearchParams, body: any): [nu
   if (path === "/graph") {
     const live = !q.get("as_of") || q.get("as_of") === "live", c = q.get("center")!, depth = Math.min(3, Number(q.get("depth") ?? 1));
     const want = q.get("include_inferred") !== "false";
+    if (!nodeIndex(asOfH).has(c)) return [404, { detail: "not found" }];
     const es = edges(asOfH, live && want), idx = nodeIndex(asOfH);
     const seen = new Set([c]); let frontier = [c];
     for (let d = 0; d < depth; d++) { const nx: string[] = []; for (const e of es) for (const [x, y] of [[e.src, e.dst], [e.dst, e.src]]) if (frontier.includes(x) && !seen.has(y)) { seen.add(y); nx.push(y); } frontier = nx; }
@@ -171,13 +229,13 @@ function route(method: string, path: string, q: URLSearchParams, body: any): [nu
     const set = new Set(ids);
     return [200, { center: c, as_of: live ? null : q.get("as_of"), inferred_available: live, truncated: seen.size > 300, nodes: ids.map((id) => idx.get(id)).filter(Boolean), edges: es.filter((e) => set.has(e.src) && set.has(e.dst)) }];
   }
-  if (path === "/types") return [200, { namespace: "mock", classes: {}, role: "admin", linkTypes: [], objectTypes: Object.entries(TYPES).map(([name, ps]) => ({ name, properties: ps.map((p) => ({ name: p, type: "string", required: false, enum: ENUMS[p] ?? [] })) })) }];
-  if ((m = path.match(/^\/objects\/(\w+)$/)) && method === "GET") return [200, objects(m[1], asOfH).slice(Number(q.get("offset") ?? 0), Number(q.get("offset") ?? 0) + Number(q.get("limit") ?? 100))];
-  if ((m = path.match(/^\/objects\/(\w+)\/([\w-]+)\/history$/))) return [200, objects(m[1], st.simH).filter((o) => o.id === m![2]).map((o) => ({ ...o, recorded_from: iso(0), recorded_to: null }))];
-  if ((m = path.match(/^\/objects\/(\w+)\/([\w-]+)$/)) && method === "GET") { const o = objects(m[1], asOfH).find((x) => x.id === m![2]); return o ? [200, o] : [404, { detail: "not found" }]; }
+  if (path === "/types") return [200, { namespace: "mock", classes: {}, role: curRole, linkTypes: [], objectTypes: Object.entries(TYPES).filter(([n]) => !NO_READ[curRole]?.includes(n)).map(([name, ps]) => ({ name, properties: ps.map((p) => ({ name: p, type: "string", required: false, enum: ENUMS[p] ?? [] })) })) }];
+  if ((m = path.match(/^\/objects\/(\w+)$/)) && method === "GET") return [200, vobjs(m[1], asOfH).slice(Number(q.get("offset") ?? 0), Number(q.get("offset") ?? 0) + Number(q.get("limit") ?? 100))];
+  if ((m = path.match(/^\/objects\/(\w+)\/([\w-]+)\/history$/))) return [200, vobjs(m[1], st.simH).filter((o) => o.id === m![2]).map((o) => ({ ...o, recorded_from: iso(0), recorded_to: null }))];
+  if ((m = path.match(/^\/objects\/(\w+)\/([\w-]+)$/)) && method === "GET") { const o = vobjs(m[1], asOfH).find((x) => x.id === m![2]); return o ? [200, o] : [404, { detail: "not found" }]; }
   if ((m = path.match(/^\/neighbours\/(\w+)\/([\w-]+)$/))) {
     const idx = nodeIndex(asOfH), id = m[2], out = [];
-    for (const e of edges(asOfH, false)) { const other = e.src === id ? e.dst : e.dst === id ? e.src : null; const n = other && idx.get(other); if (n) out.push({ link: e.link, direction: e.src === id ? "out" : "in", type: n.type, id: n.id, object: objects(n.type, asOfH).find((o) => o.id === n.id) ?? null }); }
+    for (const e of edges(asOfH, false)) { const other = e.src === id ? e.dst : e.dst === id ? e.src : null; const n = other && idx.get(other); if (n) out.push({ link: e.link, direction: e.src === id ? "out" : "in", type: n.type, id: n.id, object: vobjs(n.type, asOfH).find((o) => o.id === n.id) ?? null }); }
     return [200, out];
   }
   return [404, { detail: `mock: no route ${method} ${path}` }];
@@ -196,6 +254,7 @@ export function installMock(base: string) {
     const role = (init?.headers as Record<string, string> | undefined)?.["x-role"];
     w.__mockLog.push({ method, path: u.pathname, query: Object.fromEntries(u.searchParams), role, body });
     if (w.__mockLog.length > 500) w.__mockLog.splice(0, 250);
+    curRole = role ?? "admin";
     const [status, data] = route(method, u.pathname, u.searchParams, body);
     return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
   };

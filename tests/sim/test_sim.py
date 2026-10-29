@@ -300,3 +300,25 @@ def test_reset(db):
     r.reset()
     assert r.state()["tick"] == 0 and r.actions == 0 and r.sim_now == EPOCH
     r.close()
+
+
+def test_resume_ignores_history_before_reset(db):
+    """A `reset` audit event starts a new epoch: a runner built afterwards starts from the epoch even
+    though old sim audit rows (kept on purpose) are still there."""
+    schema, ids = db.new()
+    r = SimRunner(schema=schema, seed=7)
+    r.run_until(at(48))
+    r.close()
+    r1 = SimRunner(schema=schema, seed=7)
+    assert r1.sim_now > EPOCH  # without the reset event it would resume here
+    r1.close()
+    c = connect(schema=schema)
+    try:
+        c.execute("INSERT INTO audit_event (action_id, name, actor, source, params, role) "
+                  "VALUES (gen_random_uuid(), 'reset', 'demo-admin', 'api', '{}', 'admin')")
+        c.commit()
+    finally:
+        c.close()
+    r2 = SimRunner(schema=schema, seed=7)
+    assert r2.sim_now == EPOCH and r2.state()["tick"] == 0
+    r2.close()

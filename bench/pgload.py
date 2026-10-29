@@ -9,6 +9,7 @@ from psycopg import sql
 
 from engine.db import connect, get_dsn
 from engine.db import bitemporal as bt
+from engine.db.setup import apply_schema
 
 SCHEMA_SQL = Path(__file__).resolve().parents[1] / "build" / "schema.sql"
 VALID_FROM = datetime(2020, 1, 1, tzinfo=UTC)
@@ -20,7 +21,7 @@ def reset_schema(name: str = "bench") -> None:
         a.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(name)))
         a.execute(sql.SQL("SET search_path TO {}, public").format(sql.Identifier(name)))
         a.execute("CREATE EXTENSION IF NOT EXISTS btree_gist")
-        a.execute(SCHEMA_SQL.read_text())
+        apply_schema(a, SCHEMA_SQL.read_text())
 
 
 def load(ds, schema: str = "bench") -> dict:
