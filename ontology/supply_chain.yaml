@@ -6,8 +6,8 @@ classes:
   Warehouse: {extends: Facility}
 objectTypes:
   Supplier:  {properties: {name: "string!", country: string}}
-  Port:      {properties: {name: "string!", lat: float, lon: float, location: point, status: {enum: [open, closed]}}}
-  Warehouse: {properties: {name: "string!", lat: float, lon: float, location: point}}
+  Port:      {properties: {name: "string!", lat: float, lon: float, location: point, status: {enum: [open, closed]}, region: {enum: [APAC, EMEA, AMER]}}}
+  Warehouse: {properties: {name: "string!", lat: float, lon: float, location: point, region: {enum: [APAC, EMEA, AMER]}}}
   Shipment:
     properties:
       ref: "string!"
@@ -43,38 +43,151 @@ linkTypes:
   invoices_for: {from: Invoice, to: Shipment, cardinality: many-to-one}
   billed_by:   {from: Invoice,  to: Supplier, cardinality: many-to-one}
   affects:     {from: Event,    to: Port,     cardinality: many-to-many}
+roles:
+  planner:
+    description: Supply-chain planner. Plans shipments and handles port disruptions; cannot see invoices; supplier country is masked.
+    types:
+      Shipment: {read: true, write: true}
+      Carrier: {read: true}
+      Supplier: {read: true, mask: [country]}
+      Port: {read: true, write: true}
+      Warehouse: {read: true}
+      Event: {read: true, write: true}
+      PurchaseOrder: {read: true}
+      Invoice: {read: false}
+    links: [ships_via, ships_from, ships_to, operated_by, supplies, affects]
+    actions: [create_object, update_object, delete_object, create_link, end_link, ship_depart, ship_position, ship_arrive, delay_shipment, close_port, reopen_port]
+  finance_analyst:
+    description: Finance analyst. Works with invoices and purchase orders; proposes payments for approval.
+    types:
+      Invoice: {read: true, write: true}
+      PurchaseOrder: {read: true, write: true}
+      Supplier: {read: true}
+      Shipment: {read: true}
+      Carrier: {read: true}
+      Port: {read: true}
+      Warehouse: {read: true}
+      Event: {read: true}
+    links: [invoices_for, billed_by, supplies, ships_via, ships_from, ships_to, operated_by, affects]
+    actions: [create_object, update_object, create_link, end_link, issue_invoice, flag_invoice, pay_invoice]
+  regional_ops_lead:
+    description: Regional operations lead (EMEA). Sees and operates only ports and warehouses of their region and the shipments heading to them.
+    region: EMEA
+    types:
+      Port: {read: true, write: true, where: "region = $region"}
+      Warehouse: {read: true, where: "region = $region"}
+      Shipment: {read: true, where: "exists(ships_to, Warehouse: region = $region)"}
+      Carrier: {read: true}
+      Supplier: {read: true, mask: [country]}
+      Event: {read: true, write: true}
+    links: [ships_via, ships_from, ships_to, operated_by, supplies, affects]
+    actions: [close_port, reopen_port]
+  admin:
+    description: Administrator. Full access, approves every approval-gated action.
+    types: all
+    links: all
+    actions: all
+    approves: all
+  sim:
+    description: System role used by the simulation. Never selectable from the UI.
+    types: all
+    links: all
+    actions: [create_object, create_link, ship_depart, ship_position, ship_arrive, delay_shipment, close_port, reopen_port, issue_invoice, flag_invoice, pay_invoice]
+webhooks:
+  notify_ops: {url_env: AMARH_WEBHOOK_OPS_URL, method: POST, max_attempts: 5, description: Notify operations of port disruptions.}
+  notify_finance: {url_env: AMARH_WEBHOOK_FINANCE_URL, method: POST, max_attempts: 5, description: Notify finance of flagged invoices.}
 actions:
   create_object:
     description: Create an object of any type (generic, used by REST).
     params: {type: "string!", id: uuid, props: string!}
+    roles: [planner, finance_analyst, admin, sim]
+    function: create_object
   update_object:
     description: Replace properties of an object.
     params: {type: "string!", id: "uuid!", props: string!}
+    roles: [planner, finance_analyst, admin]
+    function: update_object
   delete_object:
     description: End an object's validity.
     params: {type: "string!", id: "uuid!"}
+    roles: [planner, admin]
+    function: delete_object
   create_link:
+    description: Create a link between two objects.
     params: {link: "string!", src: "uuid!", dst: "uuid!"}
+    roles: [planner, finance_analyst, admin, sim]
+    function: create_link
   end_link:
+    description: End a link between two objects.
     params: {link: "string!", src: "uuid!", dst: "uuid!"}
+    roles: [planner, finance_analyst, admin]
+    function: end_link
   ship_depart:
     description: Shipment leaves origin and becomes in_transit.
     params: {shipment: "uuid!"}
+    roles: [planner, admin, sim]
+    bind: {sh: {type: Shipment, id: $shipment}}
+    rules:
+      - modify: {type: Shipment, id: $shipment, set: {status: in_transit, progress: 0.0}}
   ship_position:
-    description: Update a shipment's position and progress.
+    description: Update a shipment's position and progress (a delayed shipment resumes).
     params: {shipment: "uuid!", position: "point!", progress: "float!"}
+    roles: [planner, admin, sim]
+    function: ship_position
   ship_arrive:
     description: Shipment arrives at destination.
     params: {shipment: "uuid!"}
+    roles: [planner, admin, sim]
+    bind: {sh: {type: Shipment, id: $shipment}}
+    rules:
+      - modify: {type: Shipment, id: $shipment, set: {status: arrived, progress: 1.0}}
   delay_shipment:
+    description: Mark a shipment delayed and push its ETA back.
     params: {shipment: "uuid!", delay_hours: "float!", reason: string}
+    roles: [planner, admin, sim]
+    bind: {sh: {type: Shipment, id: $shipment}}
+    criteria:
+      - {expr: "$delay_hours > 0", message: "delay_hours must be positive"}
+    function: delay_shipment
   close_port:
-    params: {port: "uuid!", reason: string, duration_h: float}
+    description: Close a port, open a port_closure Event affecting it.
+    params: {port: "uuid!", reason: string, duration_h: float, event_id: uuid}
+    roles: [planner, regional_ops_lead, admin, sim]
+    bind: {port: {type: Port, id: $port}}
+    function: close_port
+    webhooks: [notify_ops]
   reopen_port:
+    description: Reopen a port and end its open closure Event.
     params: {port: "uuid!"}
+    roles: [planner, regional_ops_lead, admin, sim]
+    bind: {port: {type: Port, id: $port}}
+    function: reopen_port
   issue_invoice:
-    params: {shipment: "uuid!", supplier: "uuid!", amount: "float!", currency: string, due: timestamp}
+    description: Issue an invoice for a shipment, billed by a supplier.
+    params: {shipment: "uuid!", supplier: "uuid!", amount: "float!", currency: string, due: timestamp, invoice_id: uuid, ref: string}
+    roles: [finance_analyst, admin, sim]
+    bind: {sh: {type: Shipment, id: $shipment}, su: {type: Supplier, id: $supplier}}
+    criteria:
+      - {expr: "$amount > 0", message: "Invoice amount must be positive"}
+    function: issue_invoice
   flag_invoice:
+    description: Flag an invoice as anomalous.
     params: {invoice: "uuid!", anomaly: "string!"}
+    roles: [finance_analyst, admin, sim]
+    bind: {inv: {type: Invoice, id: $invoice}}
+    criteria:
+      - {expr: "inv.status != 'paid'", message: "Invoice is already paid"}
+    rules:
+      - modify: {type: Invoice, id: $invoice, set: {status: flagged, anomaly: $anomaly}}
+    webhooks: [notify_finance]
   pay_invoice:
+    description: Pay an open invoice (needs approval by an admin).
     params: {invoice: "uuid!"}
+    roles: [finance_analyst, admin, sim]
+    approval: {required: true, approvers: [admin], exempt: [sim]}
+    bind: {inv: {type: Invoice, id: $invoice}}
+    criteria:
+      - {expr: "inv.status == 'open'", message: "Only open invoices can be paid"}
+    rules:
+      - modify: {type: Invoice, id: $invoice, set: {status: paid}}
+    rollback: compensate

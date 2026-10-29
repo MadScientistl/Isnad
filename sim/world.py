@@ -1,4 +1,4 @@
-"""SimPy world: processes that generate supply-chain activity by calling apply_action.
+"""SimPy world: processes that generate supply-chain activity by calling the injected `apply` callback (engine.actions.execute).
 
 Time: env.now is in sim hours since the epoch. All process events fire at integer hours;
 the logical hour of a write is floor(env.now) (the runner runs to H+0.5 so that everything

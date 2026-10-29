@@ -31,9 +31,10 @@ export default function GraphPage() {
 
   useEffect(() => {
     const d = g.data; if (!ref.current || !d) return;
+    const ids = new Set(d.nodes.map((n) => n.id)); // defensive: never draw an edge to a node the role cannot see
     const els: cytoscape.ElementDefinition[] = [
       ...d.nodes.map((n) => ({ data: { id: n.id, label: n.label + (emph(n.status) ? ` [${n.status}]` : ""), type: n.type, emph: emph(n.status) ? 1 : 0, status: n.status ?? "", centre: n.id === d.center ? 1 : 0, color: TCOL[n.type] ?? "#6366f1" } })),
-      ...d.edges.map((e, i) => ({ data: { id: `e${i}`, source: e.src, target: e.dst, label: e.link + (e.inferred ? " (inferred)" : ""), inferred: e.inferred ? 1 : 0 } })),
+      ...d.edges.filter((e) => ids.has(e.src) && ids.has(e.dst)).map((e, i) => ({ data: { id: `e${i}`, source: e.src, target: e.dst, label: e.link + (e.inferred ? " (inferred)" : ""), inferred: e.inferred ? 1 : 0 } })),
     ];
     const cy = cytoscape({ container: ref.current, elements: els, layout: { name: "cose", animate: false, nodeRepulsion: () => 40000, idealEdgeLength: () => 130, nodeOverlap: 30, padding: 30 } as any,
       style: [
@@ -69,7 +70,7 @@ export default function GraphPage() {
         <label style={{ flexDirection: "row", alignItems: "center", gap: 6, color: "var(--ink)" }}><input type="checkbox" checked={inferred} onChange={(e) => setInferred(e.target.checked)} /> Show inferred edges</label>
         <span className="muted">{live ? "Live state" : `As of ${fmtT(asOf)}`}</span>
       </div>
-      {g.error && <div className="err">{g.error}</div>}
+      {g.error && <div className="err">{/API 404/.test(g.error) ? "Centre object not found. Pick another object." : g.error}</div>}
       {g.data?.truncated && <div className="warnbox">Result truncated at 300 nodes. Reduce the depth or pick a more specific centre.</div>}
       {wantInferredButNone && <div className="warnbox">Inferred edges exist for the live state only. Switch to Live to see them.</div>}
       <div className="cy" ref={ref} role="img" aria-label="Graph neighbourhood" data-testid="graph" />

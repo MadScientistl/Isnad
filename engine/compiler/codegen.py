@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from .model import Ontology
+import json
+
+from .model import Ontology, parse_param_type
 
 GEO_PY = {"point": "GeoPoint", "linestring": "GeoLineString"}
 GEO_TS = {"point": "GeoJSONPoint", "linestring": "GeoJSONLineString"}
@@ -60,6 +62,7 @@ def pydantic_source(o: Ontology) -> str:
             out.append(f"    {p.name}: {t}" if p.required else f"    {p.name}: Optional[{t}] = None")
     out += ["", "", "class Link(BaseModel):", "    src: UUID", "    dst: UUID", "",
             "", "OBJECT_MODELS = {" + ", ".join(f"{n!r}: {n}" for n in names) + "}", ""]
+    out += _py_governance(o)
     return "\n".join(out)
 
 
@@ -86,12 +89,11 @@ def ts_source(o: Ontology) -> str:
     out.append("export interface ActionParams {")
     for a in acts:
         ps = []
-        for pn, pt in o.actions[a].params.items():
-            req = pt.endswith("!")
-            base = pt.rstrip("!")
-            ps.append(f"{pn}{'' if req else '?'}: {'string' if base == 'uuid' else TS[base]}")
+        for sp in o.actions[a].param_specs():
+            ps.append(f"{sp.name}{'' if sp.required else '?'}: {'string' if sp.base == 'uuid' else TS[sp.base]}")
         out.append(f"  {a}: {{ " + "; ".join(ps) + " };" if ps else f"  {a}: Record<string, never>;")
     out.append("}")
+    out += _ts_governance(o)
     out.append("export interface ObjectTypeMap {")
     out += [f"  {t}: {t};" for t in types]
     out.append("}")
@@ -100,6 +102,41 @@ def ts_source(o: Ontology) -> str:
     out.append("}")
     out.append(TS_RUNTIME)
     return "\n".join(out)
+
+
+def _action_meta(o: Ontology) -> dict:
+    meta = {}
+    for n in sorted(o.actions):
+        a = o.actions[n]
+        meta[n] = {
+            "description": a.description or "",
+            "params": [{"name": sp.name, "type": sp.base, "ref": sp.ref, "required": sp.required} for sp in a.param_specs()],
+            "requiresApproval": a.approval_required,
+            "approvers": list(a.approvers),
+            "roles": sorted(a.roles),
+            "webhooks": list(a.webhooks),
+            "rollback": a.rollback,
+        }
+    return meta
+
+
+def _ts_governance(o: Ontology) -> list[str]:
+    roles = sorted(o.roles)
+    out = ["export type RoleName = " + (" | ".join(f'"{r}"' for r in roles) or "never") + ";",
+           "/** Roles a user may pick in the UI (the system role `sim` is excluded). */",
+           "export const SELECTABLE_ROLES: RoleName[] = " + json.dumps([r for r in roles if r != "sim"]) + ";",
+           "export interface ActionParamMeta { name: string; type: string; ref: string | null; required: boolean }",
+           "export interface ActionMeta {",
+           "  description: string; params: ActionParamMeta[]; requiresApproval: boolean; approvers: RoleName[];",
+           "  roles: RoleName[]; webhooks: string[]; rollback: \"compensate\" | \"irreversible\";", "}",
+           "export const ACTION_META: Record<ActionName, ActionMeta> = " + json.dumps(_action_meta(o), indent=2) + ";", ""]
+    return out
+
+
+def _py_governance(o: Ontology) -> list[str]:
+    return ["", "ROLE_NAMES = " + repr(sorted(o.roles)),
+            "SELECTABLE_ROLES = " + repr([r for r in sorted(o.roles) if r != "sim"]),
+            "ACTION_META = " + repr(_action_meta(o)), ""]
 
 
 TS_RUNTIME = r"""

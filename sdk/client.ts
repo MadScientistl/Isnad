@@ -56,6 +56,7 @@ export interface PortProps {
   lon?: number;
   location?: GeoJSONPoint;
   status?: "open" | "closed";
+  region?: "APAC" | "EMEA" | "AMER";
 }
 
 export interface Port extends PortProps {
@@ -116,6 +117,7 @@ export interface WarehouseProps {
   lat?: number;
   lon?: number;
   location?: GeoJSONPoint;
+  region?: "APAC" | "EMEA" | "AMER";
 }
 
 export interface Warehouse extends WarehouseProps {
@@ -129,14 +131,14 @@ export type ObjectTypeName = "Carrier" | "Event" | "Invoice" | "Port" | "Purchas
 export type LinkTypeName = "affects" | "billed_by" | "invoices_for" | "operated_by" | "ships_from" | "ships_to" | "ships_via" | "supplies";
 export type ActionName = "close_port" | "create_link" | "create_object" | "delay_shipment" | "delete_object" | "end_link" | "flag_invoice" | "issue_invoice" | "pay_invoice" | "reopen_port" | "ship_arrive" | "ship_depart" | "ship_position" | "update_object";
 export interface ActionParams {
-  close_port: { port: string; reason?: string; duration_h?: number };
+  close_port: { port: string; reason?: string; duration_h?: number; event_id?: string };
   create_link: { link: string; src: string; dst: string };
   create_object: { type: string; id?: string; props: string };
   delay_shipment: { shipment: string; delay_hours: number; reason?: string };
   delete_object: { type: string; id: string };
   end_link: { link: string; src: string; dst: string };
   flag_invoice: { invoice: string; anomaly: string };
-  issue_invoice: { shipment: string; supplier: string; amount: number; currency?: string; due?: string };
+  issue_invoice: { shipment: string; supplier: string; amount: number; currency?: string; due?: string; invoice_id?: string; ref?: string };
   pay_invoice: { invoice: string };
   reopen_port: { port: string };
   ship_arrive: { shipment: string };
@@ -144,6 +146,444 @@ export interface ActionParams {
   ship_position: { shipment: string; position: GeoJSONPoint; progress: number };
   update_object: { type: string; id: string; props: string };
 }
+export type RoleName = "admin" | "finance_analyst" | "planner" | "regional_ops_lead" | "sim";
+/** Roles a user may pick in the UI (the system role `sim` is excluded). */
+export const SELECTABLE_ROLES: RoleName[] = ["admin", "finance_analyst", "planner", "regional_ops_lead"];
+export interface ActionParamMeta { name: string; type: string; ref: string | null; required: boolean }
+export interface ActionMeta {
+  description: string; params: ActionParamMeta[]; requiresApproval: boolean; approvers: RoleName[];
+  roles: RoleName[]; webhooks: string[]; rollback: "compensate" | "irreversible";
+}
+export const ACTION_META: Record<ActionName, ActionMeta> = {
+  "close_port": {
+    "description": "Close a port, open a port_closure Event affecting it.",
+    "params": [
+      {
+        "name": "port",
+        "type": "uuid",
+        "ref": null,
+        "required": true
+      },
+      {
+        "name": "reason",
+        "type": "string",
+        "ref": null,
+        "required": false
+      },
+      {
+        "name": "duration_h",
+        "type": "float",
+        "ref": null,
+        "required": false
+      },
+      {
+        "name": "event_id",
+        "type": "uuid",
+        "ref": null,
+        "required": false
+      }
+    ],
+    "requiresApproval": false,
+    "approvers": [],
+    "roles": [
+      "admin",
+      "planner",
+      "regional_ops_lead",
+      "sim"
+    ],
+    "webhooks": [
+      "notify_ops"
+    ],
+    "rollback": "compensate"
+  },
+  "create_link": {
+    "description": "Create a link between two objects.",
+    "params": [
+      {
+        "name": "link",
+        "type": "string",
+        "ref": null,
+        "required": true
+      },
+      {
+        "name": "src",
+        "type": "uuid",
+        "ref": null,
+        "required": true
+      },
+      {
+        "name": "dst",
+        "type": "uuid",
+        "ref": null,
+        "required": true
+      }
+    ],
+    "requiresApproval": false,
+    "approvers": [],
+    "roles": [
+      "admin",
+      "finance_analyst",
+      "planner",
+      "sim"
+    ],
+    "webhooks": [],
+    "rollback": "compensate"
+  },
+  "create_object": {
+    "description": "Create an object of any type (generic, used by REST).",
+    "params": [
+      {
+        "name": "type",
+        "type": "string",
+        "ref": null,
+        "required": true
+      },
+      {
+        "name": "id",
+        "type": "uuid",
+        "ref": null,
+        "required": false
+      },
+      {
+        "name": "props",
+        "type": "string",
+        "ref": null,
+        "required": true
+      }
+    ],
+    "requiresApproval": false,
+    "approvers": [],
+    "roles": [
+      "admin",
+      "finance_analyst",
+      "planner",
+      "sim"
+    ],
+    "webhooks": [],
+    "rollback": "compensate"
+  },
+  "delay_shipment": {
+    "description": "Mark a shipment delayed and push its ETA back.",
+    "params": [
+      {
+        "name": "shipment",
+        "type": "uuid",
+        "ref": null,
+        "required": true
+      },
+      {
+        "name": "delay_hours",
+        "type": "float",
+        "ref": null,
+        "required": true
+      },
+      {
+        "name": "reason",
+        "type": "string",
+        "ref": null,
+        "required": false
+      }
+    ],
+    "requiresApproval": false,
+    "approvers": [],
+    "roles": [
+      "admin",
+      "planner",
+      "sim"
+    ],
+    "webhooks": [],
+    "rollback": "compensate"
+  },
+  "delete_object": {
+    "description": "End an object's validity.",
+    "params": [
+      {
+        "name": "type",
+        "type": "string",
+        "ref": null,
+        "required": true
+      },
+      {
+        "name": "id",
+        "type": "uuid",
+        "ref": null,
+        "required": true
+      }
+    ],
+    "requiresApproval": false,
+    "approvers": [],
+    "roles": [
+      "admin",
+      "planner"
+    ],
+    "webhooks": [],
+    "rollback": "compensate"
+  },
+  "end_link": {
+    "description": "End a link between two objects.",
+    "params": [
+      {
+        "name": "link",
+        "type": "string",
+        "ref": null,
+        "required": true
+      },
+      {
+        "name": "src",
+        "type": "uuid",
+        "ref": null,
+        "required": true
+      },
+      {
+        "name": "dst",
+        "type": "uuid",
+        "ref": null,
+        "required": true
+      }
+    ],
+    "requiresApproval": false,
+    "approvers": [],
+    "roles": [
+      "admin",
+      "finance_analyst",
+      "planner"
+    ],
+    "webhooks": [],
+    "rollback": "compensate"
+  },
+  "flag_invoice": {
+    "description": "Flag an invoice as anomalous.",
+    "params": [
+      {
+        "name": "invoice",
+        "type": "uuid",
+        "ref": null,
+        "required": true
+      },
+      {
+        "name": "anomaly",
+        "type": "string",
+        "ref": null,
+        "required": true
+      }
+    ],
+    "requiresApproval": false,
+    "approvers": [],
+    "roles": [
+      "admin",
+      "finance_analyst",
+      "sim"
+    ],
+    "webhooks": [
+      "notify_finance"
+    ],
+    "rollback": "compensate"
+  },
+  "issue_invoice": {
+    "description": "Issue an invoice for a shipment, billed by a supplier.",
+    "params": [
+      {
+        "name": "shipment",
+        "type": "uuid",
+        "ref": null,
+        "required": true
+      },
+      {
+        "name": "supplier",
+        "type": "uuid",
+        "ref": null,
+        "required": true
+      },
+      {
+        "name": "amount",
+        "type": "float",
+        "ref": null,
+        "required": true
+      },
+      {
+        "name": "currency",
+        "type": "string",
+        "ref": null,
+        "required": false
+      },
+      {
+        "name": "due",
+        "type": "timestamp",
+        "ref": null,
+        "required": false
+      },
+      {
+        "name": "invoice_id",
+        "type": "uuid",
+        "ref": null,
+        "required": false
+      },
+      {
+        "name": "ref",
+        "type": "string",
+        "ref": null,
+        "required": false
+      }
+    ],
+    "requiresApproval": false,
+    "approvers": [],
+    "roles": [
+      "admin",
+      "finance_analyst",
+      "sim"
+    ],
+    "webhooks": [],
+    "rollback": "compensate"
+  },
+  "pay_invoice": {
+    "description": "Pay an open invoice (needs approval by an admin).",
+    "params": [
+      {
+        "name": "invoice",
+        "type": "uuid",
+        "ref": null,
+        "required": true
+      }
+    ],
+    "requiresApproval": true,
+    "approvers": [
+      "admin"
+    ],
+    "roles": [
+      "admin",
+      "finance_analyst",
+      "sim"
+    ],
+    "webhooks": [],
+    "rollback": "compensate"
+  },
+  "reopen_port": {
+    "description": "Reopen a port and end its open closure Event.",
+    "params": [
+      {
+        "name": "port",
+        "type": "uuid",
+        "ref": null,
+        "required": true
+      }
+    ],
+    "requiresApproval": false,
+    "approvers": [],
+    "roles": [
+      "admin",
+      "planner",
+      "regional_ops_lead",
+      "sim"
+    ],
+    "webhooks": [],
+    "rollback": "compensate"
+  },
+  "ship_arrive": {
+    "description": "Shipment arrives at destination.",
+    "params": [
+      {
+        "name": "shipment",
+        "type": "uuid",
+        "ref": null,
+        "required": true
+      }
+    ],
+    "requiresApproval": false,
+    "approvers": [],
+    "roles": [
+      "admin",
+      "planner",
+      "sim"
+    ],
+    "webhooks": [],
+    "rollback": "compensate"
+  },
+  "ship_depart": {
+    "description": "Shipment leaves origin and becomes in_transit.",
+    "params": [
+      {
+        "name": "shipment",
+        "type": "uuid",
+        "ref": null,
+        "required": true
+      }
+    ],
+    "requiresApproval": false,
+    "approvers": [],
+    "roles": [
+      "admin",
+      "planner",
+      "sim"
+    ],
+    "webhooks": [],
+    "rollback": "compensate"
+  },
+  "ship_position": {
+    "description": "Update a shipment's position and progress (a delayed shipment resumes).",
+    "params": [
+      {
+        "name": "shipment",
+        "type": "uuid",
+        "ref": null,
+        "required": true
+      },
+      {
+        "name": "position",
+        "type": "point",
+        "ref": null,
+        "required": true
+      },
+      {
+        "name": "progress",
+        "type": "float",
+        "ref": null,
+        "required": true
+      }
+    ],
+    "requiresApproval": false,
+    "approvers": [],
+    "roles": [
+      "admin",
+      "planner",
+      "sim"
+    ],
+    "webhooks": [],
+    "rollback": "compensate"
+  },
+  "update_object": {
+    "description": "Replace properties of an object.",
+    "params": [
+      {
+        "name": "type",
+        "type": "string",
+        "ref": null,
+        "required": true
+      },
+      {
+        "name": "id",
+        "type": "uuid",
+        "ref": null,
+        "required": true
+      },
+      {
+        "name": "props",
+        "type": "string",
+        "ref": null,
+        "required": true
+      }
+    ],
+    "requiresApproval": false,
+    "approvers": [],
+    "roles": [
+      "admin",
+      "finance_analyst",
+      "planner"
+    ],
+    "webhooks": [],
+    "rollback": "compensate"
+  }
+};
+
 export interface ObjectTypeMap {
   Carrier: Carrier;
   Event: Event;

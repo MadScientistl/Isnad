@@ -38,3 +38,22 @@ def conn(schema):
     yield c
     c.rollback()
     c.close()
+
+
+@pytest.fixture(scope="session")
+def gschema():
+    """Schema with governance tables (inferred_support) + RLS layer."""
+    from engine.db.setup import apply_schema
+    name = f"tg_{uuid.uuid4().hex[:10]}"
+    try:
+        admin = psycopg.connect(get_dsn(), autocommit=True)
+    except psycopg.OperationalError as e:
+        pytest.skip(f"postgres unreachable: {e}")
+    admin.execute("CREATE EXTENSION IF NOT EXISTS btree_gist")
+    admin.execute("CREATE EXTENSION IF NOT EXISTS postgis")
+    admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(name)))
+    admin.execute(sql.SQL("SET search_path TO {}, public").format(sql.Identifier(name)))
+    apply_schema(admin)
+    yield name
+    admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(name)))
+    admin.close()

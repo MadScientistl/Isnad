@@ -6,7 +6,8 @@ from uuid import uuid4
 import pytest
 from psycopg import sql
 
-from engine.actions import apply_action
+from engine.actions import execute
+from engine.db.principal import Principal
 from engine.actions.core import ensure_audit_schema
 from engine.db import bitemporal as bt, connect, get_dsn
 from engine.sync import snapshot, G_ASSERTED, G_INFERRED
@@ -24,7 +25,7 @@ def pipe(schema, conn):
     ensure_audit_schema(c)
     for (t,) in c.execute("SELECT tablename FROM pg_tables WHERE schemaname=%s AND "
                           "(tablename LIKE 'obj\\_%%' OR tablename LIKE 'link\\_%%' OR tablename IN "
-                          "('graph_outbox','audit_event'))", [schema]).fetchall():
+                          "('graph_outbox'))", [schema]).fetchall():
         c.execute(sql.SQL("TRUNCATE {} RESTART IDENTITY").format(sql.Identifier(t)))
     c.commit()
     yield SyncPipeline(schema=schema, min_reason_interval_s=0.2), c
@@ -39,8 +40,8 @@ def test_config_defaults_from_yaml():
 
 
 def _world(c, rnd, steps=40):
-    sup = apply_action(c, "create_object", {"type": "Supplier", "props": {"name": "s0", "country": "DE"}},
-                       "t", valid_at=T0).created
+    sup = execute(c, "create_object", {"type": "Supplier", "props": {"name": "s0", "country": "DE"}},
+                  Principal("sim", "t", ""), valid_at=T0).created
     return sup
 
 
@@ -78,8 +79,8 @@ def test_parity_and_abstract_endpoint(pipe):
         if k % 3 == 0:
             p.sync()
     # real action path too
-    r = apply_action(c, "create_object", {"type": "Supplier", "props": {"name": "x", "country": "FR"}},
-                     "t", valid_at=T0 + timedelta(days=20))
+    r = execute(c, "create_object", {"type": "Supplier", "props": {"name": "x", "country": "FR"}},
+                Principal("sim", "t", ""), valid_at=T0 + timedelta(days=20))
     p.sync()
     inc = snapshot(p.store)
     p.rebuild()

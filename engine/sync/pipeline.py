@@ -11,6 +11,7 @@ from pyoxigraph import NamedNode
 
 from engine.db import connect, get_dsn
 from engine.reason import materialize
+from engine.reason.materialize import write_support
 from . import iri
 from .store import SyncConfig, consume_outbox, get_last_seq, open_store, rebuild
 
@@ -29,6 +30,7 @@ class SyncPipeline:
         self._dirty = True            # asserted graph changed since last reasoning
         self._last_reason = -1e18     # monotonic time of last reasoning pass
         self._reasoned_once = False
+        self.support_stats = None
 
     def _conn(self) -> psycopg.Connection:
         return connect(self.dsn, schema=self.schema)
@@ -53,9 +55,20 @@ class SyncPipeline:
                 if time.monotonic() - self._last_reason < self.min_reason_interval_s:
                     return False
             materialize(self.store, self.cfg.namespace)
+            self._write_support()
             self._dirty = False
             self._last_reason = time.monotonic()
             return True
+
+    def _write_support(self) -> None:
+        """Record derivations of inferred edges (inferred_support) as OWNER. Skipped if the table is absent."""
+        c = self._conn()
+        try:
+            self.support_stats = write_support(c, self.store, self.cfg.namespace)
+        except psycopg.errors.UndefinedTable:
+            self.support_stats = None
+        finally:
+            c.close()
 
     def rebuild(self) -> None:
         with self._lock:

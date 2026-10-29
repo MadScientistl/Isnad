@@ -29,6 +29,7 @@ from psycopg.types.range import Range
 COMMON_COLS = ("valid_during", "recorded_during", "changed_by", "action_id", "scenario_id")
 
 _cols_cache: dict[tuple, tuple[str, ...]] = {}
+_rd_cache: dict[tuple, bool] = {}
 
 
 # ---------------------------------------------------------------- helpers
@@ -64,23 +65,30 @@ def _tbl(name: str) -> sql.Identifier:
     return sql.Identifier(name)
 
 
+_COLS_SQL = """SELECT a.attname, t.typname FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
+               WHERE a.attrelid = to_regclass(%s) AND a.attnum > 0 AND NOT a.attisdropped
+               ORDER BY a.attnum"""
+
+
+def _sp(conn) -> str:
+    return conn.execute("SELECT current_schemas(false)::text").fetchone()[0]
+
+
+def clear_caches() -> None:
+    """Forget cached column lists / view existence (call after DDL on the same process)."""
+    _cols_cache.clear()
+    _geo_cache.clear()
+    _rd_cache.clear()
+
+
 def _prop_cols(conn: psycopg.Connection, table: str, keycols: Sequence[str]) -> tuple[str, ...]:
-    with conn.cursor() as cur:
-        cur.execute("SELECT current_schemas(false)::text")
-        sp = cur.fetchone()[0]
-        key = (sp, table)
-        if key not in _cols_cache:
-            cur.execute(
-                """SELECT column_name FROM information_schema.columns
-                   WHERE table_name = %s AND table_schema = ANY(current_schemas(false))
-                   ORDER BY ordinal_position""",
-                [table],
-            )
-            cols = [r[0] for r in cur.fetchall()]
-            if not cols:
-                raise LookupError(f"table {table} not found on search_path")
-            skip = set(COMMON_COLS) | set(keycols)
-            _cols_cache[key] = tuple(c for c in cols if c not in skip)
+    key = (_sp(conn), table, tuple(keycols))
+    if key not in _cols_cache:
+        cols = [r[0] for r in conn.execute(_COLS_SQL, [table]).fetchall()]
+        if not cols:
+            raise LookupError(f"table {table} not found on search_path")
+        skip = set(COMMON_COLS) | set(keycols)
+        _cols_cache[key] = tuple(c for c in cols if c not in skip)
     return _cols_cache[key]
 
 
@@ -89,22 +97,32 @@ _geo_cache: dict[tuple, tuple[tuple[str, ...], tuple[str, ...]]] = {}
 
 def _table_cols(conn: psycopg.Connection, table: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """(all columns in order, geometry columns) of `table` on the current search_path."""
-    with conn.cursor() as cur:
-        cur.execute("SELECT current_schemas(false)::text")
-        key = (cur.fetchone()[0], table)
-        if key not in _geo_cache:
-            cur.execute(
-                """SELECT column_name, udt_name FROM information_schema.columns
-                   WHERE table_name = %s AND table_schema = ANY(current_schemas(false))
-                   ORDER BY ordinal_position""",
-                [table],
-            )
-            rows = cur.fetchall()
-            if not rows:
-                raise LookupError(f"table {table} not found on search_path")
-            _geo_cache[key] = (tuple(r[0] for r in rows),
-                               tuple(r[0] for r in rows if r[1] == "geometry"))
+    key = (_sp(conn), table)
+    if key not in _geo_cache:
+        rows = conn.execute(_COLS_SQL, [table]).fetchall()
+        if not rows:
+            raise LookupError(f"table {table} not found on search_path")
+        _geo_cache[key] = (tuple(r[0] for r in rows),
+                           tuple(r[0] for r in rows if r[1] == "geometry"))
     return _geo_cache[key]
+
+
+def read_source(conn, table: str, masked: bool = True) -> str:
+    """Relation to read an object table through. masked => the generated `rd_<table>` view
+    (property masking + RLS, contract Phase 3) when it exists in this schema; otherwise the
+    base table. The fallback ONLY applies while the views are absent (pre-Phase-3 schemas).
+    Link tables are read directly."""
+    if not masked or not table.startswith("obj_"):
+        return table
+    rd = f"rd_{table}"
+    key = (_sp(conn), rd)
+    if key not in _rd_cache:
+        _rd_cache[key] = conn.execute("SELECT to_regclass(%s) IS NOT NULL", [rd]).fetchone()[0]
+    if _rd_cache[key]:
+        return rd
+    if conn.execute("SELECT current_user = 'amarh_app'").fetchone()[0]:
+        raise LookupError(f"masked view {rd} is missing: refusing to read the base table as a scoped role")
+    return table
 
 
 def geometry_columns(conn: psycopg.Connection, table_or_type: str) -> tuple[str, ...]:
@@ -350,27 +368,29 @@ def _asof_clause(as_of_valid, as_of_recorded):
     return " AND ".join(parts), params
 
 
-def _fetch(conn, table, where: str, params: list, order: str = "") -> list[dict]:
+def _fetch(conn, table, where: str, params: list, order: str = "", masked: bool = True) -> list[dict]:
     q = sql.SQL("SELECT {s} FROM {t} WHERE {w} {o}").format(
-        s=_select_list(conn, table), t=_tbl(table), w=sql.SQL(where), o=sql.SQL(order))
+        s=_select_list(conn, table), t=_tbl(read_source(conn, table, masked)),
+        w=sql.SQL(where), o=sql.SQL(order))
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(q, params)
         return cur.fetchall()
 
 
 def get_object(conn, type, id: UUID, as_of_valid: datetime | None = None,
-               as_of_recorded: datetime | None = None, scenario_id: int = 0) -> dict | None:
+               as_of_recorded: datetime | None = None, scenario_id: int = 0,
+               masked: bool = True) -> dict | None:
     """The object as true at `as_of_valid`, as believed at `as_of_recorded`."""
     c, p = _asof_clause(as_of_valid, as_of_recorded)
     rows = _fetch(conn, obj_table(type), f"id = %s AND scenario_id = %s AND {c}",
-                  [id, scenario_id, *p])
+                  [id, scenario_id, *p], masked=masked)
     return rows[0] if rows else None
 
 
 def list_objects(conn, type, as_of_valid=None, as_of_recorded=None, scenario_id: int = 0,
                  where: str | None = None, params: Sequence[Any] = (), *,
                  limit: int | None = None, offset: int = 0, order_by: str | None = None,
-                 desc: bool = False) -> list[dict]:
+                 desc: bool = False, masked: bool = True) -> list[dict]:
     """All objects of a type as of the given instants. `where` is an optional trusted SQL
     fragment (use %s placeholders with `params`). `order_by` is a column name (default id);
     limit/offset are pushed down into SQL."""
@@ -390,11 +410,12 @@ def list_objects(conn, type, as_of_valid=None, as_of_recorded=None, scenario_id:
     if offset:
         order += " OFFSET %s"
         args.append(int(offset))
-    return _fetch(conn, table, w, args, order)
+    return _fetch(conn, table, w, args, order, masked)
 
 
 def list_objects_bbox(conn, type, bbox: Sequence[float], as_of_valid=None, as_of_recorded=None,
-                      geom_col: str | None = None, scenario_id: int = 0) -> list[dict]:
+                      geom_col: str | None = None, scenario_id: int = 0,
+                      masked: bool = True) -> list[dict]:
     """Objects whose geometry intersects bbox=(west, south, east, north) (EPSG:4326)."""
     geo = geometry_columns(conn, type)
     col = geom_col or (geo[0] if geo else None)
@@ -402,18 +423,20 @@ def list_objects_bbox(conn, type, bbox: Sequence[float], as_of_valid=None, as_of
         raise ValueError(f"{type} has no geometry column {geom_col!r}")
     w, s_, e, n = (float(x) for x in bbox)
     return list_objects(conn, type, as_of_valid, as_of_recorded, scenario_id,
-                        where=f'"{col}" && ST_MakeEnvelope(%s,%s,%s,%s,4326)', params=[w, s_, e, n])
+                        where=f'"{col}" && ST_MakeEnvelope(%s,%s,%s,%s,4326)', params=[w, s_, e, n],
+                        masked=masked)
 
 
-def history(conn, type, id: UUID, scenario_id: int = 0) -> list[dict]:
+def history(conn, type, id: UUID, scenario_id: int = 0, masked: bool = True) -> list[dict]:
     """Every stored version, ordered by recorded time then valid time (oldest first).
     Adds valid_from/valid_to/recorded_from/recorded_to (None = open)."""
     rows = _fetch(conn, obj_table(type), "id = %s AND scenario_id = %s", [id, scenario_id],
-                  "ORDER BY lower(recorded_during), lower(valid_during)")
+                  "ORDER BY lower(recorded_during), lower(valid_during)", masked=masked)
     return [_decorate(r) for r in rows]
 
 
-def link_history(conn, link: str, src: UUID, dst: UUID, scenario_id: int = 0) -> list[dict]:
+def link_history(conn, link: str, src: UUID, dst: UUID, scenario_id: int = 0,
+                 masked: bool = True) -> list[dict]:
     rows = _fetch(conn, link_table(link), "src = %s AND dst = %s AND scenario_id = %s",
                   [src, dst, scenario_id], "ORDER BY lower(recorded_during), lower(valid_during)")
     return [_decorate(r) for r in rows]
@@ -427,22 +450,23 @@ def _decorate(r: dict) -> dict:
 
 
 def neighbours(conn, link: str, id: UUID, direction: str = "out", as_of_valid=None,
-               as_of_recorded=None, scenario_id: int = 0) -> list[UUID]:
+               as_of_recorded=None, scenario_id: int = 0,
+               masked: bool = True) -> list[UUID]:
     """Ids linked from (direction='out': id is src) or to (direction='in') the given id."""
     if direction not in ("out", "in"):
         raise ValueError("direction must be 'out' or 'in'")
     mine, other = ("src", "dst") if direction == "out" else ("dst", "src")
     c, p = _asof_clause(as_of_valid, as_of_recorded)
     rows = _fetch(conn, link_table(link), f"{mine} = %s AND scenario_id = %s AND {c}",
-                  [id, scenario_id, *p], f"ORDER BY {other}")
+                  [id, scenario_id, *p], f"ORDER BY {other}", masked=masked)
     return [r[other] for r in rows]
 
 
 def list_links(conn, link: str, as_of_valid=None, as_of_recorded=None,
-               scenario_id: int = 0) -> list[dict]:
+               scenario_id: int = 0, masked: bool = True) -> list[dict]:
     c, p = _asof_clause(as_of_valid, as_of_recorded)
     return _fetch(conn, link_table(link), f"scenario_id = %s AND {c}", [scenario_id, *p],
-                  "ORDER BY src, dst")
+                  "ORDER BY src, dst", masked=masked)
 
 
 # ------------------------------------------------------------------- bulk

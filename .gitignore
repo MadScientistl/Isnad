@@ -7,3 +7,4 @@ bench/results/*.json
 web/dist/
 .pytest_cache/
 web/dist/
+bench/work/

@@ -1,9 +1,12 @@
-"""python -m engine.api.seed: apply build/schema.sql (+ audit table) and load the demo base data.
+"""python -m engine.api.seed: apply the schema (governance + compiler DDL) and load the demo base data.
 
-Idempotent and non-destructive: every entity has a deterministic uuid5 id; missing entities are
-written at the sim epoch, existing Phase 1 entities without a `location` are rewritten with one
-(a bitemporal correction at the epoch), links are only written when absent. Nothing is deleted.
-No shipments are created: the simulation does that through apply_action.
+Runs as the OWNER/loader (writes with `bt.*` directly, no role) and is audited as ONE `seed`
+execution (`audit_event` name='seed', source='seed', params = counts), inserted once per data epoch
+(a `reset` starts a new one). Idempotent and non-destructive: every entity has a deterministic uuid5 id;
+missing entities are written at the sim epoch, existing entities without a `location` / `region` are
+rewritten with one (a bitemporal correction at the epoch), links are only written when absent. Nothing is
+deleted. `region` (APAC|EMEA|AMER) is assigned to ports and warehouses by longitude.
+No shipments are created: the simulation does that through engine.actions.execute.
 """
 from __future__ import annotations
 
@@ -15,9 +18,11 @@ from pathlib import Path
 
 from psycopg import sql
 
-from engine.actions import ensure_audit_schema
+from psycopg.types.json import Jsonb
+
 from engine.db import bitemporal as bt
 from engine.db import connect
+from engine.db.setup import apply_schema as _apply_governed_schema
 
 NS = uuid.UUID("6f1d1c3e-0000-4000-8000-00000000a11a")
 ROOT = Path(__file__).resolve().parents[2]
@@ -79,14 +84,18 @@ def _apply_missing(conn, want) -> int:
     return added
 
 
+def region_for(lon: float) -> str:
+    """APAC / EMEA / AMER by longitude (D8)."""
+    return "AMER" if lon < -30 else "EMEA" if lon < 60 else "APAC"
+
+
 def apply_schema(conn, schema_sql: str | None = None) -> dict:
     if schema_sql is None:
         schema_sql = (ROOT / "build" / "schema.sql").read_text()
     conn.commit()
     added = _migrate_columns(conn, schema_sql)
-    conn.execute(schema_sql)
+    _apply_governed_schema(conn, schema_sql)
     conn.commit()
-    ensure_audit_schema(conn)
     return {"columns_added": added}
 
 
@@ -97,14 +106,15 @@ def seed(conn, schema_sql: str | None = None) -> dict:
 
     def put(type_, key, props, location=None):
         id_ = _id(type_, key)
-        cur = bt.get_object(conn, type_, id_, as_of_valid=EPOCH)
+        cur = bt.get_object(conn, type_, id_, as_of_valid=EPOCH, masked=False)
         if cur is None:
-            cur = bt.get_object(conn, type_, id_)
+            cur = bt.get_object(conn, type_, id_, masked=False)
         if cur is None:
             bt.write_object(conn, type_, id_, {**props, **({"location": location} if location else {})},
                             EPOCH, by)
             stats["written"] += 1
-        elif location is not None and cur.get("location") is None:
+        elif location is not None and (cur.get("location") is None or
+                                       ("region" in props and cur.get("region") is None)):
             keep = {k: v for k, v in cur.items() if k in props or k == "status" or k == "location"}
             keep.update({k: v for k, v in props.items() if keep.get(k) is None})
             keep["location"] = location
@@ -113,9 +123,11 @@ def seed(conn, schema_sql: str | None = None) -> dict:
         return id_
 
     for name, lat, lon in PORTS:
-        put("Port", name, {"name": name, "lat": lat, "lon": lon, "status": "open"}, _point(lat, lon))
+        put("Port", name, {"name": name, "lat": lat, "lon": lon, "status": "open",
+                                  "region": region_for(lon)}, _point(lat, lon))
     for name, lat, lon in WAREHOUSES:
-        put("Warehouse", name, {"name": name, "lat": lat, "lon": lon}, _point(lat, lon))
+        put("Warehouse", name, {"name": name, "lat": lat, "lon": lon, "region": region_for(lon)},
+            _point(lat, lon))
     for c in CARRIERS:
         put("Carrier", c, {"name": c})
     S = [put("Supplier", i, {"name": f"Supplier {i:02d}", "country": COUNTRIES[i % len(COUNTRIES)]})
@@ -140,11 +152,21 @@ def seed(conn, schema_sql: str | None = None) -> dict:
         if i not in in_chain and not any(i == c[0] for c in CHAINS):
             link_if_absent_in(S[i], S[parent])
     conn.commit()
-    ports = len(bt.list_objects(conn, "Port"))
-    return {**info, **stats, "ports": ports,
-            "warehouses": len(bt.list_objects(conn, "Warehouse")),
-            "carriers": len(bt.list_objects(conn, "Carrier")),
-            "suppliers": len(bt.list_objects(conn, "Supplier"))}
+    ports = len(bt.list_objects(conn, "Port", masked=False))
+    out = {**info, **stats, "ports": ports,
+           "warehouses": len(bt.list_objects(conn, "Warehouse", masked=False)),
+           "carriers": len(bt.list_objects(conn, "Carrier", masked=False)),
+           "suppliers": len(bt.list_objects(conn, "Supplier", masked=False))}
+    # ONE audited `seed` execution per data epoch (a `reset` event starts a new epoch)
+    if not conn.execute(
+            "SELECT 1 FROM audit_event WHERE name='seed' AND "
+            "seq > coalesce((SELECT max(seq) FROM audit_event WHERE name='reset'), 0)").fetchone():
+        conn.execute(
+            "INSERT INTO audit_event (action_id, name, actor, source, params, sim_time, role, status) "
+            "VALUES (%s,'seed','seed','seed',%s,%s,'owner','executed')",
+            [uuid.uuid4(), Jsonb(out), EPOCH])
+    conn.commit()
+    return out
 
 
 def main() -> None:

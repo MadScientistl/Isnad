@@ -9,8 +9,12 @@ from psycopg import sql
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from engine.actions import apply_action, ensure_audit_schema
+from engine.actions import execute
 from engine.db import connect, get_dsn
+from engine.db.principal import Principal
+from engine.db.setup import apply_schema
+
+SEEDER = Principal("sim", "seed", "")
 
 EPOCH = datetime(2026, 1, 1, tzinfo=UTC)
 PORTS = [("Rotterdam", 4.48, 51.95), ("Singapore", 103.8, 1.26), ("Shanghai", 121.8, 31.2),
@@ -29,8 +33,8 @@ def seed_entities(conn):
     def mk(t, props):
         # deterministic ids: the digest depends on entity ids (sim sorts candidates by id)
         i = uuid.uuid5(uuid.NAMESPACE_URL, f"sim-test:{t}:{props['name']}")
-        r = apply_action(conn, "create_object", {"type": t, "id": i, "props": props}, "seed", valid_at=EPOCH,
-                         source="seed")
+        r = execute(conn, "create_object", {"type": t, "id": i, "props": props}, SEEDER, valid_at=EPOCH,
+                    source="seed")
         return r.created[t]
 
     for n, lo, la in PORTS:
@@ -59,10 +63,9 @@ class Db:
         name = f"sim_{uuid.uuid4().hex[:10]}"
         self.admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(name)))
         self.admin.execute(sql.SQL("SET search_path TO {}, public").format(sql.Identifier(name)))
-        self.admin.execute((ROOT / "build" / "schema.sql").read_text())
+        apply_schema(self.admin)
         self.names.append(name)
         c = connect(schema=name)
-        ensure_audit_schema(c)
         ids = seed_entities(c) if seeded else None
         c.close()
         return name, ids

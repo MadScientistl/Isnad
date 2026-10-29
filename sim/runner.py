@@ -1,13 +1,14 @@
 """SimRunner: owns a DB connection, a World and (optionally) a background thread.
 
 Error policy
-  * a failed `apply_action` (validation / data error): rollback, record `last_error`, skip that
-    action (it is not part of the digest) and continue;
+  * a failed `execute` (validation / permission / criteria / data error): rollback, record `last_error`,
+    skip that action (it is not part of the digest) and continue;
   * connection-level failures (psycopg OperationalError/InterfaceError) or unexpected exceptions:
     rollback, record `last_error`; in the background thread the runner then stops
     (`running` False, `last_error` set); direct calls (step/run_until) re-raise.
 Resume
-  * on construction, if `audit_event` holds rows with source='sim' and run_id == this run_id,
+  * on construction, if `audit_event` holds rows with source='sim' and run_id == this run_id that are
+    NEWER than the last `reset` audit event (a reset keeps the audit trail but starts a new epoch),
     sim_now resumes at max(sim_time) and in-flight shipments, open invoices and closed ports are
     restored from the database (RNG streams restart from a seed derived from (seed, resume hour);
     closed ports reopen 24 h after the resume point). Otherwise sim_now = epoch.
@@ -27,11 +28,15 @@ from typing import Any
 
 import psycopg
 
-from engine.actions import apply_action, ensure_audit_schema
+from engine.actions import ApprovalRequired, CriteriaFailed, PermissionDenied, execute
 from engine.db import connect
+from engine.db.principal import Principal
 
 from .world import World
 
+# The system principal of the simulation. user='sim' (not the contract's 'system:sim') keeps the
+# Phase 2 `actor` / `changed_by` values that the audit queries and tests rely on.
+SIM_PRINCIPAL = Principal("sim", "sim", "")
 SPEEDS = ("paused", "1", "6", "24")
 KINDS = ("port_closure", "shipment_delay", "invoice_anomaly")
 
@@ -52,7 +57,6 @@ class SimRunner:
         self._lock = threading.RLock()       # serialises conn + world access
         self._slock = threading.Lock()       # guards the state snapshot
         self.conn = connect(dsn, schema)
-        ensure_audit_schema(self.conn)
         self._speed = "paused"
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -68,8 +72,10 @@ class SimRunner:
     def _reset_state(self, resume: bool) -> None:
         h = 0
         if resume:
-            row = self.conn.execute("SELECT max(sim_time) FROM audit_event WHERE run_id=%s AND source='sim'",
-                                    [self.run_id]).fetchone()
+            row = self.conn.execute(
+                "SELECT max(sim_time) FROM audit_event WHERE run_id=%s AND source='sim' "
+                "AND seq > coalesce((SELECT max(seq) FROM audit_event WHERE name='reset'), 0)",
+                [self.run_id]).fetchone()
             self.conn.commit()
             if row and row[0] is not None:
                 h = max(0, int((row[0] - self.epoch).total_seconds() // 3600))
@@ -98,12 +104,12 @@ class SimRunner:
 
     def _apply(self, name: str, params: dict, valid_at: datetime):
         try:
-            res = apply_action(self.conn, name, params, "sim", valid_at=valid_at, source="sim",
-                               run_id=self.run_id)
+            res = execute(self.conn, name, params, SIM_PRINCIPAL, valid_at=valid_at, source="sim",
+                          run_id=self.run_id)
         except (psycopg.OperationalError, psycopg.InterfaceError):
             self._rollback()
             raise
-        except (ValueError, psycopg.Error) as e:
+        except (ValueError, PermissionDenied, CriteriaFailed, ApprovalRequired, psycopg.Error) as e:
             self._rollback()
             self.last_error = f"{name} at {valid_at.isoformat()}: {e}"
             return None

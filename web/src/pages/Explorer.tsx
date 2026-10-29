@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import cytoscape from "cytoscape";
 import { type TypesResponse, type ObjectTypeName, type Neighbour } from "@sdk/client";
-import { client } from "../api";
-import { useAsOf } from "../store";
+import { client, isNotFound } from "../api";
+import { useAsOf, useApp } from "../store";
+import { ActionsPanel, Restricted } from "../Actions";
 
 type Obj = Record<string, any>;
 function useAsync<T>(fn: () => Promise<T>, deps: unknown[]) {
@@ -52,6 +53,8 @@ export default function ExplorerPage({ parts }: { parts: string[] }) {
 
 const PAGE = 15;
 function Explorer({ type, tdef, asOf, go }: { type: ObjectTypeName; tdef: TypesResponse["objectTypes"][0]; asOf?: string; go: (h: string) => void }) {
+  const { me } = useApp();
+  const masked = me?.types[type]?.masked ?? [];
   const [page, setPage] = useState(0);
   const r = useAsync(() => client.list(type, { limit: PAGE + 1, offset: page * PAGE, asOfValid: asOf }), [page]);
   const rows = (r.data ?? []) as Obj[];
@@ -61,7 +64,7 @@ function Explorer({ type, tdef, asOf, go }: { type: ObjectTypeName; tdef: TypesR
       {r.loading && <div className="muted">Loading…</div>}
       <table><thead><tr>{tdef.properties.map((p) => <th key={p.name}>{p.name}</th>)}</tr></thead>
         <tbody>{rows.slice(0, PAGE).map((o) => (
-          <tr key={o.id} className="row" onClick={() => go(`${type}/${o.id}`)}>{tdef.properties.map((p) => <td key={p.name}>{fmt(o[p.name])}</td>)}</tr>))}
+          <tr key={o.id} className="row" onClick={() => go(`${type}/${o.id}`)}>{tdef.properties.map((p) => <td key={p.name}>{masked.includes(p.name) && o[p.name] == null ? <Restricted /> : fmt(o[p.name])}</td>)}</tr>))}
           {!r.loading && !rows.length && <tr><td colSpan={99} className="muted">No objects.</td></tr>}</tbody></table>
       <p><button disabled={page === 0} onClick={() => setPage(page - 1)}>Prev</button> Page {page + 1} <button disabled={rows.length <= PAGE} onClick={() => setPage(page + 1)}>Next</button></p>
     </div>
@@ -69,6 +72,8 @@ function Explorer({ type, tdef, asOf, go }: { type: ObjectTypeName; tdef: TypesR
 }
 
 function Object360({ type, id, tdef, asOf, go, types, onChanged }: { type: ObjectTypeName; id: string; tdef: TypesResponse["objectTypes"][0]; asOf?: string; go: (h: string) => void; types: TypesResponse; onChanged: () => void }) {
+  const { me } = useApp();
+  const masked = me?.types[type]?.masked ?? [];
   const obj = useAsync(() => client.get(type, id, { asOfValid: asOf }), []);
   const hist = useAsync(() => client.history(type, id), []);
   const nb = useAsync(() => client.neighbours(type, id, asOf), []);
@@ -92,6 +97,8 @@ function Object360({ type, id, tdef, asOf, go, types, onChanged }: { type: Objec
     if (!confirm("Delete this object?")) return;
     try { await client.remove(type, id); onChanged(); go(type); } catch (e: any) { setMsg(e.message); }
   };
+  if (obj.error && isNotFound(obj.error)) return <div><p><a className="lnk" href={`#/${type}`}>← {type}</a></p><h2>Not found</h2><p className="muted">This object does not exist.</p></div>;
+  const refreshAll = () => { obj.reload(); hist.reload(); nb.reload(); onChanged(); };
   return (
     <div>
       <p><a className="lnk" href={`#/${type}`}>← {type}</a></p>
@@ -103,15 +110,16 @@ function Object360({ type, id, tdef, asOf, go, types, onChanged }: { type: Objec
           <div className="card"><h3>Properties</h3>
             {o && !edit && <table><tbody>
               <tr><th>id</th><td>{o.id}</td></tr>
-              {tdef.properties.map((p) => <tr key={p.name}><th>{p.name}</th><td>{fmt(o[p.name])}</td></tr>)}
+              {tdef.properties.map((p) => <tr key={p.name}><th>{p.name}</th><td>{masked.includes(p.name) && o[p.name] == null ? <Restricted /> : fmt(o[p.name])}</td></tr>)}
               <tr><th>changed_by</th><td>{o.changed_by}</td></tr></tbody></table>}
             {o && edit && <div className="form">{tdef.properties.map((p) => (
               <label key={p.name}><span>{p.name}{p.required ? "*" : ""}</span>
                 {p.enum.length ? <select value={edit[p.name] ?? ""} onChange={(e) => setEdit({ ...edit, [p.name]: e.target.value })}><option value="" />{p.enum.map((v) => <option key={v}>{v}</option>)}</select>
                   : <input value={edit[p.name] ?? ""} onChange={(e) => setEdit({ ...edit, [p.name]: e.target.value })} />}</label>))}
               <button onClick={save}>Save</button> <button onClick={() => setEdit(null)}>Cancel</button></div>}
-            {o && !edit && <p><button onClick={() => setEdit({ ...o })}>Edit</button> <button className="danger" onClick={del}>Delete</button></p>}
+            {o && !edit && me?.types[type]?.write !== false && <p><button onClick={() => setEdit({ ...o })}>Edit</button> <button className="danger" onClick={del}>Delete</button></p>}
           </div>
+          {o && <ActionsPanel type={type} id={id} onDone={refreshAll} />}
           <div className="card"><h3>Links</h3><Err e={nb.error} />{nb.loading && <div className="muted">Loading…</div>}
             {Object.entries(groups).map(([g, ns]) => <div key={g}><b>{g}</b><ul>{ns.map((n) => (
               <li key={n.link + n.direction + n.id}><a className="lnk" href={`#/${n.type}/${n.id}`}>{n.type} {label(n.object as Obj, n.id)}</a></li>))}</ul></div>)}
