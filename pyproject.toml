@@ -15,11 +15,13 @@ dependencies = [
   "owlrl",
   "reasonable",
   "simpy>=4.1.2",
+  "anthropic>=2.3.0",
 ]
 [dependency-groups]
 dev = ["pytest", "httpx", "psutil"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = ["live: calls the real Anthropic API (needs ANTHROPIC_API_KEY); skipped otherwise"]
 [tool.setuptools]
 packages = ["engine", "bench"]
