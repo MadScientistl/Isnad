@@ -1,0 +1,15 @@
+[project]
+name = "amarh"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi", "uvicorn", "pydantic>=2", "pyyaml", "jsonschema",
+  "psycopg[binary,pool]>=3.2", "pyoxigraph", "rdflib", "pyshacl", "owlrl", "reasonable",
+]
+[dependency-groups]
+dev = ["pytest", "httpx", "psutil"]
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+[tool.setuptools]
+packages = ["engine", "bench"]

@@ -1,0 +1,68 @@
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix sc: <https://example.org/sc#> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+sc:CarrierShape a sh:NodeShape ;
+    sh:property [ sh:datatype xsd:string ;
+            sh:maxCount 1 ;
+            sh:minCount 1 ;
+            sh:path sc:name ] ;
+    sh:targetClass sc:Carrier .
+
+sc:PortShape a sh:NodeShape ;
+    sh:property [ sh:datatype xsd:double ;
+            sh:maxCount 1 ;
+            sh:path sc:lon ],
+        [ sh:datatype xsd:string ;
+            sh:maxCount 1 ;
+            sh:minCount 1 ;
+            sh:path sc:name ],
+        [ sh:datatype xsd:string ;
+            sh:in ( "open" "closed" ) ;
+            sh:maxCount 1 ;
+            sh:path sc:status ],
+        [ sh:datatype xsd:double ;
+            sh:maxCount 1 ;
+            sh:path sc:lat ] ;
+    sh:targetClass sc:Port .
+
+sc:ShipmentShape a sh:NodeShape ;
+    sh:property [ sh:datatype xsd:string ;
+            sh:maxCount 1 ;
+            sh:minCount 1 ;
+            sh:path sc:ref ],
+        [ sh:maxCount 1 ;
+            sh:minCount 1 ;
+            sh:path sc:operated_by ],
+        [ sh:datatype xsd:string ;
+            sh:maxCount 1 ;
+            sh:path sc:status ],
+        [ sh:datatype xsd:dateTime ;
+            sh:maxCount 1 ;
+            sh:path sc:eta ] ;
+    sh:targetClass sc:Shipment .
+
+sc:SupplierShape a sh:NodeShape ;
+    sh:property [ sh:datatype xsd:string ;
+            sh:maxCount 1 ;
+            sh:minCount 1 ;
+            sh:path sc:name ],
+        [ sh:datatype xsd:string ;
+            sh:maxCount 1 ;
+            sh:path sc:country ] ;
+    sh:targetClass sc:Supplier .
+
+sc:WarehouseShape a sh:NodeShape ;
+    sh:property [ sh:datatype xsd:double ;
+            sh:maxCount 1 ;
+            sh:path sc:lat ],
+        [ sh:datatype xsd:double ;
+            sh:maxCount 1 ;
+            sh:path sc:lon ],
+        [ sh:datatype xsd:string ;
+            sh:maxCount 1 ;
+            sh:minCount 1 ;
+            sh:path sc:name ] ;
+    sh:targetClass sc:Warehouse .
+

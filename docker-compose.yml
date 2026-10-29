@@ -1,0 +1,8 @@
+services:
+  postgres:
+    image: postgres:18
+    environment: {POSTGRES_USER: amarh, POSTGRES_PASSWORD: amarh, POSTGRES_DB: amarh}
+    ports: ["55441:5432"]
+    volumes: [pgdata:/var/lib/postgresql]
+    command: ["postgres", "-c", "shared_buffers=1GB", "-c", "max_wal_size=4GB"]
+volumes: {pgdata: {}}

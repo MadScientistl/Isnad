@@ -1,0 +1,16 @@
+version: 1
+namespace: https://example.org/sc#
+classes:
+  Facility: {}
+  Port: {extends: Facility}
+  Warehouse: {extends: Facility}
+objectTypes:
+  Supplier:  {properties: {name: "string!", country: string}}
+  Port:      {properties: {name: "string!", lat: float, lon: float, status: {enum: [open, closed]}}}
+  Warehouse: {properties: {name: "string!", lat: float, lon: float}}
+  Shipment:  {properties: {ref: "string!", eta: timestamp, status: string}}
+  Carrier:   {properties: {name: "string!"}}
+linkTypes:
+  ships_via:   {from: Shipment, to: Port,     cardinality: many-to-many}
+  supplies:    {from: Supplier, to: Supplier, cardinality: many-to-many, transitive: true, inverse: supplied_by}
+  operated_by: {from: Shipment, to: Carrier,  cardinality: many-to-one, required: true}
