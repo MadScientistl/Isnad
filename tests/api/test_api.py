@@ -17,8 +17,8 @@ def test_bad_role_and_unknown_type(client):
 
 def test_seed_list_paging(client):
     all_ = client.get("/objects/Supplier?limit=1000", headers=H).json()
-    assert len(all_) == 20
-    assert len(client.get("/objects/Supplier?limit=5&offset=18", headers=H).json()) == 2
+    assert len(all_) >= 30
+    assert len(client.get(f"/objects/Supplier?limit=5&offset={len(all_) - 2}", headers=H).json()) == 2
 
 
 def test_crud_and_history(client):

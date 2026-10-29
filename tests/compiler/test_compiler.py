@@ -196,3 +196,110 @@ def test_ddl_executes(comp):
                              "VALUES (gen_random_uuid(),'P','bad','[2020-01-01,)','[2020-01-01,)','t')")
         finally:
             conn.execute(f"DROP SCHEMA {schema} CASCADE")
+
+
+def test_geo_ddl_and_index(comp):
+    ddl = comp.ddl()
+    assert "CREATE EXTENSION IF NOT EXISTS postgis;" in ddl
+    assert '"position" geometry(Point,4326)' in ddl
+    assert '"location" geometry(Point,4326)' in ddl
+    assert 'CREATE INDEX IF NOT EXISTS "obj_shipment_position_gist" ON obj_shipment USING gist ("position");' in ddl
+    assert 'CREATE INDEX IF NOT EXISTS "obj_port_location_gist" ON obj_port USING gist ("location");' in ddl
+
+
+def test_geo_linestring_ddl():
+    raw = {"version": 1, "namespace": "https://e.org/x#",
+           "objectTypes": {"Route": {"properties": {"path": "linestring!"}}}}
+    from engine.compiler.ddl import generate_ddl
+    ddl = generate_ddl(parse_ontology(raw))
+    assert '"path" geometry(LineString,4326) NOT NULL' in ddl
+    assert "USING gist (\"path\")" in ddl
+
+
+def test_geo_owl(comp):
+    from rdflib import OWL, RDFS
+    g = Graph().parse(data=comp.owl_turtle(), format="turtle")
+    geo = Namespace("http://www.opengis.net/ont/geosparql#")
+    assert (SC.location, RDF.type, OWL.DatatypeProperty) in g
+    assert (SC.position, RDFS.range, geo.wktLiteral) in g
+
+
+def test_pydantic_geojson(comp):
+    m = comp.pydantic_models()
+    ok = m.Shipment(id=uuid.uuid4(), ref="S", position={"type": "Point", "coordinates": [4.4, 51.9]})
+    assert ok.position.coordinates == [4.4, 51.9]
+    for bad in ({"type": "Point", "coordinates": [1]}, {"type": "Point", "coordinates": [200, 0]},
+                {"type": "LineString", "coordinates": [[0, 0], [1, 1]]}, {"type": "Point"}):
+        with pytest.raises(Exception):
+            m.Shipment(id=uuid.uuid4(), ref="S", position=bad)
+    m.GeoLineString(type="LineString", coordinates=[[0, 0], [1, 1]])
+    with pytest.raises(Exception):
+        m.GeoLineString(type="LineString", coordinates=[[0, 0]])
+    with pytest.raises(Exception):
+        m.Shipment(id=uuid.uuid4(), ref="S", status="sailing")
+
+
+def test_v2_types_and_links(comp):
+    o = comp.model
+    assert {"Invoice", "PurchaseOrder", "Event"} <= set(o.object_types)
+    for n, (s, d, c) in {"ships_from": ("Shipment", "Facility", "many-to-one"), "ships_to": ("Shipment", "Warehouse", "many-to-one"),
+                         "invoices_for": ("Invoice", "Shipment", "many-to-one"), "billed_by": ("Invoice", "Supplier", "many-to-one"),
+                         "affects": ("Event", "Port", "many-to-many")}.items():
+        l = o.link_types[n]
+        assert (l.src, l.dst, l.cardinality) == (s, d, c)
+    inv = {p.name: p for p in o.object_types["Invoice"].properties}
+    assert inv["status"].enum == ("open", "approved", "paid", "flagged") and inv["amount"].required
+    ddl = comp.ddl()
+    for t in ("obj_invoice", "obj_purchase_order", "obj_event", "link_ships_from", "link_affects"):
+        assert t in ddl
+
+
+def test_actions_parsed_and_ts(comp):
+    a = comp.model.actions
+    for n in ("create_object", "update_object", "delete_object", "create_link", "end_link", "ship_depart", "ship_position",
+              "ship_arrive", "delay_shipment", "close_port", "reopen_port", "issue_invoice", "flag_invoice", "pay_invoice"):
+        assert n in a
+    assert a["ship_position"].params["position"] == "point!"
+    ts = comp.ts_sdk()
+    assert "export type ActionName =" in ts and '"pay_invoice"' in ts and "interface ActionParams" in ts
+    assert "GeoJSONPoint" in ts
+
+
+def test_action_unknown_param_type():
+    d = mutated(lambda d: d["actions"]["close_port"]["params"].update(x="blob"))
+    with pytest.raises(OntologyError, match="unknown type 'blob'"):
+        parse_ontology(d)
+
+
+def test_action_bad_shape():
+    with pytest.raises(OntologyError):
+        parse_ontology(mutated(lambda d: d["actions"]["close_port"].update(bogus=1)))
+
+
+def test_cli_sdk_flag(tmp_path):
+    r = subprocess.run([sys.executable, "-m", "engine.compiler", str(YAML), str(tmp_path / "b"), "--sdk", str(tmp_path / "sdk")],
+                       cwd=ROOT, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert (tmp_path / "sdk" / "client.ts").read_text() == (tmp_path / "b" / "client.ts").read_text()
+
+
+def test_postgis_schema_applies(comp):
+    psycopg = pytest.importorskip("psycopg")
+    try:
+        conn = psycopg.connect(DSN, connect_timeout=2, autocommit=True)
+    except Exception as e:
+        pytest.skip(f"postgres unreachable: {e}")
+    schema = "m7_" + uuid.uuid4().hex[:8]
+    with conn:
+        try:
+            conn.execute(f"CREATE SCHEMA {schema}")
+            conn.execute(f"SET search_path = {schema}, public")
+            conn.execute(comp.ddl())
+            rows = conn.execute("SELECT f_table_name, f_geometry_column, type, srid FROM geometry_columns "
+                                "WHERE f_table_schema = %s ORDER BY 1,2", (schema,)).fetchall()
+            assert ("obj_shipment", "position", "POINT", 4326) in rows
+            assert ("obj_port", "location", "POINT", 4326) in rows
+        except psycopg.errors.UndefinedFile as e:
+            pytest.skip(f"postgis not installed: {e}")
+        finally:
+            conn.execute(f"DROP SCHEMA {schema} CASCADE")

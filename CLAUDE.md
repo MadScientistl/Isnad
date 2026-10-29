@@ -3,11 +3,11 @@
 Open-source, Palantir Foundry/AIP-inspired ontology platform for one simulated use case (supply chain, geospatial events, finance ops). The full design and sources are in `RESEARCH.md`; read it before any work. This file holds the rules that apply every session.
 
 ## Status
-Phase 1 in progress: M0-M5 done (compiler, bitemporal engine, API, Oxigraph sync, reasoner, feasibility gate passed; see `bench/results/report.md`), M6 explorer UI built (`web/`, hash routes, Cytoscape neighbourhood; Phase 1 complete pending review). Implement one phase per session (RESEARCH.md section 10).
+Phase 1 done (M0-M6; gate in `bench/results/report.md`). Phase 2 built and verified (M7-M11): PostGIS + geo types, ontology v2 (Invoice, PurchaseOrder, Event, shipment geometry), minimal action + audit layer (`engine/actions/`), seeded SimPy world (`sim/`), visual API (`/sim`, `/events`, `/geo`, `/stats`, `/graph`), map, graph, dashboard and as-of time slider in `web/`. Gate re-run on the PostGIS schema: all PASS (`bench/results/report_phase2.md`). Phase 2 pending review. Phase 3 (governance, real action engine, RLS) is next; do one phase per session (RESEARCH.md section 10).
 
 ## Commands
 Contracts and conventions: `docs/contracts.md`. Python via `uv` (venv currently CPython 3.14).
-- Database: `docker compose up -d postgres` (Postgres 18, no PostGIS yet, DSN `postgresql://amarh:amarh@localhost:55441/amarh`, needs `CREATE EXTENSION btree_gist`).
+- Database: `docker compose up -d postgres` (built from `docker/postgres/Dockerfile`: Postgres 18 + PostGIS 3.6, the official postgis image has no arm64 build; DSN `postgresql://amarh:amarh@localhost:55441/amarh`, needs `CREATE EXTENSION btree_gist`).
 - Tests: `uv run pytest` (needs the database up).
 - Compile ontology: `uv run python -m engine.compiler ontology/supply_chain.yaml build/`.
 - Seed demo data: `AMARH_SCHEMA=demo uv run python -m engine.api.seed`; API: `AMARH_SCHEMA=demo uv run uvicorn engine.api.main:app --port 8000`.
@@ -64,3 +64,14 @@ Rules:
 - Seeded randomness everywhere in simulation and evals so runs are reproducible.
 - Do not commit secrets. The Claude API key comes from the environment.
 - Add commands to this file (install, run, test, lint) as soon as they exist.
+
+## Phase 2 commands and conventions
+- Compile and refresh the SDK: `uv run python -m engine.compiler ontology/supply_chain.yaml build/ --sdk sdk/` (also copies `build/client.ts` to `sdk/client.ts`).
+- Seed (idempotent, non-destructive): `AMARH_SCHEMA=demo uv run python -m engine.api.seed`.
+- Headless simulation: `AMARH_SCHEMA=demo uv run python -m sim --seed 1 --days 30` (prints action counts and the event digest; same seed gives the same digest). 30 sim days take about 15 s.
+- API (use 127.0.0.1, `localhost:8000` may be another Docker service): `AMARH_SCHEMA=demo uv run uvicorn engine.api.main:app --host 127.0.0.1 --port 8000`. The sim does not auto-run: the UI time bar starts it (speed 1/6/24 sim hours per wall second). `POST /sim/control {"reset":true}` deletes all data in the schema and reseeds, so it needs `AMARH_ALLOW_RESET=1`.
+- UI: `cd web && VITE_API=http://127.0.0.1:8000 npm run dev` (must be port 5173, the API's CORS origin). Offline UI development: `VITE_MOCK=1 npm run dev` (fake API in `web/src/mock/`). The map needs internet for OSM tiles.
+- Time model: sim valid time, wall-clock recorded time. Sim epoch 2026-01-01; the sim never runs past wall-clock now, so the `cur_*` views are the latest sim state. Time slider = `as_of_valid`.
+- All writes go through `engine.actions.apply_action` (one transaction, audit row with action_id). Only the seed bootstrap writes with `bt.write_*` directly. A position update resumes a delayed shipment (`ship_position` sets `in_transit`).
+- Inferred edges exist for the live state only (the reasoner materialises current state); the graph view says so when the slider is in the past. Only `supplies` (transitive, inverse) produces inferred edges today.
+- Tests: `uv run pytest` (about 80 s, mostly the 30-day sim tests).

@@ -25,18 +25,40 @@ from . import iri
 from .iri import G_ASSERTED, G_META, RDF_TYPE, SYNC_SUBJ, LAST_SEQ, class_iri, link_iri, obj_iri
 
 
+DEFAULT_YAML = Path(__file__).resolve().parents[2] / "ontology" / "supply_chain.yaml"
+_yaml_cache: dict = {}
+
+
+def _yaml_defaults(path) -> tuple:
+    k = str(path)
+    if k not in _yaml_cache:
+        from engine.compiler import compile_ontology
+        m = compile_ontology(path).model
+        _yaml_cache[k] = (m.namespace, tuple(m.object_types), tuple(m.link_types))
+    return _yaml_cache[k]
+
+
 @dataclass
 class SyncConfig:
-    namespace: str = iri.DEFAULT_NS
-    object_types: tuple[str, ...] = ("Supplier", "Port", "Warehouse", "Shipment", "Carrier")
-    link_types: tuple[str, ...] = ("ships_via", "supplies", "operated_by")
+    namespace: str | None = None
+    object_types: tuple[str, ...] | None = None
+    link_types: tuple[str, ...] | None = None
     ontology_ttl: Path | None = Path(__file__).resolve().parents[2] / "build" / "ontology.ttl"
+
+    def __post_init__(self):
+        # Unset fields derive from the default YAML ontology (explicit args win).
+        if self.namespace is None or self.object_types is None or self.link_types is None:
+            d = _yaml_defaults(DEFAULT_YAML)
+            if self.namespace is None:
+                self.namespace = d[0]
+            if self.object_types is None:
+                self.object_types = d[1]
+            if self.link_types is None:
+                self.link_types = d[2]
 
     @classmethod
     def from_yaml(cls, path) -> "SyncConfig":
-        from engine.compiler import compile_ontology
-        m = compile_ontology(path).model
-        return cls(m.namespace, tuple(m.object_types), tuple(m.link_types))
+        return cls(*_yaml_defaults(path))
 
 
 def open_store(path: str | Path | None = None, cfg: SyncConfig | None = None) -> Store:

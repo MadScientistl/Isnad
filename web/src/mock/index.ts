@@ -1,0 +1,202 @@
+/**
+ * Mock API layer (development and browser verification only).
+ *
+ * Enabled with `VITE_MOCK=1` (e.g. `cd web && VITE_MOCK=1 npm run dev`). `installMock(base)` replaces
+ * `window.fetch` for requests whose URL starts with the API base and answers them from a deterministic
+ * in-memory world (no randomness): 8 ports, 4 warehouses, 14 shipments, 6 invoices, suppliers, carriers,
+ * closure events. It implements every Phase 2 endpoint with the frozen response shapes
+ * (`/sim/state`, `/sim/control`, `/sim/inject`, `/events`, `/geo/{type}`, `/stats/summary`, `/stats/series`,
+ * `/graph`) plus the older explorer routes (`/types`, `/objects/...`, `/neighbours/...`). The mock sim clock
+ * advances by the chosen speed every wall second; `as_of` is honoured everywhere; inferred graph edges are
+ * returned only when `as_of` is absent or "live". Every request is appended to `window.__mockLog`
+ * ({method, path, query, role, body}) so tests can assert what the UI sent. The real fetch path is untouched
+ * when the flag is off.
+ */
+const H = 3600000;
+const EPOCH = Date.parse("2026-01-01T00:00:00Z");
+const iso = (h: number) => new Date(EPOCH + h * H).toISOString();
+const uid = (k: string, i: number) => `${{ port: "a1", wh: "b2", ship: "c3", inv: "d4", sup: "e5", car: "f6", ev: "07" }[k]}000000-0000-4000-8000-${String(i).padStart(12, "0")}`;
+
+const PORTS: [string, number, number][] = [["Rotterdam", 4.4, 51.9], ["Singapore", 103.8, 1.26], ["Shanghai", 121.8, 31.2], ["Los Angeles", -118.2, 33.7], ["Dubai", 55.0, 25.0], ["Santos", -46.3, -23.9], ["Durban", 31.0, -29.9], ["Mumbai", 72.9, 18.9]];
+const WHS: [string, number, number][] = [["Warehouse Frankfurt", 8.7, 50.1], ["Warehouse Chicago", -87.6, 41.9], ["Warehouse Nairobi", 36.8, -1.3], ["Warehouse Jakarta", 106.8, -6.2]];
+const CARRIERS = ["Maersk-like", "Hapag-like", "Cosco-like"];
+const NSHIP = 14;
+const pt = (c: [number, number]) => ({ type: "Point", coordinates: c });
+
+interface Win { target: string; start: number; end: number; kind: "port" | "ship" | "inv" }
+const base: Win[] = [
+  { target: uid("port", 3), start: 300, end: 420, kind: "port" }, { target: uid("port", 5), start: 100, end: 160, kind: "port" },
+  { target: uid("inv", 0), start: 200, end: 280, kind: "inv" }, { target: uid("inv", 2), start: 280, end: 360, kind: "inv" }, { target: uid("inv", 4), start: 360, end: 440, kind: "inv" },
+];
+for (let i = 2; i < NSHIP; i += 5) { const d = dep(i), u = dur(i); base.push({ target: uid("ship", i), start: d + u * 0.4, end: d + u * 0.4 + 60, kind: "ship" }); }
+function dep(i: number) { return 24 + i * 30; }
+function dur(i: number) { return 96 + ((i * 37) % 120); }
+
+const st = { simH: 480, speed: "paused" as "paused" | "1" | "6" | "24", tick: 0, injected: [] as Win[] };
+const wins = () => [...base, ...st.injected];
+const inWin = (target: string, kind: Win["kind"], h: number) => wins().some((w) => w.target === target && w.kind === kind && h >= w.start && h < w.end);
+
+const portStatus = (i: number, h: number) => (inWin(uid("port", i), "port", h) ? "closed" : "open");
+const via = (i: number) => (i * 3 + 1) % PORTS.length;
+const origin = (i: number) => i % PORTS.length;
+const dest = (i: number) => i % WHS.length;
+function shipment(i: number, h: number) {
+  const d = dep(i), u = dur(i);
+  const status = h < d ? "planned" : h >= d + u ? "arrived" : inWin(uid("ship", i), "ship", h) ? "delayed" : "in_transit";
+  const p = Math.min(1, Math.max(0, (h - d) / u));
+  const o = [PORTS[origin(i)][1], PORTS[origin(i)][2]], t = [WHS[dest(i)][1], WHS[dest(i)][2]];
+  const pos = [o[0] + (t[0] - o[0]) * p, o[1] + (t[1] - o[1]) * p] as [number, number];
+  const w = wins().find((x) => x.target === uid("ship", i) && x.kind === "ship" && h >= x.start);
+  return { id: uid("ship", i), ref: `SHP-${String(i + 1).padStart(3, "0")}`, status, progress: +p.toFixed(3), cargo_value: 40000 + i * 13000, delay_hours: status === "delayed" && w ? Math.round(h - w.start) : 0, position: pt(pos) };
+}
+const stamp = { valid_from: iso(0), valid_to: null, changed_by: "mock" };
+function objects(type: string, h: number): Record<string, any>[] {
+  switch (type) {
+    case "Port": return PORTS.map((p, i) => ({ id: uid("port", i), name: p[0], lat: p[2], lon: p[1], location: pt([p[1], p[2]]), status: portStatus(i, h), ...stamp }));
+    case "Warehouse": return WHS.map((p, i) => ({ id: uid("wh", i), name: p[0], lat: p[2], lon: p[1], location: pt([p[1], p[2]]), ...stamp }));
+    case "Carrier": return CARRIERS.map((n, i) => ({ id: uid("car", i), name: n, ...stamp }));
+    case "Supplier": return Array.from({ length: 6 }, (_, i) => ({ id: uid("sup", i), name: `Supplier ${i + 1}`, ...stamp }));
+    case "Shipment": return Array.from({ length: NSHIP }, (_, i) => ({ ...shipment(i, h), ...stamp }));
+    case "Invoice": return Array.from({ length: 6 }, (_, i) => ({ id: uid("inv", i), ref: `INV-${100 + i}`, amount: 12000 + i * 3500, currency: "USD", status: inWin(uid("inv", i), "inv", h) ? "flagged" : h > 500 ? "paid" : "open", anomaly: inWin(uid("inv", i), "inv", h) ? "amount mismatch" : null, ...stamp }));
+    case "Event": return evObjs().map((w, i) => ({ id: uid("ev", i), kind: "port_closure", severity: "high", started: iso(w.start), ended: iso(w.end), note: `Closure of ${PORTS[portIdx(w.target)][0]}`, ...stamp }));
+    default: return [];
+  }
+}
+const portIdx = (id: string) => Number(id.slice(-12));
+const evObjs = () => wins().filter((w) => w.kind === "port");
+const TYPES: Record<string, string[]> = {
+  Port: ["name", "lat", "lon", "location", "status"], Warehouse: ["name", "lat", "lon", "location"], Carrier: ["name"], Supplier: ["name"],
+  Shipment: ["ref", "status", "progress", "cargo_value", "delay_hours", "position"], Invoice: ["ref", "amount", "currency", "status", "anomaly"],
+  Event: ["kind", "severity", "started", "ended", "note"], PurchaseOrder: ["ref", "amount", "status"],
+};
+const ENUMS: Record<string, string[]> = { status: [] };
+
+interface Edge { src: string; dst: string; link: string; inferred: boolean }
+function edges(h: number, inferred: boolean): Edge[] {
+  const e: Edge[] = [];
+  const a = (src: string, link: string, dst: string, inf = false) => e.push({ src, dst, link, inferred: inf });
+  for (let i = 0; i < NSHIP; i++) {
+    a(uid("ship", i), "ships_from", uid("port", origin(i))); a(uid("ship", i), "ships_to", uid("wh", dest(i))); a(uid("ship", i), "ships_via", uid("port", via(i)));
+  }
+  for (let i = 0; i < 6; i++) { a(uid("inv", i), "invoices_for", uid("ship", i)); a(uid("inv", i), "billed_by", uid("sup", i)); }
+  for (let i = 0; i < 5; i++) a(uid("sup", i), "supplies", uid("sup", i + 1));
+  WHS.forEach((_, i) => a(uid("wh", i), "operated_by", uid("car", i % 3)));
+  evObjs().forEach((w, i) => a(uid("ev", i), "affects", w.target));
+  if (inferred) {
+    for (let i = 0; i < 4; i++) a(uid("sup", i), "supplies", uid("sup", i + 2), true);
+    evObjs().forEach((w, i) => { if (h >= w.start && h < w.end) for (let s = 0; s < NSHIP; s++) if (uid("port", via(s)) === w.target) a(uid("ev", i), "affects", uid("ship", s), true); });
+  }
+  return e;
+}
+const nodeIndex = (h: number) => {
+  const m = new Map<string, { id: string; type: string; label: string; status: string | null }>();
+  for (const t of Object.keys(TYPES)) for (const o of objects(t, h)) m.set(o.id, { id: o.id, type: t, label: String(o.name ?? o.ref ?? o.kind), status: t === "Port" || t === "Shipment" || t === "Invoice" ? o.status : null });
+  return m;
+};
+
+function summary(h: number) {
+  const sh = objects("Shipment", h), cnt = (k: string) => sh.filter((s) => s.status === k).length;
+  const inv = objects("Invoice", h), ic = (k: string) => inv.filter((s) => s.status === k).length;
+  const closed = PORTS.filter((_, i) => portStatus(i, h) === "closed").length;
+  const risk = sh.filter((s, i) => s.status !== "arrived" && (portStatus(via(i), h) === "closed" || s.status === "delayed")).reduce((a, s) => a + s.cargo_value, 0);
+  return { as_of: iso(h), shipments: { planned: cnt("planned"), in_transit: cnt("in_transit"), delayed: cnt("delayed"), arrived: cnt("arrived") }, ports: { open: PORTS.length - closed, closed },
+    invoices: { open: ic("open"), approved: ic("approved"), paid: ic("paid"), flagged: ic("flagged") }, value_at_risk: risk, delay_hours_total: sh.reduce((a, s) => a + s.delay_hours, 0), open_events: evObjs().filter((w) => h >= w.start && h < w.end).length };
+}
+function metric(m: string, h: number) {
+  const s = summary(h);
+  return ({ shipments_in_transit: s.shipments.in_transit, shipments_delayed: s.shipments.delayed, ports_closed: s.ports.closed, invoices_flagged: s.invoices.flagged, value_at_risk: s.value_at_risk } as Record<string, number>)[m] ?? 0;
+}
+function feed(h: number) {
+  const out: { t: number; name: string; id: string; type: string; summary: string }[] = [];
+  for (let i = 0; i < NSHIP; i++) { out.push({ t: dep(i), name: "ship_depart", id: uid("ship", i), type: "Shipment", summary: `SHP-${String(i + 1).padStart(3, "0")} departed ${PORTS[origin(i)][0]}` }); out.push({ t: dep(i) + dur(i), name: "ship_arrive", id: uid("ship", i), type: "Shipment", summary: `SHP-${String(i + 1).padStart(3, "0")} arrived at ${WHS[dest(i)][0]}` }); }
+  for (const w of wins()) {
+    if (w.kind === "port") { out.push({ t: w.start, name: "close_port", id: w.target, type: "Port", summary: `${PORTS[portIdx(w.target)][0]} closed` }); out.push({ t: w.end, name: "reopen_port", id: w.target, type: "Port", summary: `${PORTS[portIdx(w.target)][0]} reopened` }); }
+    if (w.kind === "inv") out.push({ t: w.start, name: "flag_invoice", id: w.target, type: "Invoice", summary: `Invoice INV-${100 + portIdx(w.target)} flagged: amount mismatch` });
+    if (w.kind === "ship") out.push({ t: w.start, name: "delay_shipment", id: w.target, type: "Shipment", summary: `Shipment SHP-${String(portIdx(w.target) + 1).padStart(3, "0")} delayed` });
+  }
+  return out.filter((x) => x.t <= h).sort((a, b) => b.t - a.t || (a.name < b.name ? 1 : -1));
+}
+const simState = () => ({ sim_now: iso(st.simH), epoch: iso(0), speed: st.speed, running: st.speed !== "paused", seed: 1, tick: st.tick, achieved_hours_per_s: st.speed === "paused" ? null : Number(st.speed) * 0.98, last_error: null });
+
+const hOf = (v: string | null) => (!v || v === "live" ? st.simH : (Date.parse(v) - EPOCH) / H);
+
+function route(method: string, path: string, q: URLSearchParams, body: any): [number, unknown] {
+  const asOfH = hOf(q.get("as_of") ?? q.get("as_of_valid"));
+  let m: RegExpMatchArray | null;
+  if (path === "/sim/state") return [200, simState()];
+  if (path === "/sim/control") {
+    if (body?.reset) { st.simH = 48; st.tick = 0; st.injected = []; st.speed = "paused"; }
+    if (body?.speed) st.speed = body.speed;
+    if (body?.step) { st.simH += 1; st.tick += 1; }
+    return [200, simState()];
+  }
+  if (path === "/sim/inject") {
+    const at = body?.at ? hOf(body.at) : st.simH, d = body?.duration_h ?? 24;
+    const kind = body?.kind as string;
+    let target = body?.target as string | undefined;
+    if (kind === "port_closure") target ??= uid("port", 1);
+    if (kind === "shipment_delay") target ??= uid("ship", 0);
+    if (kind === "invoice_anomaly") target ??= uid("inv", 1);
+    st.injected.push({ target: target!, start: at, end: at + d, kind: kind === "port_closure" ? "port" : kind === "shipment_delay" ? "ship" : "inv" });
+    return [200, { injected: { kind, target: target ?? null, at: iso(at) } }];
+  }
+  if (path === "/events") {
+    const lim = Number(q.get("limit") ?? 100), to = q.get("to") ? hOf(q.get("to")) : st.simH, from = q.get("from") ? hOf(q.get("from")) : -1;
+    const rows = feed(to).filter((x) => x.t >= from).slice(0, lim).map((x, i, a) => ({ seq: 100000 - i, action_id: `act-${x.name}-${Math.round(x.t)}-${i}`, name: x.name, actor: "sim", source: "sim", sim_time: iso(x.t), recorded_at: iso(x.t), params: { id: x.id, type: x.type }, summary: x.summary }));
+    return [200, rows];
+  }
+  if ((m = path.match(/^\/geo\/(\w+)$/))) {
+    const t = m[1];
+    const feats = objects(t, asOfH).filter((o) => o.position ?? o.location).map((o) => {
+      const { position, location, ...rest } = o; const props: any = { ...rest, type: t };
+      if (t === "Shipment") { const i = portIdx(o.id); props.origin = [PORTS[origin(i)][1], PORTS[origin(i)][2]]; props.destination = [WHS[dest(i)][1], WHS[dest(i)][2]]; }
+      return { type: "Feature", id: o.id, geometry: position ?? location, properties: props };
+    });
+    return [200, { type: "FeatureCollection", features: feats }];
+  }
+  if (path === "/stats/summary") return [200, summary(asOfH)];
+  if (path === "/stats/series") {
+    const f = hOf(q.get("from")), t = hOf(q.get("to")), s = Number(q.get("step_hours") ?? 24), pts = [];
+    for (let x = f; x <= t + 1e-6; x += s) pts.push({ t: iso(x), v: metric(q.get("metric")!, x) });
+    if (pts.length && Date.parse(pts[pts.length - 1].t) < EPOCH + t * H - 1) pts.push({ t: iso(t), v: metric(q.get("metric")!, t) });
+    return [200, { metric: q.get("metric"), points: pts }];
+  }
+  if (path === "/graph") {
+    const live = !q.get("as_of") || q.get("as_of") === "live", c = q.get("center")!, depth = Math.min(3, Number(q.get("depth") ?? 1));
+    const want = q.get("include_inferred") !== "false";
+    const es = edges(asOfH, live && want), idx = nodeIndex(asOfH);
+    const seen = new Set([c]); let frontier = [c];
+    for (let d = 0; d < depth; d++) { const nx: string[] = []; for (const e of es) for (const [x, y] of [[e.src, e.dst], [e.dst, e.src]]) if (frontier.includes(x) && !seen.has(y)) { seen.add(y); nx.push(y); } frontier = nx; }
+    const ids = [...seen].slice(0, 300);
+    const set = new Set(ids);
+    return [200, { center: c, as_of: live ? null : q.get("as_of"), inferred_available: live, truncated: seen.size > 300, nodes: ids.map((id) => idx.get(id)).filter(Boolean), edges: es.filter((e) => set.has(e.src) && set.has(e.dst)) }];
+  }
+  if (path === "/types") return [200, { namespace: "mock", classes: {}, role: "admin", linkTypes: [], objectTypes: Object.entries(TYPES).map(([name, ps]) => ({ name, properties: ps.map((p) => ({ name: p, type: "string", required: false, enum: ENUMS[p] ?? [] })) })) }];
+  if ((m = path.match(/^\/objects\/(\w+)$/)) && method === "GET") return [200, objects(m[1], asOfH).slice(Number(q.get("offset") ?? 0), Number(q.get("offset") ?? 0) + Number(q.get("limit") ?? 100))];
+  if ((m = path.match(/^\/objects\/(\w+)\/([\w-]+)\/history$/))) return [200, objects(m[1], st.simH).filter((o) => o.id === m![2]).map((o) => ({ ...o, recorded_from: iso(0), recorded_to: null }))];
+  if ((m = path.match(/^\/objects\/(\w+)\/([\w-]+)$/)) && method === "GET") { const o = objects(m[1], asOfH).find((x) => x.id === m![2]); return o ? [200, o] : [404, { detail: "not found" }]; }
+  if ((m = path.match(/^\/neighbours\/(\w+)\/([\w-]+)$/))) {
+    const idx = nodeIndex(asOfH), id = m[2], out = [];
+    for (const e of edges(asOfH, false)) { const other = e.src === id ? e.dst : e.dst === id ? e.src : null; const n = other && idx.get(other); if (n) out.push({ link: e.link, direction: e.src === id ? "out" : "in", type: n.type, id: n.id, object: objects(n.type, asOfH).find((o) => o.id === n.id) ?? null }); }
+    return [200, out];
+  }
+  return [404, { detail: `mock: no route ${method} ${path}` }];
+}
+
+export function installMock(base: string) {
+  const w = window as any;
+  w.__mockLog = [] as unknown[];
+  const orig = window.fetch.bind(window);
+  setInterval(() => { if (st.speed !== "paused") { st.simH += Number(st.speed); st.tick += Number(st.speed); } }, 1000);
+  window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (!url.startsWith(base)) return orig(input, init);
+    const u = new URL(url), method = (init?.method ?? "GET").toUpperCase();
+    const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+    const role = (init?.headers as Record<string, string> | undefined)?.["x-role"];
+    w.__mockLog.push({ method, path: u.pathname, query: Object.fromEntries(u.searchParams), role, body });
+    if (w.__mockLog.length > 500) w.__mockLog.splice(0, 250);
+    const [status, data] = route(method, u.pathname, u.searchParams, body);
+    return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
+  };
+}

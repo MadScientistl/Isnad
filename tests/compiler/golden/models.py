@@ -3,25 +3,87 @@ from datetime import datetime
 from typing import Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+
+
+
+def _pos(c):
+    if (not isinstance(c, (list, tuple)) or len(c) < 2 or len(c) > 3
+            or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in c)):
+        raise ValueError("position must be [lon, lat] numbers")
+    if not (-180 <= c[0] <= 180 and -90 <= c[1] <= 90):
+        raise ValueError("position out of range")
+
+
+class GeoPoint(BaseModel):
+    type: Literal["Point"]
+    coordinates: list[float]
+
+    @field_validator("coordinates")
+    @classmethod
+    def _v(cls, v):
+        _pos(v)
+        return v
+
+
+class GeoLineString(BaseModel):
+    type: Literal["LineString"]
+    coordinates: list[list[float]]
+
+    @field_validator("coordinates")
+    @classmethod
+    def _v(cls, v):
+        if len(v) < 2:
+            raise ValueError("LineString needs at least 2 positions")
+        for c in v:
+            _pos(c)
+        return v
 
 
 class Carrier(BaseModel):
     id: UUID
     name: str
 
+class Event(BaseModel):
+    id: UUID
+    kind: str
+    severity: Optional[Literal['low', 'medium', 'high']] = None
+    started: Optional[datetime] = None
+    ended: Optional[datetime] = None
+    note: Optional[str] = None
+
+class Invoice(BaseModel):
+    id: UUID
+    ref: str
+    amount: float
+    currency: Optional[str] = None
+    status: Optional[Literal['open', 'approved', 'paid', 'flagged']] = None
+    due: Optional[datetime] = None
+    anomaly: Optional[str] = None
+
 class Port(BaseModel):
     id: UUID
     name: str
     lat: Optional[float] = None
     lon: Optional[float] = None
+    location: Optional[GeoPoint] = None
     status: Optional[Literal['open', 'closed']] = None
+
+class PurchaseOrder(BaseModel):
+    id: UUID
+    ref: str
+    amount: Optional[float] = None
+    status: Optional[str] = None
 
 class Shipment(BaseModel):
     id: UUID
     ref: str
     eta: Optional[datetime] = None
-    status: Optional[str] = None
+    status: Optional[Literal['planned', 'in_transit', 'delayed', 'arrived']] = None
+    position: Optional[GeoPoint] = None
+    progress: Optional[float] = None
+    cargo_value: Optional[float] = None
+    delay_hours: Optional[float] = None
 
 class Supplier(BaseModel):
     id: UUID
@@ -33,6 +95,7 @@ class Warehouse(BaseModel):
     name: str
     lat: Optional[float] = None
     lon: Optional[float] = None
+    location: Optional[GeoPoint] = None
 
 
 class Link(BaseModel):
@@ -40,4 +103,4 @@ class Link(BaseModel):
     dst: UUID
 
 
-OBJECT_MODELS = {'Carrier': Carrier, 'Port': Port, 'Shipment': Shipment, 'Supplier': Supplier, 'Warehouse': Warehouse}
+OBJECT_MODELS = {'Carrier': Carrier, 'Event': Event, 'Invoice': Invoice, 'Port': Port, 'PurchaseOrder': PurchaseOrder, 'Shipment': Shipment, 'Supplier': Supplier, 'Warehouse': Warehouse}

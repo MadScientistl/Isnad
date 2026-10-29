@@ -25,13 +25,26 @@
             "propertyNames": {"pattern": "^[a-z][a-z0-9_]*$"},
             "additionalProperties": {
               "oneOf": [
-                {"type": "string", "pattern": "^(string|int|float|bool|timestamp)!?$"},
+                {"type": "string", "pattern": "^(string|int|float|bool|timestamp|point|linestring)!?$"},
                 {"type": "object", "required": ["enum"], "additionalProperties": false,
                  "properties": {"enum": {"type": "array", "minItems": 1, "items": {"type": "string"}, "uniqueItems": true},
                                 "required": {"type": "boolean"}}}
               ]
             }
           }
+        }
+      }
+    },
+    "actions": {
+      "type": "object",
+      "propertyNames": {"pattern": "^[a-z][a-z0-9_]*$"},
+      "additionalProperties": {
+        "type": "object", "additionalProperties": false,
+        "properties": {
+          "params": {"type": "object", "propertyNames": {"pattern": "^[a-z][a-z0-9_]*$"},
+                     "additionalProperties": {"type": "string"}},
+          "description": {"type": "string"},
+          "writes": {"type": "array", "items": {"type": "string"}}
         }
       }
     },

@@ -52,7 +52,7 @@ def compile_ontology(path) -> CompiledOntology:
     return CompiledOntology(model, text)
 
 
-def write_outputs(c: CompiledOntology, outdir) -> list[Path]:
+def write_outputs(c: CompiledOntology, outdir, sdk_dir=None) -> list[Path]:
     out = Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
     files = {"schema.sql": c.ddl(), "ontology.ttl": c.owl_turtle(), "shapes.ttl": c.shacl_turtle(),
@@ -61,4 +61,9 @@ def write_outputs(c: CompiledOntology, outdir) -> list[Path]:
     for n, t in files.items():
         (out / n).write_text(t)
         paths.append(out / n)
+    if sdk_dir is not None:
+        sdk = Path(sdk_dir)
+        sdk.mkdir(parents=True, exist_ok=True)
+        (sdk / "client.ts").write_text(files["client.ts"])
+        paths.append(sdk / "client.ts")
     return paths

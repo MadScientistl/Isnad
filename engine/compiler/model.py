@@ -52,6 +52,18 @@ class ClassDef:
     extends: str | None = None
 
 
+@dataclass(frozen=True)
+class ActionDef:
+    name: str
+    params: dict[str, str] = field(default_factory=dict)
+    description: str | None = None
+    writes: tuple[str, ...] = ()
+
+
+GEO_TYPES = ("point", "linestring")
+PARAM_TYPES = ("string", "int", "float", "bool", "timestamp", "point", "linestring", "uuid")
+
+
 @dataclass
 class Ontology:
     version: int
@@ -59,6 +71,7 @@ class Ontology:
     classes: dict[str, ClassDef] = field(default_factory=dict)
     object_types: dict[str, ObjectType] = field(default_factory=dict)
     link_types: dict[str, LinkType] = field(default_factory=dict)
+    actions: dict[str, ActionDef] = field(default_factory=dict)
 
     def parent_of(self, name: str) -> str | None:
         c = self.classes.get(name)
@@ -98,7 +111,15 @@ def parse_ontology(raw: dict) -> Ontology:
             bool(l.get("required", False)), bool(l.get("transitive", False)), l.get("inverse"),
         )
 
+    for n, a in (raw.get("actions") or {}).items():
+        a = a or {}
+        onto.actions[n] = ActionDef(n, dict(a.get("params") or {}), a.get("description"), tuple(a.get("writes") or ()))
+
     errors: list[str] = []
+    for a in onto.actions.values():
+        for pn, pt in a.params.items():
+            if pt.rstrip("!") not in PARAM_TYPES:
+                errors.append(f"action '{a.name}': param '{pn}' has unknown type '{pt}'")
     for c in onto.classes.values():
         if c.extends and c.extends not in onto.classes:
             errors.append(f"class '{c.name}' extends unknown class '{c.extends}'")

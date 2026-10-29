@@ -84,6 +84,65 @@ def _prop_cols(conn: psycopg.Connection, table: str, keycols: Sequence[str]) -> 
     return _cols_cache[key]
 
 
+_geo_cache: dict[tuple, tuple[tuple[str, ...], tuple[str, ...]]] = {}
+
+
+def _table_cols(conn: psycopg.Connection, table: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """(all columns in order, geometry columns) of `table` on the current search_path."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT current_schemas(false)::text")
+        key = (cur.fetchone()[0], table)
+        if key not in _geo_cache:
+            cur.execute(
+                """SELECT column_name, udt_name FROM information_schema.columns
+                   WHERE table_name = %s AND table_schema = ANY(current_schemas(false))
+                   ORDER BY ordinal_position""",
+                [table],
+            )
+            rows = cur.fetchall()
+            if not rows:
+                raise LookupError(f"table {table} not found on search_path")
+            _geo_cache[key] = (tuple(r[0] for r in rows),
+                               tuple(r[0] for r in rows if r[1] == "geometry"))
+    return _geo_cache[key]
+
+
+def geometry_columns(conn: psycopg.Connection, table_or_type: str) -> tuple[str, ...]:
+    """Geometry column names of a table (or of an object type's table)."""
+    t = table_or_type if table_or_type.startswith(("obj_", "link_")) else obj_table(table_or_type)
+    return _table_cols(conn, t)[1]
+
+
+def _point_hex(coords) -> str:
+    import struct
+    return (b"\x01" + struct.pack("<IIdd", 0x20000001, 4326, float(coords[0]), float(coords[1]))).hex()
+
+
+def _geom_hex(conn, g) -> str | None:
+    """Normalise a geometry value (GeoJSON dict/str, or EWKB hex) to canonical EWKB hex."""
+    import json
+    if g is None:
+        return None
+    if isinstance(g, (bytes, memoryview)):
+        g = bytes(g).hex()
+    if isinstance(g, str) and not g.lstrip().startswith("{"):
+        return conn.execute("SELECT encode(ST_AsEWKB(%s::geometry), 'hex')", [g]).fetchone()[0]
+    if isinstance(g, str):
+        g = json.loads(g)
+    if g.get("type") == "Point" and len(g.get("coordinates") or ()) == 2:
+        return _point_hex(g["coordinates"])
+    return conn.execute(
+        "SELECT encode(ST_AsEWKB(ST_SetSRID(ST_GeomFromGeoJSON(%s),4326)), 'hex')",
+        [json.dumps(g)]).fetchone()[0]
+
+
+def _select_list(conn, table: str) -> sql.Composable:
+    cols, geo = _table_cols(conn, table)
+    return sql.SQL(", ").join(
+        sql.SQL("ST_AsGeoJSON({c})::jsonb AS {c}").format(c=_tbl(c)) if c in geo else _tbl(c)
+        for c in cols)
+
+
 def _now(conn: psycopg.Connection) -> datetime:
     return conn.execute("SELECT clock_timestamp()").fetchone()[0]
 
@@ -127,11 +186,12 @@ def _apply(
     if vt is not None and vt <= vf:
         raise ValueError("valid_to must be after valid_from")
     pcols = _prop_cols(conn, table, keycols)
+    geo = set(_table_cols(conn, table)[1])
     if props is not None:
         unknown = set(props) - set(pcols)
         if unknown:
             raise ValueError(f"unknown properties for {table}: {sorted(unknown)}")
-        newp = tuple(props.get(c) for c in pcols)
+        newp = tuple(_geom_hex(conn, props.get(c)) if c in geo else props.get(c) for c in pcols)
     else:
         newp = None
 
@@ -144,7 +204,9 @@ def _apply(
             "FROM {t} WHERE {kw} AND scenario_id = %s AND (upper_inf(recorded_during) OR upper(recorded_during) = 'infinity') "
             "AND (valid_during && %s::tstzrange OR valid_during -|- %s::tstzrange)"
         ).format(
-            pc=sql.SQL(", ").join(_tbl(c) for c in pcols) if pcols else sql.SQL("1 AS _dummy"),
+            pc=sql.SQL(", ").join(
+                sql.SQL("encode(ST_AsEWKB({c}), 'hex') AS {c}").format(c=_tbl(c)) if c in geo
+                else _tbl(c) for c in pcols) if pcols else sql.SQL("1 AS _dummy"),
             t=_tbl(table), kw=keyw,
         )
         rng = Range(vf, vt, "[)")
@@ -204,7 +266,8 @@ def _apply(
         cols = [*keycols, *pcols, *COMMON_COLS]
         ins = sql.SQL("INSERT INTO {t} ({c}) VALUES ({v})").format(
             t=_tbl(table), c=sql.SQL(", ").join(_tbl(c) for c in cols),
-            v=sql.SQL(", ").join(sql.Placeholder() for _ in cols),
+            v=sql.SQL(", ").join(
+                sql.SQL("%s::geometry") if c in geo else sql.Placeholder() for c in cols),
         )
         for lo, hi, p, cb, aid, _new in to_insert:
             conn.execute(ins, [*keyvals, *p, Range(lo, hi, "[)"), Range(now, None, "[)"),
@@ -288,8 +351,8 @@ def _asof_clause(as_of_valid, as_of_recorded):
 
 
 def _fetch(conn, table, where: str, params: list, order: str = "") -> list[dict]:
-    q = sql.SQL("SELECT * FROM {t} WHERE {w} {o}").format(
-        t=_tbl(table), w=sql.SQL(where), o=sql.SQL(order))
+    q = sql.SQL("SELECT {s} FROM {t} WHERE {w} {o}").format(
+        s=_select_list(conn, table), t=_tbl(table), w=sql.SQL(where), o=sql.SQL(order))
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(q, params)
         return cur.fetchall()
@@ -305,12 +368,41 @@ def get_object(conn, type, id: UUID, as_of_valid: datetime | None = None,
 
 
 def list_objects(conn, type, as_of_valid=None, as_of_recorded=None, scenario_id: int = 0,
-                 where: str | None = None, params: Sequence[Any] = ()) -> list[dict]:
+                 where: str | None = None, params: Sequence[Any] = (), *,
+                 limit: int | None = None, offset: int = 0, order_by: str | None = None,
+                 desc: bool = False) -> list[dict]:
     """All objects of a type as of the given instants. `where` is an optional trusted SQL
-    fragment (use %s placeholders with `params`)."""
+    fragment (use %s placeholders with `params`). `order_by` is a column name (default id);
+    limit/offset are pushed down into SQL."""
     c, p = _asof_clause(as_of_valid, as_of_recorded)
     w = f"scenario_id = %s AND {c}" + (f" AND ({where})" if where else "")
-    return _fetch(conn, obj_table(type), w, [scenario_id, *p, *params], "ORDER BY id")
+    table = obj_table(type)
+    ob = "id"
+    if order_by:
+        if order_by not in _table_cols(conn, table)[0]:
+            raise ValueError(f"unknown order_by column {order_by!r}")
+        ob = f'"{order_by}"'
+    order = f"ORDER BY {ob}{' DESC' if desc else ''}" + ("" if ob == "id" else ", id")
+    args = [scenario_id, *p, *params]
+    if limit is not None:
+        order += " LIMIT %s"
+        args.append(int(limit))
+    if offset:
+        order += " OFFSET %s"
+        args.append(int(offset))
+    return _fetch(conn, table, w, args, order)
+
+
+def list_objects_bbox(conn, type, bbox: Sequence[float], as_of_valid=None, as_of_recorded=None,
+                      geom_col: str | None = None, scenario_id: int = 0) -> list[dict]:
+    """Objects whose geometry intersects bbox=(west, south, east, north) (EPSG:4326)."""
+    geo = geometry_columns(conn, type)
+    col = geom_col or (geo[0] if geo else None)
+    if col is None or col not in geo:
+        raise ValueError(f"{type} has no geometry column {geom_col!r}")
+    w, s_, e, n = (float(x) for x in bbox)
+    return list_objects(conn, type, as_of_valid, as_of_recorded, scenario_id,
+                        where=f'"{col}" && ST_MakeEnvelope(%s,%s,%s,%s,4326)', params=[w, s_, e, n])
 
 
 def history(conn, type, id: UUID, scenario_id: int = 0) -> list[dict]:
@@ -366,6 +458,7 @@ def bulk_load_objects(conn, type, rows: Iterable[tuple[UUID, dict]], valid_from:
     table = obj_table(type)
     pcols = _prop_cols(conn, table, ("id",))
     cols = ["id", *pcols, *COMMON_COLS]
+    geo = set(_table_cols(conn, table)[1])
     now = _now(conn)
     vt, rt = _rng_text(valid_from), _rng_text(now)
     n = 0
@@ -374,7 +467,8 @@ def bulk_load_objects(conn, type, rows: Iterable[tuple[UUID, dict]], valid_from:
             t=_tbl(table), c=sql.SQL(", ").join(_tbl(c) for c in cols))
         with conn.cursor() as cur, cur.copy(stmt) as cp:
             for id_, props in rows:
-                cp.write_row([id_, *(props.get(c) for c in pcols), vt, rt, changed_by,
+                cp.write_row([id_, *((_geom_hex(conn, props.get(c)) if c in geo else props.get(c))
+                                    for c in pcols), vt, rt, changed_by,
                               action_id, scenario_id])
                 n += 1
         if outbox:
