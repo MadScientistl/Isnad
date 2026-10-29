@@ -185,7 +185,9 @@ export const ACTION_META: Record<ActionName, ActionMeta> = {
       }
     ],
     "requiresApproval": false,
-    "approvers": [],
+    "approvers": [
+      "admin"
+    ],
     "roles": [
       "admin",
       "planner",
@@ -286,7 +288,9 @@ export const ACTION_META: Record<ActionName, ActionMeta> = {
       }
     ],
     "requiresApproval": false,
-    "approvers": [],
+    "approvers": [
+      "admin"
+    ],
     "roles": [
       "admin",
       "planner",
@@ -369,7 +373,9 @@ export const ACTION_META: Record<ActionName, ActionMeta> = {
       }
     ],
     "requiresApproval": false,
-    "approvers": [],
+    "approvers": [
+      "admin"
+    ],
     "roles": [
       "admin",
       "finance_analyst",
@@ -469,7 +475,9 @@ export const ACTION_META: Record<ActionName, ActionMeta> = {
       }
     ],
     "requiresApproval": false,
-    "approvers": [],
+    "approvers": [
+      "admin"
+    ],
     "roles": [
       "admin",
       "planner",
@@ -502,7 +510,9 @@ export const ACTION_META: Record<ActionName, ActionMeta> = {
       }
     ],
     "requiresApproval": false,
-    "approvers": [],
+    "approvers": [
+      "admin"
+    ],
     "roles": [
       "admin",
       "planner"

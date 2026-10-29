@@ -13,6 +13,7 @@
  * when the flag is off.
  */
 import * as gov from "./gov";
+import { agentRoute } from "./agent";
 const H = 3600000;
 const EPOCH = Date.parse("2026-01-01T00:00:00Z");
 const iso = (h: number) => new Date(EPOCH + h * H).toISOString();
@@ -255,7 +256,9 @@ export function installMock(base: string) {
     w.__mockLog.push({ method, path: u.pathname, query: Object.fromEntries(u.searchParams), role, body });
     if (w.__mockLog.length > 500) w.__mockLog.splice(0, 250);
     curRole = role ?? "admin";
-    const [status, data] = route(method, u.pathname, u.searchParams, body);
+    const ar = agentRoute(method, u.pathname, u.searchParams, body, curRole);
+    if (ar instanceof Response) return ar;
+    const [status, data] = ar ?? route(method, u.pathname, u.searchParams, body);
     return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
   };
 }

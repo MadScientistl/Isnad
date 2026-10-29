@@ -173,6 +173,7 @@ actions:
   delay_shipment:
     description: Mark a shipment delayed and push its ETA back.
     params: {shipment: "uuid!", delay_hours: "float!", reason: string}
+    approval: {approvers: [admin]}   # who may approve proposals (agent proposals)
     roles: [planner, admin, sim]
     bind: {sh: {type: Shipment, id: $shipment}}
     criteria:
@@ -181,6 +182,7 @@ actions:
   close_port:
     description: Close a port, open a port_closure Event affecting it.
     params: {port: "uuid!", reason: string, duration_h: float, event_id: uuid}
+    approval: {approvers: [admin]}   # who may approve proposals (agent proposals)
     roles: [planner, regional_ops_lead, admin, sim]
     bind: {port: {type: Port, id: $port}}
     function: close_port
@@ -188,6 +190,7 @@ actions:
   reroute_shipment:
     description: Reroute a shipment from its current port to a new open port.
     params: {shipment: "uuid(Shipment)!", new_port: "uuid(Port)!", reason: string}
+    approval: {approvers: [admin]}   # who may approve proposals (agent proposals)
     roles: [planner, admin]
     bind: {sh: {type: Shipment, id: $shipment}, np: {type: Port, id: $new_port}}
     criteria:
@@ -197,6 +200,7 @@ actions:
   reopen_port:
     description: Reopen a port and end its open closure Event.
     params: {port: "uuid!"}
+    approval: {approvers: [admin]}   # who may approve proposals (agent proposals)
     roles: [planner, regional_ops_lead, admin, sim]
     bind: {port: {type: Port, id: $port}}
     function: reopen_port
@@ -211,6 +215,7 @@ actions:
   flag_invoice:
     description: Flag an invoice as anomalous.
     params: {invoice: "uuid!", anomaly: "string!"}
+    approval: {approvers: [admin]}   # who may approve proposals (agent proposals)
     roles: [finance_analyst, admin, sim]
     bind: {inv: {type: Invoice, id: $invoice}}
     criteria:

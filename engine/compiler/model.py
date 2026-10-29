@@ -296,8 +296,8 @@ def _parse_actions(raw: dict, onto: "Ontology", errors: list[str]) -> None:
         exempt = tuple(ap.get("exempt") or ())
         if approval_required and not approvers:
             errors.append(f"{where}: approval.required needs at least one approver")
-        if approvers and not approval_required:
-            errors.append(f"{where}: approvers given but approval.required is false")
+        # approvers without `required` = who may approve PROPOSALS (e.g. agent proposals) of an action that
+        # roles may also execute directly
 
         bind: dict[str, BindDef] = {}
         for al, b in (a.get("bind") or {}).items():
