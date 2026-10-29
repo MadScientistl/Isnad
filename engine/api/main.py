@@ -30,7 +30,9 @@ from fastapi.responses import JSONResponse
 from psycopg.rows import dict_row
 from pydantic import BaseModel, ValidationError
 
-from engine.actions import (ApprovalRequired, CriteriaFailed, NotFound, PermissionDenied, RollbackConflict,
+from engine.api import masking
+from engine.actions import (ApprovalRequired, CriteriaFailed, NotFound, PermissionDenied, ProposalExpired,
+                            StaleProposal, RollbackConflict,
                             RollbackRefused, decide, execute, make_principal, propose, rollback)
 from engine.actions import outbox as outbox_mod
 from engine.compiler import compile_ontology, exprs
@@ -70,6 +72,10 @@ def map_error(e: Exception) -> ApiError | None:
         return ApiError(422, "criteria_failed", str(e), failures=[{"message": f["message"]} for f in e.failures])
     if isinstance(e, NotFound):
         return ApiError(404, "not_found", str(e))
+    if isinstance(e, StaleProposal):
+        return ApiError(409, "stale_proposal", str(e), changed=e.changed)
+    if isinstance(e, ProposalExpired):
+        return ApiError(409, "proposal_expired", str(e))
     if isinstance(e, RollbackConflict):
         return ApiError(409, "rollback_conflict", str(e), keys=e.keys)
     if isinstance(e, RollbackRefused):
@@ -1052,6 +1058,7 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
     # ------------------------------------------------------------ proposals
     PROPOSAL_SQL = (
         "SELECT p.id, p.action, p.params, p.proposer, p.proposer_role, p.rationale, p.dry_run, p.created_at, "
+        "p.on_behalf_of, p.evidence, p.run_id, p.expires_at, (p.expires_at < clock_timestamp()) AS expired, "
         "a.decision, a.approver, a.approver_role, a.comment, a.decided_at, a.execution_id "
         "FROM proposal p LEFT JOIN approval a ON a.proposal_id = p.id")
 
@@ -1117,78 +1124,18 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
             return None
         return e if re.fullmatch(r"HTTP \d{3}|no url|no secret|bad url scheme|\w+Error|TimeoutError", e) else "error"
 
-    def mask_snapshot(p: Principal, type_: str, snap):
-        """Diff snapshots come from the engine's unmasked read: null the columns this role may not see."""
-        if p.role == "admin" or not isinstance(snap, dict):
-            return snap
-        a = om.roles[p.role].types.get(type_)
-        mask = set(a.mask) if a else set()
-        return {k: (None if k in mask else v) for k, v in snap.items()} if mask else snap
+    def mask_out(p: Principal, x):
+        """THE masking function for every response (see engine/api/masking.py)."""
+        return masking.mask_out(om, p, x)
 
     def mask_diff(p: Principal, diff):
-        if not isinstance(diff, list):
-            return diff
-        return [{**d, "before": mask_snapshot(p, d.get("type"), d.get("before")),
-                 "after": mask_snapshot(p, d.get("type"), d.get("after"))}
-                if isinstance(d, dict) and d.get("kind", "object") == "object" else d for d in diff]
+        return masking.mask_diff(om, p, diff)
 
     def mask_summary(p: Principal, snap):
-        """before/after summaries are keyed "Type:uuid"."""
-        if p.role == "admin" or not isinstance(snap, dict):
-            return snap
-        return {k: mask_snapshot(p, k.partition(":")[0], v) for k, v in snap.items()}
+        return masking.mask_summary(om, p, snap)
 
     def mask_params(p: Principal, name, params):
-        """Generic object actions carry property values in params (type + props)."""
-        if p.role == "admin" or not isinstance(params, dict):
-            return params
-        a = om.actions.get(name) if name else None
-        if a is not None:  # declarative actions: params that flow straight into a masked column
-            hide = set()
-            for r in a.rules:
-                acc = om.roles[p.role].types.get(r.type) if r.type else None
-                masked = set(acc.mask) if acc else set()
-                for col, val in (r.set or {}).items():
-                    if col in masked and isinstance(val, str) and val.startswith("$"):
-                        hide.add(val[1:])
-            if hide:
-                params = {k: (None if k in hide else v) for k, v in params.items()}
-        if "props" not in params:
-            return params
-        props, as_str = params["props"], False
-        if isinstance(props, str):
-            try:
-                props, as_str = json.loads(props), True
-            except ValueError:
-                return {**params, "props": None}
-        if not isinstance(props, dict):
-            return params
-        props = mask_snapshot(p, params.get("type"), props)
-        return {**params, "props": json.dumps(props) if as_str else props}
-
-    def mask_out(p: Principal, x):
-        """THE masking function for every response that can carry diff / before / after / dry_run /
-        params values. Applied recursively; role-relative, at output time (stored values stay raw)."""
-        if p.role == "admin":
-            return x
-        if isinstance(x, list):
-            return [mask_out(p, i) for i in x]
-        if not isinstance(x, dict):
-            return x
-        out = dict(x)
-        for k, v in x.items():
-            if k == "diff":
-                out[k] = mask_diff(p, v)
-            elif k == "dry_run" and isinstance(v, dict):
-                out[k] = {**v, "diff": mask_diff(p, v.get("diff"))}
-            elif k in ("before", "after") and isinstance(v, dict):
-                if all(isinstance(i, dict) for i in v.values()) and all(":" in str(i) for i in v):
-                    out[k] = mask_summary(p, v)
-            elif k == "params":
-                out[k] = mask_params(p, x.get("name") or x.get("action"), v)
-            elif isinstance(v, (dict, list)):
-                out[k] = mask_out(p, v)
-        return out
+        return masking.mask_params(om, p, name, params)
 
     @app.get("/executions/{action_id}")
     def get_execution(action_id: UUID, p: Principal = Depends(get_principal), conn=Depends(rdb)):

@@ -120,6 +120,19 @@ def _action_meta(o: Ontology) -> dict:
     return meta
 
 
+def _function_meta(o: Ontology) -> dict:
+    return {n: {"description": f.description,
+                "params": [{"name": sp.name, "type": sp.base, "ref": sp.ref, "required": sp.required}
+                           for sp in f.param_specs()],
+                "roles": sorted(f.roles)} for n, f in sorted(o.functions.items())}
+
+
+def _agent_meta(o: Ontology) -> dict:
+    return {r: {"allowlist": list(d.agent.allowlist), "tools": list(d.agent.tools),
+                "max_tool_calls": d.agent.max_tool_calls, "max_cost_usd": d.agent.max_cost_usd}
+            for r, d in sorted(o.roles.items()) if d.agent is not None}
+
+
 def _ts_governance(o: Ontology) -> list[str]:
     roles = sorted(o.roles)
     out = ["export type RoleName = " + (" | ".join(f'"{r}"' for r in roles) or "never") + ";",
@@ -129,14 +142,22 @@ def _ts_governance(o: Ontology) -> list[str]:
            "export interface ActionMeta {",
            "  description: string; params: ActionParamMeta[]; requiresApproval: boolean; approvers: RoleName[];",
            "  roles: RoleName[]; webhooks: string[]; rollback: \"compensate\" | \"irreversible\";", "}",
-           "export const ACTION_META: Record<ActionName, ActionMeta> = " + json.dumps(_action_meta(o), indent=2) + ";", ""]
+           "export const ACTION_META: Record<ActionName, ActionMeta> = " + json.dumps(_action_meta(o), indent=2) + ";",
+           "export interface FunctionMeta { description: string; params: ActionParamMeta[]; roles: RoleName[] }",
+           "export const FUNCTION_META: Record<string, FunctionMeta> = " + json.dumps(_function_meta(o), indent=2) + ";",
+           "/** Per-role agent configuration (instructions are server-side only). */",
+           "export const AGENT_META: Partial<Record<RoleName, { allowlist: ActionName[]; tools: string[]; "
+           "max_tool_calls: number | null; max_cost_usd: number | null }>> = "
+           + json.dumps(_agent_meta(o), indent=2) + ";", ""]
     return out
 
 
 def _py_governance(o: Ontology) -> list[str]:
     return ["", "ROLE_NAMES = " + repr(sorted(o.roles)),
             "SELECTABLE_ROLES = " + repr([r for r in sorted(o.roles) if r != "sim"]),
-            "ACTION_META = " + repr(_action_meta(o)), ""]
+            "ACTION_META = " + repr(_action_meta(o)),
+            "FUNCTION_META = " + repr(_function_meta(o)),
+            "AGENT_META = " + repr(_agent_meta(o)), ""]
 
 
 TS_RUNTIME = r"""

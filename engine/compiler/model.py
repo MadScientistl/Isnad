@@ -138,6 +138,36 @@ class TypeAccess:
     where_ast: object = field(default=None, compare=False, repr=False)
 
 
+AGENT_TOOLS = ("query_objects", "traverse", "find_paths", "impact_analysis", "get_history", "as_of", "diff",
+               "run_function", "propose_action")
+GENERIC_ACTIONS = ("create_object", "update_object", "delete_object", "create_link", "end_link")
+
+
+@dataclass(frozen=True)
+class AgentDef:
+    allowlist: tuple[str, ...] = ()
+    tools: tuple[str, ...] = ()
+    instructions: str = ""
+    max_tool_calls: int | None = None
+    max_cost_usd: float | None = None
+
+
+@dataclass(frozen=True)
+class FunctionDef:
+    name: str
+    description: str = ""
+    params: dict[str, str] = field(default_factory=dict, hash=False)
+    roles: tuple[str, ...] = ()
+
+    def param_specs(self) -> list[ParamSpec]:
+        out = []
+        for n, t in self.params.items():
+            ps = parse_param_type(t)
+            if ps is not None:
+                out.append(ParamSpec(n, ps.base, ps.ref, ps.required))
+        return out
+
+
 @dataclass(frozen=True)
 class RoleDef:
     name: str
@@ -149,6 +179,7 @@ class RoleDef:
     region: str | None = None
     all_actions: bool = False  # `actions: all` shorthand (still limited to actions that list this role)
     all_approves: bool = False
+    agent: AgentDef | None = None
 
     def can_read(self, type_name: str) -> bool:
         a = self.types.get(type_name)
@@ -182,6 +213,20 @@ class Ontology:
     actions: dict[str, ActionDef] = field(default_factory=dict)
     roles: dict[str, RoleDef] = field(default_factory=dict)
     webhooks: dict[str, WebhookDef] = field(default_factory=dict)
+    functions: dict[str, FunctionDef] = field(default_factory=dict)
+
+    def agent_allowlist(self, role: str) -> tuple[str, ...]:
+        """Actions the role's agent may propose (empty if the role has no agent block)."""
+        r = self.roles.get(role)
+        return r.agent.allowlist if r and r.agent else ()
+
+    def agent_tools(self, role: str) -> tuple[str, ...]:
+        r = self.roles.get(role)
+        return r.agent.tools if r and r.agent else ()
+
+    def role_can_run_function(self, role: str, name: str) -> bool:
+        f = self.functions.get(name)
+        return bool(f and role in f.roles)
 
     def role_can_execute(self, role: str, action: str) -> bool:
         """Role may execute (or, for approval-gated actions, propose) the action: listed on both sides."""
@@ -287,7 +332,7 @@ def _parse_actions(raw: dict, onto: "Ontology", errors: list[str]) -> None:
             else:
                 for m in validate_expr(ast, onto, params=ptypes, aliases=aliases):
                     errors.append(f"{where}: criteria[{k}]: {m}")
-                if any(x.startswith("new") for x in params_used(ast)):
+                if any(x == "new" or x.startswith("new.") for x in params_used(ast)):
                     errors.append(f"{where}: criteria[{k}]: $new is not available in criteria")
             criteria.append(Criterion(c["expr"], c.get("message") or f"criteria failed: {c['expr']}", ast))
 
@@ -472,8 +517,48 @@ def _parse_roles(raw: dict, onto: "Ontology", errors: list[str]) -> None:
         for a in appr:
             if a not in onto.actions:
                 errors.append(f"{rw}: approves: unknown action '{a}'")
+        agent = None
+        if r.get("agent") is not None:
+            ag = r["agent"]
+            allow = tuple(ag.get("allowlist") or ())
+            tools = tuple(ag.get("tools") or ())
+            for t in tools:
+                if t not in AGENT_TOOLS:
+                    errors.append(f"{rw}: agent.tools: unknown tool '{t}' (valid: {', '.join(AGENT_TOOLS)})")
+            for a in allow:
+                if a in GENERIC_ACTIONS:
+                    errors.append(f"{rw}: agent.allowlist: generic action '{a}' is not allowed")
+                elif a not in onto.actions:
+                    errors.append(f"{rw}: agent.allowlist: unknown action '{a}'")
+                elif a not in acts:
+                    errors.append(f"{rw}: agent.allowlist: action '{a}' is not in the role's actions")
+            if allow and "propose_action" not in tools:
+                errors.append(f"{rw}: agent.allowlist is set but 'propose_action' is not in agent.tools")
+            agent = AgentDef(allow, tools, ag.get("instructions") or "", ag.get("max_tool_calls"),
+                             ag.get("max_cost_usd"))
         onto.roles[rn] = RoleDef(rn, r.get("description"), types, links, acts, appr, r.get("region"),
-                                 r.get("actions") == "all", r.get("approves") == "all")
+                                 r.get("actions") == "all", r.get("approves") == "all", agent)
+
+
+def _parse_functions(raw: dict, onto: "Ontology", errors: list[str]) -> None:
+    from engine.functions import FUNCTIONS  # registry of Python implementations
+    for n, f in (raw.get("functions") or {}).items():
+        f = f or {}
+        where = f"function '{n}'"
+        if n not in FUNCTIONS:
+            errors.append(f"{where}: no implementation registered in engine.functions.FUNCTIONS")
+        params = dict(f.get("params") or {})
+        for pn, pt in params.items():
+            ps = parse_param_type(pt)
+            if ps is None:
+                errors.append(f"{where}: param '{pn}' has unknown type '{pt}'")
+            elif ps.ref and ps.ref not in onto.object_types and ps.ref not in onto.classes:
+                errors.append(f"{where}: param '{pn}' references unknown type '{ps.ref}'")
+        roles = tuple(f.get("roles") or ())
+        for r in roles:
+            if r not in onto.roles:
+                errors.append(f"{where}: unknown role '{r}'")
+        onto.functions[n] = FunctionDef(n, f.get("description") or "", params, roles)
 
 
 def _parse_webhooks(raw: dict, onto: "Ontology", errors: list[str]) -> None:
@@ -535,6 +620,7 @@ def parse_ontology(raw: dict) -> Ontology:
     _parse_actions(raw, onto, errors)
     _parse_roles(raw, onto, errors)
     _parse_webhooks(raw, onto, errors)
+    _parse_functions(raw, onto, errors)
     _cross_check(onto, errors)
     for c in onto.classes.values():
         if c.extends and c.extends not in onto.classes:
