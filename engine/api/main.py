@@ -201,8 +201,10 @@ class SparqlBody(BaseModel):
 
 
 def create_app(ontology_path: str | None = None, schema: str | None = None,
-               dsn: str | None = None, runner: Any = None, pipeline: Any = None) -> FastAPI:
-    """`runner` / `pipeline`: optional injected doubles. `pipeline=False` disables sync entirely."""
+               dsn: str | None = None, runner: Any = None, pipeline: Any = None,
+               agent_model_factory: Any = None) -> FastAPI:
+    """`runner` / `pipeline`: optional injected doubles. `pipeline=False` disables sync entirely.
+    `agent_model_factory(principal) -> model client` (tests inject MockModel; default: Anthropic, needs a key)."""
     path = ontology_path or os.environ.get("AMARH_ONTOLOGY", DEFAULT_ONTOLOGY)
     schema = schema or os.environ.get("AMARH_SCHEMA")
     comp = compile_ontology(path)
@@ -1066,6 +1068,7 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
         r = mask_out(p, {**r, "name": r["action"]})
         r.pop("name", None)
         r["state"] = "pending" if r["decision"] is None else r["decision"]
+        r["stale"] = None  # not computed in the list (decide() blocks stale approvals with 409)
         r["approval"] = None if r["decision"] is None else {
             k: r[k] for k in ("decision", "approver", "approver_role", "comment", "decided_at", "execution_id")}
         return jsonable_encoder(r)
@@ -1259,6 +1262,9 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
         items.sort(key=lambda i: i["at"], reverse=True)
         return jsonable_encoder(mask_out(p, items[:limit]))
 
+    from engine.api import agent_routes
+    agent_routes.mount(app, comp=comp, get_principal=get_principal, connect_fn=lambda: connect(dsn, schema=schema),
+                       get_pipeline=get_pipeline, model_factory=agent_model_factory)
     return app
 
 
