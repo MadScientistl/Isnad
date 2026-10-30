@@ -8,3 +8,8 @@ web/dist/
 .pytest_cache/
 web/dist/
 bench/work/
+
+# Phase 6: generated workspaces (demo fixtures named demo_* are kept) and stored ingest uploads
+workspaces/*
+!workspaces/demo_*/
+var/ingest/
