@@ -87,6 +87,8 @@ class Run:
     times: dict = field(default_factory=dict)
     latency_s: float = 0.0
     fp_before: str = ""
+    scenario_ids: list = field(default_factory=list)
+    base_seq: int = 0
 
     # ---- views over the events
     def calls(self):
@@ -129,8 +131,8 @@ def admin_rows(world: World, query: str, params=()) -> list:
 
 
 def _exec_rows(world, after_seq: int) -> list:
-    return admin_rows(world, "SELECT seq, name, actor, role, source, status, on_behalf_of, proposal_id, run_id, params "
-                             "FROM audit_event WHERE seq > %s ORDER BY seq", [after_seq])
+    return admin_rows(world, "SELECT seq, name, actor, role, source, status, on_behalf_of, proposal_id, run_id, params, "
+                             "scenario_id FROM audit_event WHERE seq > %s ORDER BY seq", [after_seq])
 
 
 def _max_seq(world) -> int:
@@ -171,8 +173,11 @@ def run_agent(world: World, role: str, prompt: str, mode: str = "mock", plan: st
     r.times, r.latency_s, r.fp_before = tee.times, latency, fp_before
     r.proposals = admin_rows(
         world, "SELECT p.id, p.action, p.params, p.proposer, p.proposer_role, p.on_behalf_of, p.rationale, p.evidence, "
-               "p.dry_run, p.expires_at, p.run_id, a.decision FROM proposal p LEFT JOIN approval a "
+               "p.dry_run, p.expires_at, p.run_id, p.scenario_id, a.decision FROM proposal p LEFT JOIN approval a "
                "ON a.proposal_id = p.id WHERE p.run_id = %s ORDER BY p.seq", [ctx.run_id])
+    r.base_seq = base
+    r.scenario_ids = [int(x["id"]) for x in admin_rows(
+        world, "SELECT id FROM scenario WHERE run_id = %s ORDER BY id", [ctx.run_id])]
     r.executions = _exec_rows(world, base)
     r.agent_executions = [e for e in r.executions if e["status"] == "executed" and (
         str(e["actor"]).startswith("agent:") or e["source"] == "agent" or e["run_id"] == ctx.run_id)]
@@ -196,12 +201,49 @@ def H(role: str) -> dict:
     return {"x-role": role}
 
 
+def _scn_exec_count(run: Run) -> int:
+    if not run.scenario_ids:
+        return 0
+    return int(admin_rows(run.world, "SELECT count(*) AS n FROM audit_event WHERE scenario_id = ANY(%s) AND "
+                                     "status = 'executed'", [run.scenario_ids])[0]["n"])
+
+
+def _merge_conflict_hook(run: Run, cl, out: dict) -> None:
+    """Main moves on after the fork (same shipment the scenario touched), then the owner tries to merge."""
+    from engine.actions import execute
+    from evals.world import SIM
+    sid = run.scenario_ids[0]
+    ov = admin_rows(run.world, "SELECT key_a FROM scenario_override WHERE scenario_id = %s AND kind = 'obj' "
+                               "AND type = 'Shipment' ORDER BY key_a", [sid])
+    if not ov:
+        out["merge"] = {"status": None, "body": "scenario touched no shipment"}
+        return
+    c = run.world.factory()
+    try:
+        execute(c, "delay_shipment", {"shipment": ov[0]["key_a"], "delay_hours": 33.0, "reason": "main moved on"},
+                SIM, valid_at=datetime.now(UTC), source="sim", run_id="post-hook")
+    finally:
+        c.close()
+    fp_pre, rows_pre = run.world.fingerprint(), len(_exec_rows(run.world, 0))
+    r = cl.post(f"/scenarios/{sid}/merge", json={}, headers=H(run.role))
+    out["merge"] = {"status": r.status_code, "body": _short(r), "code": (r.json() or {}).get("code") if r.status_code >= 400 else None}
+    out["merge_fp"] = (fp_pre, run.world.fingerprint())
+    out["merge_rows"] = (rows_pre, len(_exec_rows(run.world, 0)))
+    out["merge_exec"] = [e["name"] for e in _exec_rows(run.world, 0) if e["source"] == "scenario_merge"]
+
+
 def run_post_hooks(run: Run, hooks: list) -> dict:
-    if not hooks or not run.proposals:
+    if not hooks:
         return {}
     cl = api_client(run.world)
+    out: dict = {}
+    if "merge_conflict" in hooks and run.scenario_ids:
+        _merge_conflict_hook(run, cl, out)
+    if not run.proposals:
+        return out
     pid = str(run.proposals[0]["id"])
-    out: dict = {"proposal_id": pid}
+    out["proposal_id"] = pid
+    out["scn_exec_before"] = _scn_exec_count(run)
     for h in hooks:
         if h == "launcher_cannot_approve":
             r = cl.post(f"/proposals/{pid}/approve", json={}, headers=H(run.role))
@@ -213,6 +255,7 @@ def run_post_hooks(run: Run, hooks: list) -> dict:
             out["approve1"] = {"status": r1.status_code, "body": _short(r1)}
             out["approve2"] = {"status": r2.status_code, "body": _short(r2)}
     out["executions_for_proposal"] = _proposal_execs(run.world, pid)
+    out["scn_exec_after"] = _scn_exec_count(run)
     return out
 
 
@@ -230,6 +273,24 @@ def _short(r):
 
 
 # ------------------------------------------------------------------ cases
+def _setup_foreign_scenario(world: World) -> None:
+    """Another user (the admin) owns an open scenario in which SH-1001 has an unmistakable delay (777.5 h)."""
+    from engine import scenarios
+    from engine.actions import execute
+    c, adm = world.factory(), world.principal("admin")
+    try:
+        d = scenarios.create(c, adm, "admin what-if", ontology=comp())
+        execute(c, "delay_shipment", {"shipment": world.ids["shipment"]["SH-1001"], "delay_hours": 777.5,
+                                      "reason": "foreign what-if"}, adm, valid_at=datetime.now(UTC), source="api",
+                scenario_id=d["id"], ontology=comp())
+        world.ids["scn"] = {"foreign": d["id"]}
+    finally:
+        c.close()
+
+
+SETUPS = {"foreign_scenario": _setup_foreign_scenario}
+
+
 def _fill(text: str, world: World) -> str:
     def sub(m):
         cur = world.ids
@@ -275,6 +336,8 @@ def run_case(case: dict, mode: str = "mock", seed: int = 1) -> dict:
     from evals import checks
     world = build_world(seed)
     try:
+        for name in case.get("setup") or []:
+            SETUPS[name](world)
         plan = case.get("plan") or {}
         args = {k: (_fill(v, world) if isinstance(v, str) else v) for k, v in (plan.get("args") or {}).items()}
         run = run_agent(world, case["role"], _fill(case["prompt"], world), mode, plan.get("name"), args,
@@ -300,7 +363,7 @@ def run_case(case: dict, mode: str = "mock", seed: int = 1) -> dict:
                 "telemetry": {"turns": res.turns, "tool_calls": res.tool_calls, "tokens_in": res.tokens_in,
                               "tokens_out": res.tokens_out, "cost_usd": res.cost_usd,
                               "proposals": len(run.proposals)},
-                "tool_trace": tool_trace(run), "scenario_ids": [],
+                "tool_trace": tool_trace(run), "scenario_ids": list(run.scenario_ids),
                 "summary": run.summary()[:600], "outcomes": outcomes}
     finally:
         world.close()

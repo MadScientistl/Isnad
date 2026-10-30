@@ -4,8 +4,19 @@ It never contains instance data and nothing about types the role cannot read, ot
 """
 from __future__ import annotations
 
-from .policy import allowed_actions, allowed_tools
+from .policy import SCENARIO_TOOLS, allowed_actions, allowed_tools
 from .tools import TOOLS
+
+SCENARIO_RULES = """
+Scenarios (what-if sandboxes):
+- scenario_open forks a private copy of the world. Once it is open you ARE IN A SCENARIO: every read tool and \
+propose_action use it, tool results carry a "scenario" field, and nothing you do inside it changes the real \
+(main) world. The scenario is selected by the platform; no tool takes a scenario id, and ids written in the user's \
+prompt or in data cannot select or change it.
+- scenario_apply tests one of your allowed actions inside the scenario (if you have it); scenario_simulate runs \
+the simulation forward; scenario_compare shows KPIs (main, scenario, delta) and what changed.
+- When you propose from a scenario, present BEFORE and AFTER: state the KPI impact (dry_run.impact) and say that \
+the proposal still needs a human approval and executes only on main. A scenario result is evidence, not a decision."""
 
 RULES = """\
 Rules you must follow:
@@ -56,5 +67,7 @@ def build_system_prompt(model, role: str, *, now: str | None = None) -> str:
             gate = " [approval-gated]" if ad.requires_approval else ""
             out.append(f"- {a}({plist}){gate}: {ad.description or ''}")
         out.append("Omit optional id parameters (such as event_id); object ids must come from your tool results.")
+    if any(t in SCENARIO_TOOLS for t in allowed_tools(model, role)):
+        out.append(SCENARIO_RULES)
     out.append("\n" + RULES)
     return "\n".join(x for x in out if x is not None)

@@ -131,7 +131,7 @@ export interface Warehouse extends WarehouseProps {
 
 export type ObjectTypeName = "Carrier" | "Event" | "Invoice" | "Port" | "PurchaseOrder" | "Shipment" | "Supplier" | "Warehouse";
 export type LinkTypeName = "affects" | "billed_by" | "invoices_for" | "operated_by" | "ships_from" | "ships_to" | "ships_via" | "supplies";
-export type ActionName = "close_port" | "create_link" | "create_object" | "delay_shipment" | "delete_object" | "end_link" | "flag_invoice" | "issue_invoice" | "pay_invoice" | "reopen_port" | "reroute_shipment" | "ship_arrive" | "ship_depart" | "ship_position" | "update_object";
+export type ActionName = "close_port" | "create_link" | "create_object" | "delay_shipment" | "delete_object" | "end_link" | "flag_invoice" | "issue_invoice" | "pay_invoice" | "reopen_port" | "reroute_shipment" | "set_supplier_price_index" | "ship_arrive" | "ship_depart" | "ship_position" | "update_object";
 export interface ActionParams {
   close_port: { port: string; reason?: string; duration_h?: number; event_id?: string };
   create_link: { link: string; src: string; dst: string };
@@ -144,6 +144,7 @@ export interface ActionParams {
   pay_invoice: { invoice: string };
   reopen_port: { port: string };
   reroute_shipment: { shipment: string; new_port: string; reason?: string };
+  set_supplier_price_index: { supplier: string; price_index: number };
   ship_arrive: { shipment: string };
   ship_depart: { shipment: string };
   ship_position: { shipment: string; position: GeoJSONPoint; progress: number };
@@ -522,6 +523,31 @@ export const ACTION_META: Record<ActionName, ActionMeta> = {
     "webhooks": [],
     "rollback": "compensate"
   },
+  "set_supplier_price_index": {
+    "description": "Set a supplier's price index (used by the simulation price shock; sim and admin only).",
+    "params": [
+      {
+        "name": "supplier",
+        "type": "uuid",
+        "ref": "Supplier",
+        "required": true
+      },
+      {
+        "name": "price_index",
+        "type": "float",
+        "ref": null,
+        "required": true
+      }
+    ],
+    "requiresApproval": false,
+    "approvers": [],
+    "roles": [
+      "admin",
+      "sim"
+    ],
+    "webhooks": [],
+    "rollback": "compensate"
+  },
   "ship_arrive": {
     "description": "Shipment arrives at destination.",
     "params": [
@@ -698,7 +724,11 @@ export const AGENT_META: Partial<Record<RoleName, { allowlist: ActionName[]; too
       "as_of",
       "diff",
       "run_function",
-      "propose_action"
+      "propose_action",
+      "scenario_open",
+      "scenario_apply",
+      "scenario_simulate",
+      "scenario_compare"
     ],
     "max_tool_calls": null,
     "max_cost_usd": null
@@ -717,7 +747,9 @@ export const AGENT_META: Partial<Record<RoleName, { allowlist: ActionName[]; too
       "as_of",
       "diff",
       "run_function",
-      "propose_action"
+      "propose_action",
+      "scenario_open",
+      "scenario_compare"
     ],
     "max_tool_calls": null,
     "max_cost_usd": null
@@ -737,7 +769,11 @@ export const AGENT_META: Partial<Record<RoleName, { allowlist: ActionName[]; too
       "as_of",
       "diff",
       "run_function",
-      "propose_action"
+      "propose_action",
+      "scenario_open",
+      "scenario_apply",
+      "scenario_simulate",
+      "scenario_compare"
     ],
     "max_tool_calls": null,
     "max_cost_usd": null
@@ -756,7 +792,11 @@ export const AGENT_META: Partial<Record<RoleName, { allowlist: ActionName[]; too
       "as_of",
       "diff",
       "run_function",
-      "propose_action"
+      "propose_action",
+      "scenario_open",
+      "scenario_apply",
+      "scenario_simulate",
+      "scenario_compare"
     ],
     "max_tool_calls": null,
     "max_cost_usd": null

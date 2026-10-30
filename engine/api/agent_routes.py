@@ -180,7 +180,10 @@ def mount(app, *, comp, get_principal, connect_fn, get_pipeline, model_factory=N
     RUNS_SQL = (
         'SELECT r.id, r.role, r."user", r.prompt, r.model, r.caps, r.started_at, f.payload AS fin, '
         "coalesce(s.ti,0) AS tokens_in, coalesce(s.tout,0) AS tokens_out, coalesce(s.cost,0) AS cost_usd, "
-        "coalesce(s.turns,0) AS turns, coalesce(s.tcs,0) AS tool_calls, coalesce(s.props,0) AS proposals "
+        "coalesce(s.turns,0) AS turns, coalesce(s.tcs,0) AS tool_calls, coalesce(s.props,0) AS proposals, r.scenario_id AS run_scenario_id, "
+        "coalesce((SELECT array_agg(DISTINCT (x.payload->'result'->'scenario'->>'id')::int) FROM agent_run_event x "
+        "WHERE x.run_id = r.id AND x.kind = 'tool_result' AND x.payload->'result'->'scenario'->>'id' IS NOT NULL), "
+        "'{}'::int[]) AS scenario_ids "
         "FROM agent_run r "
         "LEFT JOIN LATERAL (SELECT payload FROM agent_run_event e WHERE e.run_id = r.id AND e.kind = 'finished' "
         "ORDER BY e.seq DESC LIMIT 1) f ON true "
@@ -203,7 +206,11 @@ def mount(app, *, comp, get_principal, connect_fn, get_pipeline, model_factory=N
             "tokens_in": int(r["tokens_in"]), "tokens_out": int(r["tokens_out"]),
             "cost_usd": round(float(r["cost_usd"]), 6), "turns": int(r["turns"]),
             "tool_calls": int(r["tool_calls"]), "proposals": int(r["proposals"]),
-            "proposal_ids": (fin or {}).get("proposals") or []})
+            "proposal_ids": (fin or {}).get("proposals") or [],
+            # scenarios the run used, derived from its tool results (agent_run rows are append-only, so the
+            # column written at run start stays 0)
+            "scenario_ids": sorted(r.get("scenario_ids") or []),
+            "scenario_id": (sorted(r.get("scenario_ids") or []) or [int(r.get("run_scenario_id") or 0)])[-1] or None})
 
     def fetch_run(p: Principal, run_id: str):
         def fn(cur):

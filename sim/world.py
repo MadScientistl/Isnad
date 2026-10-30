@@ -30,6 +30,7 @@ HAZARD_PER_H = 0.0008          # per in-transit shipment per hour
 CLOSURE_MEAN_GAP_H = 96.0      # mean hours between random port closures
 ANOMALY_MEAN_GAP_H = 72.0
 FAMILIES = ("shipments", "movement", "delays", "closures", "invoices", "anomalies", "inject")
+_META = {"id", "valid_during", "recorded_during", "changed_by", "action_id", "scenario_id"}
 NS = uuid.UUID("6f1c2b7e-0d3a-4c55-9a51-5a1d0c0f5e11")
 
 
@@ -87,8 +88,11 @@ def point(xy) -> dict:
 
 class World:
     def __init__(self, seed: int, epoch: datetime, apply: Callable, *, start_hour: int = 0,
-                 max_active: int = MAX_ACTIVE, shipments_per_day: float = SHIPMENTS_PER_DAY):
+                 max_active: int = MAX_ACTIVE, shipments_per_day: float = SHIPMENTS_PER_DAY,
+                 scenario_id: int = 0):
         self.seed, self.epoch, self._apply = seed, epoch, apply
+        self.scn = scenario_id         # >0: read the scenario's effective state (what-if)
+        self.supplier_props: dict[uuid.UUID, dict] = {}
         self.start_hour, self.max_active = start_hour, max_active
         self.gen = start_hour          # id-generation tag: resumed runs never reuse ids
         self.rate_h = shipments_per_day / 24.0
@@ -124,10 +128,11 @@ class World:
     def load(self, conn) -> None:
         """Read entities as of sim_now (restores in-flight state when resuming)."""
         at = self.when(self.start_hour)
+        scn = self.scn
 
         def rows(t):
-            r = bt.list_objects(conn, t, as_of_valid=at)
-            return r or (bt.list_objects(conn, t) if self.start_hour == 0 else r)
+            r = bt.list_objects(conn, t, as_of_valid=at, scenario_id=scn)
+            return r or (bt.list_objects(conn, t, scenario_id=scn) if self.start_hour == 0 else r)
 
         for t, store, kind in (("Port", self.ports, "Port"), ("Warehouse", self.warehouses, "Warehouse")):
             for o in rows(t):
@@ -135,22 +140,24 @@ class World:
                 if xy:
                     store[o["id"]] = Fac(o["id"], kind, o.get("name") or str(o["id"]), xy)
         self.carriers = [o["id"] for o in rows("Carrier")]
-        self.suppliers = [o["id"] for o in rows("Supplier")]
+        sup = rows("Supplier")
+        self.suppliers = [o["id"] for o in sup]
+        self.supplier_props = {o["id"]: dict(o) for o in sup}
         if not self.start_hour:
             return
-        for o in bt.list_objects(conn, "Port", as_of_valid=at):
+        for o in bt.list_objects(conn, "Port", as_of_valid=at, scenario_id=scn):
             if o.get("status") == "closed" and o["id"] in self.ports:
                 self.closed[o["id"]] = self.start_hour + 24.0
         fac = {**self.ports, **self.warehouses}
-        for s in bt.list_objects(conn, "Shipment", as_of_valid=at):
+        for s in bt.list_objects(conn, "Shipment", as_of_valid=at, scenario_id=scn):
             if s.get("status") not in ("in_transit", "delayed"):
                 continue
             sid = s["id"]
-            o = [fac[i] for i in bt.neighbours(conn, "ships_from", sid, "out", as_of_valid=at) if i in fac]
-            d = [fac[i] for i in bt.neighbours(conn, "ships_to", sid, "out", as_of_valid=at) if i in fac]
+            o = [fac[i] for i in bt.neighbours(conn, "ships_from", sid, "out", as_of_valid=at, scenario_id=scn) if i in fac]
+            d = [fac[i] for i in bt.neighbours(conn, "ships_to", sid, "out", as_of_valid=at, scenario_id=scn) if i in fac]
             if not o or not d:
                 continue
-            vias = [self.ports[i] for i in bt.neighbours(conn, "ships_via", sid, "out", as_of_valid=at)
+            vias = [self.ports[i] for i in bt.neighbours(conn, "ships_via", sid, "out", as_of_valid=at, scenario_id=scn)
                     if i in self.ports]
             vias.sort(key=lambda p: Path([o[0].xy, p.xy]).total)
             path = Path([o[0].xy, *[p.xy for p in vias], d[0].xy])
@@ -160,11 +167,11 @@ class World:
                           notified=s["status"] == "delayed")
             sh.pidx = sum(1 for f in sh.port_fracs if f < sh.progress - 1e-9)
             self.active[sid] = sh
-        for inv in bt.list_objects(conn, "Invoice", as_of_valid=at):
+        for inv in bt.list_objects(conn, "Invoice", as_of_valid=at, scenario_id=scn):
             if inv.get("status") != "open":
                 continue
-            sh = bt.neighbours(conn, "invoices_for", inv["id"], "out", as_of_valid=at)
-            su = bt.neighbours(conn, "billed_by", inv["id"], "out", as_of_valid=at)
+            sh = bt.neighbours(conn, "invoices_for", inv["id"], "out", as_of_valid=at, scenario_id=scn)
+            su = bt.neighbours(conn, "billed_by", inv["id"], "out", as_of_valid=at, scenario_id=scn)
             if sh and su:
                 self.invoices[inv["id"]] = Invoice(inv["id"], inv["ref"], float(inv["amount"]), sh[0], su[0])
 
@@ -374,11 +381,49 @@ class World:
         return ok is not None
 
     # injections -------------------------------------------------------------
-    def schedule(self, kind: str, target, at_hour: int, duration_h: float) -> None:
-        self.env.process(self._injected(kind, target, at_hour, duration_h))
+    def schedule(self, kind: str, target, at_hour: int, duration_h: float, magnitude: float = 1.5) -> None:
+        self.env.process(self._injected(kind, target, at_hour, duration_h, magnitude))
 
-    def _injected(self, kind, target, at_hour, duration_h):
+    def pick_target(self, kind: str):
+        """Deterministic default target (sorted pool, injection RNG family), resolved when the injection fires."""
+        pool = {"port_closure": lambda: sorted(p for p in self.ports if p not in self.closed),
+                "shipment_delay": lambda: sorted(self.active),
+                "invoice_anomaly": lambda: sorted(i.id for i in self.invoices.values() if i.status == "open"),
+                "supplier_delay": lambda: sorted({i.supplier for i in self.invoices.values()
+                                                  if i.shipment in self.active}),
+                "price_shock": lambda: sorted(self.suppliers)}[kind]()
+        return pool[self.rng["inject"].randrange(len(pool))] if pool else None
+
+    def supplier_delay(self, supplier, hours: float) -> int:
+        """Delay every active shipment billed by `supplier` (invoices_for + billed_by)."""
+        ids = sorted({i.shipment for i in self.invoices.values() if i.supplier == supplier and i.shipment in self.active})
+        return sum(1 for sid in ids if self.delay(self.active[sid], float(hours), "supplier delay"))
+
+    def price_shock(self, supplier, magnitude: float) -> bool:
+        cur = self.supplier_props.get(supplier)
+        if cur is None:
+            self.skipped.append(f"price_shock {supplier}: unknown supplier")
+            return False
+        new = round(float(cur.get("price_index") or 1.0) * float(magnitude), 6)
+        if self.do("set_supplier_price_index", {"supplier": supplier, "price_index": new}) is None:
+            return False
+        cur["price_index"] = new
+        return True
+
+    def _injected(self, kind, target, at_hour, duration_h, magnitude: float = 1.5):
         yield self.env.timeout(max(0.0, at_hour - self.env.now))
+        if target is None:
+            target = self.pick_target(kind)
+            if target is None:
+                self.skipped.append(f"{kind}: no candidate target")
+                return
+        if kind == "supplier_delay":
+            if self.supplier_delay(target, float(duration_h)) == 0:
+                self.skipped.append(f"supplier_delay {target}: no active shipments")
+            return
+        if kind == "price_shock":
+            self.price_shock(target, magnitude)
+            return
         if kind == "port_closure":
             yield from self.closure(target, duration_h, "injected")
         elif kind == "shipment_delay":

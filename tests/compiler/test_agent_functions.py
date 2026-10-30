@@ -32,8 +32,12 @@ def test_real_ontology_agents():
     assert set(o.agent_allowlist("admin")) == {"flag_invoice", "delay_shipment", "close_port", "reopen_port",
                                               "reroute_shipment"}
     assert o.agent_allowlist("sim") == () and o.agent_tools("sim") == ()
-    for r in ("planner", "finance_analyst", "regional_ops_lead", "admin"):
+    scn = {"scenario_open", "scenario_apply", "scenario_simulate", "scenario_compare"}
+    for r in ("planner", "regional_ops_lead", "admin"):
         assert set(o.agent_tools(r)) == set(AGENT_TOOLS)
+    assert set(o.agent_tools("finance_analyst")) == set(AGENT_TOOLS) - {"scenario_apply", "scenario_simulate"}
+    assert scn <= set(AGENT_TOOLS)
+    for r in ("planner", "finance_analyst", "regional_ops_lead", "admin"):
         assert o.roles[r].agent.instructions
     assert o.actions["pay_invoice"].approval_required
 

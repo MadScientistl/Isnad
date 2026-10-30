@@ -45,6 +45,10 @@ def _canon(params: dict) -> str:
     return json.dumps(params, sort_keys=True, default=str, separators=(",", ":"))
 
 
+def digest_line(valid_at: datetime, name: str, params: dict) -> bytes:
+    return f"{valid_at.astimezone(UTC).isoformat()}|{name}|{_canon(params)}\n".encode()
+
+
 class SimRunner:
     def __init__(self, dsn: str | None = None, schema: str | None = None, seed: int = 1,
                  epoch: datetime = datetime(2026, 1, 1, tzinfo=UTC), pipeline=None,
@@ -113,8 +117,7 @@ class SimRunner:
             self._rollback()
             self.last_error = f"{name} at {valid_at.isoformat()}: {e}"
             return None
-        self._sha.update(f"{valid_at.astimezone(UTC).isoformat()}|{name}|{_canon(params)}\n"
-                         .encode())
+        self._sha.update(digest_line(valid_at, name, params))
         self.actions += 1
         return res
 

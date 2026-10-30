@@ -157,7 +157,7 @@ def test_actions_listing(cl, w):
     inv = {x["name"]: x for x in cl.get(f"/actions?type=Invoice&id={paid}", headers=H("finance_analyst")).json()}
     assert inv["flag_invoice"]["allowed"] is False and inv["flag_invoice"]["reason"] == "Invoice is already paid"
     assert inv["pay_invoice"]["requires_approval"] is True
-    assert len(cl.get("/actions", headers=H("admin")).json()) == 15
+    assert len(cl.get("/actions", headers=H("admin")).json()) == 16
 
 
 def test_criteria_failure_422(cl, w):

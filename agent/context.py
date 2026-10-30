@@ -11,7 +11,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from engine.db.principal import Principal
+from engine.db.principal import Principal, ScenarioCtx
 
 DEFAULT_CAPS = dict(max_turns=12, max_tool_calls=25, max_output_tokens=60_000, max_cost_usd=0.50, max_wall_s=120.0)
 
@@ -56,6 +56,9 @@ class AgentContext:
     inferred_refs: set = field(default_factory=set)
     seen_ids: dict = field(default_factory=dict)     # uuid str -> type name or None
     tool_calls: int = 0
+    scn: ScenarioCtx | None = None                   # the run's ACTIVE scenario (never set from model input)
+    scn_name: str = ""
+    scenario_ids: list = field(default_factory=list)  # every scenario this run opened, in order
     _conn: object = None
 
     def __post_init__(self):
@@ -80,6 +83,10 @@ class AgentContext:
     def agent_principal(self) -> Principal:
         p = self.principal
         return Principal(p.role, f"agent:{p.role}", p.region, p.approves)
+
+    @property
+    def sid(self) -> int:
+        return self.scn.id if self.scn is not None else 0
 
     @staticmethod
     def now() -> datetime:
