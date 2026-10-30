@@ -16,6 +16,13 @@ from engine.db.setup import apply_schema  # noqa: E402
 BASE_YAML = (ROOT / "ontology" / "supply_chain.yaml").read_text()
 
 
+@pytest.fixture(autouse=True)
+def _self_approve(monkeypatch):
+    """The existing tests use one admin for propose AND approve; the review fix (proposer != approver) has its own
+    tests that delete this variable."""
+    monkeypatch.setenv("AMARH_ONTOLOGY_SELF_APPROVE", "1")
+
+
 @pytest.fixture
 def raw():
     return yaml.safe_load(BASE_YAML)

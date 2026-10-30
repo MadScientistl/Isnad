@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import uuid
 from pathlib import Path
 
@@ -61,10 +62,10 @@ def get_version(conn, version_id: int) -> dict | None:
     return r[0] if r else None
 
 
-def _insert_version(conn, yaml_text, parent_hash, by, source, note) -> dict:
-    return _q(conn, "INSERT INTO ontology_version (hash, parent_hash, yaml, created_by, source, note) "
-                    "VALUES (%s,%s,%s,%s,%s,%s) RETURNING *",
-              (_hash(yaml_text), parent_hash, yaml_text, by, source, note))[0]
+def _insert_version(conn, yaml_text, parent_hash, by, source, note, parent_id=None) -> dict:
+    return _q(conn, "INSERT INTO ontology_version (hash, parent_hash, yaml, created_by, source, note, parent_id) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING *",
+              (_hash(yaml_text), parent_hash, yaml_text, by, source, note, parent_id))[0]
 
 
 def register_current(conn, yaml_text: str, by: str = "startup") -> dict:
@@ -101,6 +102,8 @@ def diff_versions(conn, principal, from_id: int, to_id: int) -> dict:
 def propose(conn, principal, yaml_text: str, rationale: str = "") -> dict:
     """Store a change proposal against the latest version. Breaking proposals are stored (and diffable)."""
     _require_admin(principal)
+    if len(rationale or "") > 4000:
+        raise VersioningError(422, "rationale too long (max 4000 characters)")
     cur = latest(conn)
     if cur is None:
         raise VersioningError(409, "no registered ontology version; start the API first")
@@ -137,11 +140,17 @@ def decide(conn, principal, proposal_id, approve: bool, comment: str = "", *, wr
     """Approve or reject. Approval of a breaking or stale proposal fails (nothing is recorded).
 
     Returns {decision, version, yaml, notes}. The YAML file is written only when `write_path` is given.
+    Review L5: the proposer cannot approve their own proposal (dev override: AMARH_ONTOLOGY_SELF_APPROVE=1);
+    approving a proposal whose diff widens permissions of existing roles/actions (`sensitive`) needs a comment.
     """
     _require_admin(principal)
+    if len(comment or "") > 4000:
+        raise VersioningError(422, "comment too long (max 4000 characters)")
     p = get_proposal(conn, principal, proposal_id)
     if p["decision"] is not None:
         raise VersioningError(409, f"proposal already {p['decision']}")
+    if approve and p["proposer"] == principal.user and os.environ.get("AMARH_ONTOLOGY_SELF_APPROVE") != "1":
+        raise VersioningError(403, "the proposer cannot approve their own ontology proposal")
     if not approve:
         _q(conn, "INSERT INTO ontology_change_decision (proposal_id, decision, approver, comment) "
                  "VALUES (%s,'rejected',%s,%s) RETURNING id", (p["id"], principal.user, comment))
@@ -152,7 +161,16 @@ def decide(conn, principal, proposal_id, approve: bool, comment: str = "", *, wr
     d = diff(cur["yaml"], p["yaml"])
     if d["breaking"]:
         raise VersioningError(422, "breaking change cannot be applied (additive-only): " + "; ".join(d["breaking"]))
-    v = _insert_version(conn, p["yaml"], cur["hash"], principal.user, "proposal", p["rationale"])
+    if d.get("sensitive") and not (comment or "").strip():
+        raise VersioningError(422, "this change widens permissions (" + "; ".join(d["sensitive"][:5]) +
+                              "); approval needs a comment")
+    try:
+        with conn.transaction():
+            v = _insert_version(conn, p["yaml"], cur["hash"], principal.user, "proposal", p["rationale"], cur["id"])
+    except Exception as e:  # noqa: BLE001 - unique parent index: a concurrent approval won
+        if type(e).__name__ == "UniqueViolation":
+            raise VersioningError(409, "stale proposal: the ontology changed since it was proposed") from e
+        raise
     _q(conn, "INSERT INTO ontology_change_decision (proposal_id, decision, approver, comment, version_id) "
              "VALUES (%s,'approved',%s,%s,%s) RETURNING id", (p["id"], principal.user, comment, v["id"]))
     notes = [RESTART_NOTE]

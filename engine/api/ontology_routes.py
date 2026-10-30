@@ -53,6 +53,8 @@ def make_router(get_principal, get_conn) -> APIRouter:
         y = body.get("yaml")
         if not isinstance(y, str) or not y.strip():
             raise HTTPException(422, "yaml (string) required")
+        if len(y) > 200_000:
+            raise HTTPException(422, "yaml too large (max 200000 characters)")
         return run(conn, V.propose, p, y, str(body.get("rationale") or ""))
 
     @r.get("/proposals")

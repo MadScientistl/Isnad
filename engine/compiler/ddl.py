@@ -55,6 +55,9 @@ def generate_base_ddl(o: Ontology) -> str:
            "CREATE TABLE IF NOT EXISTS graph_outbox (",
            "    seq bigserial PRIMARY KEY,", "    kind text,", "    type text,", "    id uuid,",
            "    src uuid,", "    dst uuid,", "    op text,", "    at timestamptz DEFAULT now()", ");", "",
+           "DROP TRIGGER IF EXISTS amarh_no_scn ON graph_outbox;",
+           "CREATE TRIGGER amarh_no_scn BEFORE INSERT ON graph_outbox FOR EACH ROW "
+           "EXECUTE FUNCTION amarh_no_scenario_write();", "",
            "CREATE TABLE IF NOT EXISTS ontology_registry (",
            "    hash text PRIMARY KEY,", "    yaml text,", "    applied_at timestamptz", ");", ""]
     for name in sorted(o.object_types):
@@ -165,7 +168,9 @@ def generate_policy_ddl(o: Ontology) -> str:
     # see (read) / own (write) it; main rows (scenario_id = 0) are unaffected (the OR short-circuits; plain
     # function calls, no sub-selects, so the main-path plan keeps no InitPlans).
     scn_r = "(scenario_id = 0 OR (scenario_id = amarh_scn() AND amarh_scenario_visible(scenario_id)))"
-    scn_w = "(scenario_id = 0 OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id)))"
+    # writes: main rows only while NO scenario is active; scenario rows only into the active scenario
+    scn_w = ("((scenario_id = 0 AND amarh_scn() = 0) OR "
+             "(scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id)))")
 
     def policies(tbl, sel, ins, upd_using, upd_check):
         out2 = []

@@ -57,12 +57,34 @@ class GraphTooLarge(RuntimeError):
     """The scenario holds more objects than AMARH_SCN_GRAPH_MAX_OBJECTS (HTTP 413). No counts in the message."""
 
 
+class GraphBusy(RuntimeError):
+    """Too many scenario graph builds are running (AMARH_SCN_MAX_GRAPH_BUILDS); HTTP 503 `graph_busy`."""
+
+
 class ScenarioNotVisible(LookupError):
     """The scenario does not exist, is closed, or is not visible to the caller (HTTP 404 scenario_not_found)."""
 
 
 def max_objects() -> int:
     return int(os.environ.get("AMARH_SCN_GRAPH_MAX_OBJECTS", "20000"))
+
+
+_build_slots: dict[int, threading.BoundedSemaphore] = {}
+_build_slots_lock = threading.Lock()
+
+
+def _slots() -> threading.BoundedSemaphore:
+    """Process-wide limit on concurrent scenario graph builds (review M4c): each build holds the full effective
+    state of a scenario in memory and runs reasoning, so builds for DIFFERENT scenarios must not pile up."""
+    n = max(1, int(os.environ.get("AMARH_SCN_MAX_GRAPH_BUILDS", "2")))
+    with _build_slots_lock:
+        if n not in _build_slots:
+            _build_slots[n] = threading.BoundedSemaphore(n)
+        return _build_slots[n]
+
+
+def build_timeout_s() -> float:
+    return float(os.environ.get("AMARH_SCN_GRAPH_TIMEOUT_S", "120"))
 
 
 def cache_size() -> int:
@@ -150,8 +172,11 @@ def _load(oc, ctx: ScenarioCtx, cfg: SyncConfig, cap: int) -> tuple[list[Quad], 
         quads.extend(Quad(iri.obj_iri(ns, r[0]), iri.RDF_TYPE, cls, iri.G_ASSERTED) for r in rows)
     for typ in cfg.link_types:
         p = iri.link_iri(ns, typ)
-        rows = oc.execute(sql.SQL("SELECT DISTINCT src, dst FROM {}").format(
-            sql.Identifier("eff_" + bt.link_table(typ)))).fetchall()
+        rows = oc.execute(sql.SQL("SELECT DISTINCT src, dst FROM {} LIMIT %s").format(
+            sql.Identifier("eff_" + bt.link_table(typ))), [remaining + 1]).fetchall()
+        if len(rows) > remaining:  # links count against the same cap as objects
+            raise GraphTooLarge("scenario graph exceeds the size limit")
+        remaining -= len(rows)
         n_link += len(rows)
         quads.extend(Quad(iri.obj_iri(ns, s), p, iri.obj_iri(ns, d), iri.G_ASSERTED) for s, d in rows)
     return quads, dv, n_obj, n_link
@@ -163,9 +188,12 @@ def _build(ctx: ScenarioCtx, comp, dsn: str | None, schema: str | None) -> Scena
     oc = connect(dsn or get_dsn(), schema=schema)
     try:
         oc.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        tmo = f"{int(build_timeout_s() * 1000)}ms"
+        oc.execute("SELECT set_config('statement_timeout', %s, true)", [tmo])
         with scoped(oc, OWNER, scenario=ctx):
             quads, dv, n_obj, n_link = _load(oc, ctx, cfg, max_objects())
         oc.rollback()
+        oc.execute("SELECT set_config('statement_timeout', %s, true)", [tmo])  # the next transaction (support rows)
         store = open_store(None, cfg)          # fresh in-memory store, ontology graph loaded
         for i in range(0, len(quads), 200_000):
             store.bulk_extend(quads[i:i + 200_000])
@@ -221,7 +249,13 @@ def get_store(conn, ctx: ScenarioCtx, comp, *, dsn: str | None = None, schema: s
             if g is not None:
                 _cache.move_to_end(k)
                 return g
-        g = _build(ctx, comp, dsn, schema)
+        slots = _slots()
+        if not slots.acquire(timeout=max(1.0, build_timeout_s() / 4)):
+            raise GraphBusy("too many scenario graph builds are running")
+        try:
+            g = _build(ctx, comp, dsn, schema)
+        finally:
+            slots.release()
         kb = (schema,) + _key(ctx, g.data_version)
         with _cache_lock:
             _stats["builds"] += 1

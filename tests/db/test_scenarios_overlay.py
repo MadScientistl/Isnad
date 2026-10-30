@@ -190,15 +190,16 @@ def test_scenario_state_counters_and_cap(c, monkeypatch):
     sid = fork(c)
     ids = [uuid.uuid4() for _ in range(3)]
     port(c, ids[0], "a", scenario_id=sid)
-    port(c, ids[0], "a2", scenario_id=sid)                  # same key: still one override row
+    port(c, ids[0], "a2", scenario_id=sid)                  # same key: one override key, two row versions
     st = c.execute("SELECT override_rows, data_version FROM scenario_state WHERE scenario_id=%s", [sid]).fetchone()
-    assert st == (1, 2)
-    monkeypatch.setenv("AMARH_SCN_MAX_ROWS", "2")
+    assert st == (2, 2)                                      # review M4a: the cap counts row versions, not keys
+    monkeypatch.setenv("AMARH_SCN_MAX_ROWS", "3")
     port(c, ids[1], "b", scenario_id=sid)
     with pytest.raises(bt.ScenarioLimit):
         port(c, ids[2], "c", scenario_id=sid)
     assert len(bt.list_overrides(c, sid)) == 2
-    port(c, ids[0], "a3", scenario_id=sid)                  # already-overridden keys keep working at the cap
+    with pytest.raises(bt.ScenarioLimit):                    # re-writing an overridden key adds versions: capped too
+        port(c, ids[0], "a3", scenario_id=sid)
 
 
 def test_link_endpoints_are_checked_against_the_effective_view(c):

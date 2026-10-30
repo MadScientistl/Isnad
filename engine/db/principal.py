@@ -15,6 +15,9 @@ class Principal:
     region: str = ""
     # actions this role may approve (feeds proposal visibility policy); optional extension of the contract
     approves: tuple[str, ...] = ()
+    # Phase 5 review (H1): set only for a runtime-agent identity (`user` = 'agent:<role>'): the human the agent acts
+    # for. Scenario ownership checks in the database accept `owner_user = on_behalf_of` for such an identity.
+    on_behalf_of: str = ""
 
 
 @dataclass(frozen=True)
@@ -91,9 +94,11 @@ def scoped(conn: psycopg.Connection, principal, scenario: ScenarioCtx | None = N
         "set_config('amarh.region', %s, true), set_config('amarh.approves', %s, true), "
         "set_config('amarh.scenario', %s, true), set_config('amarh.scenario_base', %s, true), "
         "set_config('amarh.now', %s, true), "
-        "set_config('statement_timeout', %s, true), set_config('lock_timeout', %s, true)",
+        "set_config('statement_timeout', %s, true), set_config('lock_timeout', %s, true), "
+        "set_config('amarh.on_behalf_of', %s, true)",
         [principal.role, principal.user, principal.region or "", ",".join(principal.approves), *scn_vals,
-         f"{int(statement_timeout_ms)}ms", f"{int(lock_timeout_ms)}ms"])
+         f"{int(statement_timeout_ms)}ms", f"{int(lock_timeout_ms)}ms",
+         (principal.on_behalf_of or "") if str(principal.user).startswith("agent:") else ""])
     try:
         yield conn
     finally:
@@ -105,7 +110,8 @@ def scoped(conn: psycopg.Connection, principal, scenario: ScenarioCtx | None = N
                 "set_config('amarh.region', '', true), set_config('amarh.approves', '', true), "
                 "set_config('amarh.scenario', '', true), set_config('amarh.scenario_base', '', true), "
                 "set_config('amarh.now', '', true), "
-                "set_config('statement_timeout', '0', true), set_config('lock_timeout', '0', true)")
+                "set_config('statement_timeout', '0', true), set_config('lock_timeout', '0', true), "
+                "set_config('amarh.on_behalf_of', '', true)")
 
 
 def current_scenario(conn: psycopg.Connection) -> int:
@@ -116,9 +122,10 @@ def current_scenario(conn: psycopg.Connection) -> int:
 
 def current_principal(conn: psycopg.Connection) -> Principal | None:
     """The identity currently set on the connection (None when no role is set). For tests."""
-    role, user, region, appr = conn.execute(
+    role, user, region, appr, behalf = conn.execute(
         "SELECT current_setting('amarh.role', true), current_setting('amarh.user', true), "
-        "current_setting('amarh.region', true), current_setting('amarh.approves', true)").fetchone()
+        "current_setting('amarh.region', true), current_setting('amarh.approves', true), "
+        "current_setting('amarh.on_behalf_of', true)").fetchone()
     if not role:
         return None
-    return Principal(role, user or "", region or "", tuple(a for a in (appr or "").split(",") if a))
+    return Principal(role, user or "", region or "", tuple(a for a in (appr or "").split(",") if a), behalf or "")

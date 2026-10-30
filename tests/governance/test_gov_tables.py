@@ -51,8 +51,9 @@ def test_append_only(conn, who):
 
 @pytest.mark.parametrize("t", TABLES)
 def test_all_tables_have_triggers(conn, t):
-    n = conn.execute("SELECT count(*) FROM pg_trigger WHERE tgrelid = %s::regclass AND NOT tgisinternal", [t]).fetchone()[0]
-    assert n == 2
+    n = conn.execute("SELECT count(*) FROM pg_trigger WHERE tgrelid = %s::regclass AND NOT tgisinternal "
+                     "AND tgname IN ('amarh_no_update', 'amarh_no_truncate')", [t]).fetchone()[0]
+    assert n == 2   # (the outbox tables carry one more trigger: amarh_no_scn, see the review-fix tests)
     assert conn.execute("SELECT relforcerowsecurity FROM pg_class WHERE oid=%s::regclass", [t]).fetchone()[0]
 
 

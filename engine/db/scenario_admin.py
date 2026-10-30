@@ -16,15 +16,15 @@ from .principal import ScenarioCtx
 
 def create_base(conn, *, name: str, owner_user: str, owner_role: str, shared_roles=(), parent_id: int | None = None,
                 run_id: str | None = None, expires_at: datetime | None = None,
-                base_sim_time: datetime | None = None, clock: datetime | None = None) -> dict:
+                base_sim_time: datetime | None = None, clock: datetime | None = None, kind: str = "user") -> dict:
     """Insert the `scenario` row (base_recorded = now, wall clock), its `scenario_state` row and the
     'created' event in the caller's transaction. Returns the scenario row as a dict (id, base_recorded,
     clock, ...). The fork is a snapshot: main rows recorded after `base_recorded` are invisible to it."""
     row = conn.execute(
         "INSERT INTO scenario (name, owner_user, owner_role, parent_id, base_recorded, base_sim_time, "
-        "shared_roles, run_id, expires_at) VALUES (%s,%s,%s,%s,clock_timestamp(),%s,%s,%s,%s) "
+        "shared_roles, run_id, expires_at, kind) VALUES (%s,%s,%s,%s,clock_timestamp(),%s,%s,%s,%s,%s) "
         "RETURNING id, base_recorded, created_at", [name, owner_user, owner_role, parent_id, base_sim_time,
-                                                    list(shared_roles), run_id, expires_at]).fetchone()
+                                                    list(shared_roles), run_id, expires_at, kind]).fetchone()
     sid = row[0]
     conn.execute("INSERT INTO scenario_state (scenario_id, clock) VALUES (%s,%s)", [sid, clock])
     conn.execute("INSERT INTO scenario_event (scenario_id, kind, actor, payload) VALUES (%s,'created',%s,%s)",

@@ -1,4 +1,5 @@
 import uuid
+from pathlib import Path
 from datetime import UTC, datetime, timedelta
 
 from psycopg import sql
@@ -7,6 +8,7 @@ from engine.actions import make_principal
 from engine.db import bitemporal as bt
 
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
+ROOT_YAML = Path(__file__).resolve().parents[2] / "ontology" / "supply_chain.yaml"
 
 PLANNER = make_principal("planner", "pat")
 PLANNER2 = make_principal("planner", "paul")

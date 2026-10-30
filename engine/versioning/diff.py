@@ -6,10 +6,33 @@ import yaml
 from engine.compiler.model import OntologyError, parse_ontology
 
 KINDS = ("objectTypes", "properties", "linkTypes", "actions", "roles", "functions", "webhooks")
+MAX_YAML_CHARS = 200_000
+MAX_YAML_EVENTS = 100_000   # parser events (~ nodes): rejects absurdly large documents before building them
+MAX_YAML_ALIASES = 10       # anchors/aliases beyond this are refused (alias expansion bombs)
+
+
+def _check_yaml_bounds(yaml_text: str) -> None:
+    if not isinstance(yaml_text, str):
+        raise OntologyError("ontology YAML must be text")
+    if len(yaml_text) > MAX_YAML_CHARS:
+        raise OntologyError(f"ontology YAML too large (max {MAX_YAML_CHARS} characters)")
+    events = aliases = 0
+    try:
+        for ev in yaml.parse(yaml_text, Loader=yaml.SafeLoader):
+            events += 1
+            if isinstance(ev, yaml.AliasEvent):
+                aliases += 1
+            if events > MAX_YAML_EVENTS:
+                raise OntologyError("ontology YAML has too many nodes")
+            if aliases > MAX_YAML_ALIASES:
+                raise OntologyError(f"ontology YAML uses too many aliases (max {MAX_YAML_ALIASES})")
+    except yaml.YAMLError as e:
+        raise OntologyError(f"YAML parse error: {e}") from e
 
 
 def parse(yaml_text: str):
     """Parse + validate with the compiler model. Raises OntologyError with a clear message."""
+    _check_yaml_bounds(yaml_text)
     try:
         raw = yaml.safe_load(yaml_text)
     except yaml.YAMLError as e:
@@ -135,14 +158,59 @@ def _breaking_change(kind: str, name: str, o: dict, n: dict) -> list[str]:
     return b
 
 
+def _sensitive_change(kind: str, name: str, o: dict, n: dict, old: dict) -> list[str]:
+    """Changes of EXISTING roles/actions that WIDEN what somebody may see or do (review L5): they are additive
+    (not `breaking`) but need a human's explicit comment on approval."""
+    out: list[str] = []
+    if kind == "roles":
+        # roles declared `all` expand to the new types/links/actions of the same diff: only entries that existed
+        # BEFORE are a widening of what the role could already reach
+        for t, nx in n["types"].items():
+            ox = o["types"].get(t)
+            if ox is None:
+                if t in old["objectTypes"]:
+                    out.append(f"role {name}: gains access to existing type {t}")
+                continue
+            for k in ("read", "write"):
+                if nx[k] and not ox[k]:
+                    out.append(f"role {name}: {k} on {t} granted")
+            if ox["where"] != nx["where"]:
+                out.append(f"role {name}: row filter on {t} changed")
+            for m in sorted(set(ox["mask"]) - set(nx["mask"])):
+                out.append(f"role {name}: property {t}.{m} no longer masked")
+        for key, known in (("links", old["linkTypes"]), ("actions", old["actions"]), ("approves", old["actions"])):
+            for x in sorted((set(n[key]) - set(o[key])) & set(known)):
+                out.append(f"role {name}: {key} entry {x!r} added")
+        for key in ("all_actions", "all_approves"):
+            if n[key] and not o[key]:
+                out.append(f"role {name}: {key} granted")
+        if o["region"] != n["region"]:
+            out.append(f"role {name}: region changed {o['region']!r} -> {n['region']!r}")
+        if n["agent"] and not o["agent"]:
+            out.append(f"role {name}: agent enabled")
+        elif n["agent"] and o["agent"]:
+            for key in ("allowlist", "tools"):
+                for x in sorted(set(n["agent"][key]) - set(o["agent"][key])):
+                    out.append(f"role {name}: agent {key} entry {x!r} added")
+    elif kind == "actions":
+        for r in sorted(set(n["roles"]) - set(o["roles"])):
+            out.append(f"action {name}: role {r!r} may now execute it")
+        for a in sorted(set(n["approvers"]) - set(o["approvers"])):
+            out.append(f"action {name}: approver {a!r} added")
+        if o["approval_required"] and not n["approval_required"]:
+            out.append(f"action {name}: approval no longer required")
+    return out
+
+
 def diff(old_yaml: str, new_yaml: str) -> dict:
-    """{added:{kind:[names]}, removed:{kind:[names]}, changed:{kind:{name:{field:[old,new]}}}, breaking:[str]}.
+    """{added:{kind:[names]}, removed:{kind:[names]}, changed:{kind:{name:{field:[old,new]}}}, breaking:[str],
+    sensitive:[str]} (`sensitive` = permission widening of existing roles / actions).
 
     Raises OntologyError when either document is invalid. Kinds: objectTypes, properties (Type.prop),
     linkTypes, actions, roles, functions, webhooks.
     """
     o, n = _norm(parse(old_yaml)), _norm(parse(new_yaml))
-    res = {"added": {}, "removed": {}, "changed": {}, "breaking": []}
+    res = {"added": {}, "removed": {}, "changed": {}, "breaking": [], "sensitive": []}
     for kind in KINDS:
         ok, nk = o[kind], n[kind]
         add, rem = sorted(set(nk) - set(ok)), sorted(set(ok) - set(nk))
@@ -156,6 +224,7 @@ def diff(old_yaml: str, new_yaml: str) -> dict:
                 fields = {f: [ok[name].get(f), nk[name].get(f)] for f in nk[name] if ok[name].get(f) != nk[name].get(f)}
                 res["changed"].setdefault(kind, {})[name] = fields
                 res["breaking"] += _breaking_change(kind, name, ok[name], nk[name])
+                res["sensitive"] += _sensitive_change(kind, name, ok[name], nk[name], o)
     return res
 
 

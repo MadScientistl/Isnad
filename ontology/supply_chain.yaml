@@ -212,6 +212,7 @@ actions:
     bind: {su: {type: Supplier, id: $supplier}}
     criteria:
       - {expr: "$price_index > 0", message: "Price index must be positive"}
+      - {expr: "$price_index < 1000", message: "Price index must be below 1000"}
     rules:
       - modify: {type: Supplier, id: $supplier, set: {price_index: $price_index}}
   issue_invoice:

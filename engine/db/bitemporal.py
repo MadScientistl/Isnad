@@ -16,6 +16,7 @@ history, list_objects, as_of queries, neighbours, link_history, bulk_load_*.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from datetime import UTC, datetime
@@ -245,18 +246,34 @@ def _scn_where(conn, kind: str, name: str, sid: int, as_of_valid, as_of_recorded
 
 
 def _is_first_touch(conn, kind, type_name, keyvals, sid) -> bool:
-    """True when `sid` has no override row for this key yet (so the write must clone main's rows). Enforces the
-    AMARH_SCN_MAX_ROWS cap before any row is written."""
+    """True when `sid` has no override row for this key yet (so the write must clone main's rows)."""
     kb = keyvals[1] if len(keyvals) > 1 else ZERO_UUID
     if conn.execute("SELECT 1 FROM scenario_override WHERE scenario_id = %s AND kind = %s AND type = %s "
                     "AND key_a = %s AND key_b = %s", [sid, kind, type_name, keyvals[0], kb]).fetchone():
         return False
+    return True
+
+
+def _guard_rows(conn, sid: int, add: int) -> None:
+    """AMARH_SCN_MAX_ROWS counts the scenario's actual ROW VERSIONS (cloned + inserted), not keys; checked on
+    every write (before any row is written for the part we can predict, and again after a clone)."""
     st = conn.execute("SELECT override_rows FROM scenario_state WHERE scenario_id = %s FOR UPDATE", [sid]).fetchone()
     if st is None:
         raise ValueError(f"scenario {sid} not found")
-    if st[0] >= _max_rows():
-        raise ScenarioLimit(f"scenario {sid} reached {_max_rows()} override rows (AMARH_SCN_MAX_ROWS)")
-    return True
+    if st[0] + add > _max_rows():
+        raise ScenarioLimit(f"scenario {sid} reached {_max_rows()} rows (AMARH_SCN_MAX_ROWS)")
+
+
+def _bump_rows(conn, sid: int, n: int) -> None:
+    if n:
+        conn.execute("UPDATE scenario_state SET override_rows = override_rows + %s WHERE scenario_id = %s", [n, sid])
+        if conn.execute("SELECT override_rows > %s FROM scenario_state WHERE scenario_id = %s",
+                        [_max_rows(), sid]).fetchone()[0]:
+            raise ScenarioLimit(f"scenario {sid} reached {_max_rows()} rows (AMARH_SCN_MAX_ROWS)")
+
+
+def _max_props_bytes() -> int:
+    return int(os.environ.get("AMARH_MAX_PROPS_BYTES", "65536"))
 
 
 def _clone_from_main(conn, table, kind, type_name, keycols, keyvals, sid, now, skip_lowers) -> None:
@@ -284,17 +301,17 @@ def _clone_from_main(conn, table, kind, type_name, keycols, keyvals, sid, now, s
     sel = sql.SQL(", ").join(
         sql.SQL("tstzrange(%s, NULL, '[)')") if c == "recorded_during"
         else sql.SQL("%s") if c == "scenario_id" else _tbl(c) for c in cols)
-    conn.execute(
+    cloned = conn.execute(
         sql.SQL("INSERT INTO {t} ({c}) SELECT {s} FROM {t} WHERE {kw} AND scenario_id = 0 "
                 "AND recorded_during @> %s::timestamptz AND NOT EXISTS ("
                 "SELECT 1 FROM unnest(%s::timestamptz[]) u WHERE u IS NOT DISTINCT FROM lower(valid_during))").format(
             t=_tbl(table), c=sql.SQL(", ").join(_tbl(c) for c in cols), s=sel, kw=keyw),
-        [now, sid, *keyvals, base, list(skip_lowers)])
+        [now, sid, *keyvals, base, list(skip_lowers)]).rowcount
     info = {"present": props is not None, "props": props[0] if props else None,
             "main_lower": main_lower[0].isoformat() if main_lower else None}
     conn.execute("INSERT INTO scenario_override (scenario_id, kind, type, key_a, key_b, deleted, base) "
                  "VALUES (%s,%s,%s,%s,%s,false,%s)", [sid, kind, type_name, keyvals[0], kb, Jsonb(info)])
-    conn.execute("UPDATE scenario_state SET override_rows = override_rows + 1 WHERE scenario_id = %s", [sid])
+    _bump_rows(conn, sid, max(cloned, 0))  # cloned versions count against AMARH_SCN_MAX_ROWS
 
 
 def _after_scenario_write(conn, table, kind, type_name, keycols, keyvals, sid) -> None:
@@ -338,6 +355,12 @@ def _apply(
     pcols = _prop_cols(conn, table, keycols)
     geo = set(_table_cols(conn, table)[1])
     if props is not None:
+        try:
+            size = len(json.dumps(props, default=str))
+        except (TypeError, ValueError):
+            size = 0
+        if size > _max_props_bytes():
+            raise ValueError(f"properties too large ({size} bytes; max {_max_props_bytes()}, AMARH_MAX_PROPS_BYTES)")
         unknown = set(props) - set(pcols)
         if unknown:
             raise ValueError(f"unknown properties for {table}: {sorted(unknown)}")
@@ -353,8 +376,11 @@ def _apply_tx(conn, table, keycols, keyvals, newp, pcols, geo, vf, vt, changed_b
               scenario_id, kind, type_name, outbox_extra) -> bool:
     with conn.transaction():
         _lock(conn, table, keyvals, scenario_id)
-        now = _now(conn)
+        now, g = conn.execute("SELECT clock_timestamp(), coalesce(current_setting('amarh.scenario', true), '')").fetchone()
         first = False  # first touch of this key in a scenario: the logic runs on main's rows as of the fork
+        g = g.strip()
+        if g not in ("", "0") and g != str(scenario_id):  # M2: a connection scoped to scenario X never writes Y / main
+            raise ValueError(f"write to scenario {scenario_id or 'main'} refused: the connection is scoped to scenario {g}")
         if scenario_id:
             _scn_ctx(conn, scenario_id)  # refuses a scoped session whose scenario differs
             first = _is_first_touch(conn, kind, type_name, keyvals, scenario_id)
@@ -412,6 +438,8 @@ def _apply_tx(conn, table, keycols, keyvals, newp, pcols, geo, vf, vt, changed_b
         if not to_close and not to_insert:
             return False  # (a no-op on a first touch writes nothing: no clone, no override row)
 
+        if scenario_id:
+            _guard_rows(conn, scenario_id, len(to_insert))
         if first:  # the replaced versions are main's rows: they are simply not cloned
             _clone_from_main(conn, table, kind, type_name, keycols, keyvals, scenario_id, now,
                              [lo for lo, _hi, _p in to_close])
@@ -442,6 +470,7 @@ def _apply_tx(conn, table, keycols, keyvals, newp, pcols, geo, vf, vt, changed_b
             conn.execute(ins, [*keyvals, *p, Range(lo, hi, "[)"), Range(now, None, "[)"),
                                cb, aid, scenario_id])
         if scenario_id:  # scenario writes never reach the graph outbox
+            _bump_rows(conn, scenario_id, len(to_insert))
             _after_scenario_write(conn, table, kind, type_name, keycols, keyvals, scenario_id)
             return True
         op = "upsert" if newp is not None else "delete"

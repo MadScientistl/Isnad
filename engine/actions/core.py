@@ -186,6 +186,15 @@ def make_principal(role: str, user: str, ontology=None) -> Principal:
     return Principal(role, user, r.region or "", tuple(r.approves))
 
 
+def make_agent_principal(launcher: Principal) -> Principal:
+    """Runtime-agent identity of `launcher` (Phase 5 review H1): user 'agent:<role>', same role / region /
+    approvals, `on_behalf_of` = the launcher's user. The database lets this identity own and write the
+    launcher's scenarios (never admin powers); audit rows get actor 'agent:<role>' and on_behalf_of = launcher."""
+    if str(launcher.user).startswith("agent:"):
+        return launcher
+    return Principal(launcher.role, f"agent:{launcher.role}", launcher.region, launcher.approves, launcher.user)
+
+
 def _coerce(name: str, typ: str, v: Any) -> Any:
     try:
         if typ == "string":
@@ -271,6 +280,8 @@ class _P:
         self.role, self.user = self.p.role, self.p.user
         if not self.user:
             raise ValueError("principal.user is required")
+        # the human an agent identity acts for (audit on_behalf_of default); '' for everybody else
+        self.on_behalf_of = (getattr(self.p, "on_behalf_of", "") or "") if str(self.user).startswith("agent:") else ""
 
 
 # ------------------------------------------------------------------- context
@@ -421,6 +432,7 @@ def _props_arg(v):
 
 def _create_object(c, p):
     id_ = p.get("id") or uuid4()
+    p["id"] = id_  # persisted in the audit params so a scenario merge replays the SAME id (review M5)
     if c.get(p["type"], id_) is not None:
         raise ValueError(f"{p['type']} already exists")
     c.put(p["type"], id_, _props_arg(p["props"]))
@@ -495,6 +507,7 @@ def _close_port(c, p):
     if p.get("duration_h") is not None:
         note = f"{note} (expected duration {p['duration_h']:g} h)".strip()
     ev = p.get("event_id") or uuid4()
+    p["event_id"] = ev
     c.put("Event", ev, {"kind": "port_closure", "severity": "high", "started": c.vt,
                         "ended": None, "note": note or None})
     c.link("affects", ev, port)
@@ -513,6 +526,7 @@ def _issue_invoice(c, p):
     c.need("Shipment", p["shipment"])
     c.need("Supplier", p["supplier"])
     inv = p.get("invoice_id") or uuid4()
+    p["invoice_id"] = inv
     props = {"ref": p.get("ref") or f"INV-{str(inv)[:8].upper()}", "amount": p["amount"],
              "currency": p.get("currency") or "USD", "status": "open", "due": p.get("due"),
              "anomaly": None}
@@ -634,16 +648,17 @@ def _pipeline(conn, model, a, raw_params, pr: _P, valid_at, aid, *, gate: bool, 
 
 
 def _persist(conn, model, a, pr: _P, c: _Ctx, clean, valid_at, aid, *, source, run_id, proposal_id,
-             tool_trace, on_behalf_of, name=None, parent=None, params=None) -> tuple[int, list, list]:
+             tool_trace, on_behalf_of, name=None, parent=None, params=None,
+             origin_action_id=None) -> tuple[int, list, list]:
     diff = c.diff()
     sid = c.sid
     seq = conn.execute(
         "INSERT INTO audit_event (action_id, name, actor, source, run_id, params, sim_time, before, after, "
-        "role, on_behalf_of, proposal_id, status, tool_trace, parent_execution_id, scenario_id) "
-        "VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s::jsonb,%s,%s,%s,'executed',%s::jsonb,%s,%s) RETURNING seq",
+        "role, on_behalf_of, proposal_id, status, tool_trace, parent_execution_id, scenario_id, origin_action_id) "
+        "VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s::jsonb,%s,%s,%s,'executed',%s::jsonb,%s,%s,%s) RETURNING seq",
         [aid, name or a.name, pr.user, source, run_id, _jdump(params if params is not None else clean),
          valid_at, json.dumps(c.before), json.dumps(c.after), pr.role, on_behalf_of, proposal_id,
-         None if tool_trace is None else _jdump(tool_trace), parent, sid],
+         None if tool_trace is None else _jdump(tool_trace), parent, sid, origin_action_id],
     ).fetchone()[0]
     if diff:
         conn.cursor().executemany(
@@ -674,12 +689,13 @@ def _persist(conn, model, a, pr: _P, c: _Ctx, clean, valid_at, aid, *, source, r
 
 
 def _do_execute(conn, model, a, raw_params, pr: _P, valid_at, aid, *, source, run_id, proposal_id,
-                tool_trace, on_behalf_of, gate=True, sid: int = 0) -> ActionResult:
+                tool_trace, on_behalf_of, gate=True, sid: int = 0, origin_action_id=None) -> ActionResult:
     """Everything inside the (already open) scoped transaction. Inside a scenario there is no approval gate
     (sandbox: the approval gate protects main; merging re-applies the gate)."""
     c, clean = _pipeline(conn, model, a, raw_params, pr, valid_at, aid, gate=gate and not sid, sid=sid)
     seq, diff, hooks = _persist(conn, model, a, pr, c, clean, valid_at, aid, source=source, run_id=run_id,
-                                proposal_id=proposal_id, tool_trace=tool_trace, on_behalf_of=on_behalf_of)
+                                proposal_id=proposal_id, tool_trace=tool_trace, on_behalf_of=on_behalf_of,
+                                origin_action_id=origin_action_id)
     return ActionResult(aid, c.changed, a.name, c.before, c.after, seq, c.created, "executed", diff, hooks,
                         proposal_id)
 
@@ -702,17 +718,27 @@ def _audit_denied(conn, model, pr: _P, name, params, valid_at, source, run_id, p
     try:
         sctx = _scn_ctx(conn, sid) if sid else None
         with conn.transaction():
-            with scoped(conn, OWNER if pr.owner else pr.p, sctx):
+            if sid:
+                # review L6: the caller (e.g. a read-only shared viewer) cannot insert into the scenario under its own
+                # identity, so the denial is written through the loader path with the scenario id set -- but only if
+                # the scenario is open and visible to the caller (never an audit row in a scenario they cannot see)
+                with scoped(conn, OWNER if pr.owner else pr.p, sctx):
+                    if not conn.execute("SELECT amarh_scenario_visible(%s)", [sid]).fetchone()[0]:
+                        raise ScenarioNotFound(f"scenario {sid} not found")
+                ident = OWNER
+            else:
+                ident = OWNER if pr.owner else pr.p
+            with scoped(conn, ident, sctx):
                 conn.execute(
                     "INSERT INTO audit_event (action_id, name, actor, source, run_id, params, sim_time, before, "
-                    "after, role, proposal_id, status, tool_trace, scenario_id) VALUES (%s,%s,%s,%s,%s,%s::jsonb,"
-                    "%s,NULL,%s::jsonb,%s,%s,'denied',%s::jsonb,%s)",
+                    "after, role, proposal_id, status, tool_trace, scenario_id, on_behalf_of) VALUES (%s,%s,%s,%s,%s,"
+                    "%s::jsonb,%s,NULL,%s::jsonb,%s,%s,'denied',%s::jsonb,%s,%s)",
                     [uuid4(), name, pr.user, source, run_id, _jdump(params), valid_at,
                      _jdump({"error": error, "failures": failures or []}), pr.role, proposal_id,
-                     None if tool_trace is None else _jdump(tool_trace), sid])
+                     None if tool_trace is None else _jdump(tool_trace), sid, pr.on_behalf_of or None])
         conn.commit()
     except (psycopg.Error, ScenarioNotFound) as e:
-        # e.g. the caller may not write that scenario (RLS) or it vanished: the denial is not auditable there
+        # the scenario vanished or is not visible to the caller: the denial is not auditable there
         log.warning("denial in scenario %s could not be audited: %s", sid, str(e).splitlines()[0])
         _safe_rollback(conn)
 
@@ -766,6 +792,7 @@ def execute(conn, name: str, params: dict, principal, *, valid_at: datetime, sou
     pr = _P(principal)
     aid = uuid4()
     sid = _sid(scenario_id)
+    on_behalf_of = on_behalf_of or pr.on_behalf_of or None
 
     def go():
         sctx = _scn_ctx(conn, sid)
@@ -835,6 +862,7 @@ def propose(conn, name: str, params: dict, principal, rationale: str | None = No
     pr = _P(principal)
     pid = uuid4()
     sid = _sid(scenario_id)
+    on_behalf_of = on_behalf_of or pr.on_behalf_of or None
 
     def go():
         sctx = _scn_ctx(conn, sid)
@@ -859,7 +887,8 @@ def _preview_run(conn, model, a, params, pr, valid_at, sid, with_kpis=None):
 
 
 def _propose_open(conn, model, a, params, principal, pr, sctx, sid, pid, name, rationale, valid_at, run_id,
-                  tool_trace, on_behalf_of, evidence, idempotency_key, ttl_h):
+                  tool_trace, on_behalf_of, evidence, idempotency_key, ttl_h, *, proposer=None,
+                  proposer_role=None, origin_action_id=None):
     """Body of `propose` inside the open transaction (shared with the scenario merge, which must not commit)."""
     from engine import kpis
     base_diff = None
@@ -882,6 +911,10 @@ def _propose_open(conn, model, a, params, principal, pr, sctx, sid, pid, name, r
                                                  with_kpis=lambda: kpis.compute(conn, principal, sid, valid_at))
             preview["scenario_id"] = sid
             preview["impact"] = _impact(before, after)
+            # review M6: the evidence the approver is shown; approval of a proposal whose evidence scenario kept
+            # changing afterwards is refused as stale (the approver must re-propose)
+            dv = conn.execute("SELECT data_version FROM scenario_state WHERE scenario_id = %s", [sid]).fetchone()
+            preview["scenario_data_version"] = int(dv[0]) if dv else 0
             if not preview["diff"] and main_preview is not None:  # already applied inside the scenario
                 preview["scenario_diff"], preview["diff"] = preview["diff"], main_preview["diff"]
     with scoped(conn, principal, sctx):
@@ -892,14 +925,15 @@ def _propose_open(conn, model, a, params, principal, pr, sctx, sid, pid, name, r
         ttl = PROPOSAL_TTL_H if ttl_h is None else ttl_h
         conn.execute(
             "INSERT INTO proposal (id, action, params, proposer, proposer_role, rationale, dry_run, "
-            "run_id, tool_trace, on_behalf_of, idempotency_key, evidence, base_versions, expires_at, scenario_id) "
+            "run_id, tool_trace, on_behalf_of, idempotency_key, evidence, base_versions, expires_at, scenario_id, "
+            "origin_action_id) "
             "VALUES (%s,%s,%s::jsonb,%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s,%s,%s::jsonb,%s::jsonb,"
-            "clock_timestamp() + make_interval(secs => %s),%s)",
-            [pid, name, _jdump(clean), pr.user, pr.role, rationale, _jdump(preview), run_id,
+            "clock_timestamp() + make_interval(secs => %s),%s,%s)",
+            [pid, name, _jdump(clean), proposer or pr.user, proposer_role or pr.role, rationale, _jdump(preview), run_id,
              None if tool_trace is None else _jdump(tool_trace), on_behalf_of, idempotency_key,
              None if evidence is None else _jdump(evidence),
              _jdump(_base_versions(base_diff if base_diff is not None else [])),
-             ttl * 3600, sid])
+             ttl * 3600, sid, origin_action_id])
         if sid:
             conn.execute("INSERT INTO scenario_event (scenario_id, kind, actor, payload) VALUES (%s,'proposal',%s,%s::jsonb)",
                          [sid, pr.user, _jdump({"proposal_id": str(pid), "action": name})])
@@ -941,6 +975,12 @@ def decide(conn, proposal_id: UUID, principal, approve: bool, comment: str | Non
                                            "their own proposal")
                 if approve and expired:
                     raise ProposalExpired(f"proposal {proposal_id} has expired")
+                if approve:  # review M6: the evidence scenario changed after the proposal was made
+                    ev_sid = conn.execute("SELECT scenario_id FROM proposal WHERE id=%s", [proposal_id]).fetchone()[0]
+                    seen = (dry or {}).get("scenario_data_version") if isinstance(dry, dict) else None
+                    if ev_sid and seen is not None and conn.execute(
+                            "SELECT amarh_scenario_changed(%s, %s)", [ev_sid, seen]).fetchone()[0]:
+                        raise StaleProposal(["scenario"])
                 aid = uuid4()
                 res = None
                 if approve:

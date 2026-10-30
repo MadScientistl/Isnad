@@ -14,6 +14,13 @@ CREATE TABLE IF NOT EXISTS ontology_version (
 -- not UNIQUE: a rollback legitimately re-registers an older definition (see engine/versioning docstring)
 CREATE INDEX IF NOT EXISTS ontology_version_hash_idx ON ontology_version (hash);
 
+-- review L5: a version row has ONE approved child (concurrent approvals against the same latest version cannot
+-- both win). parent_id = id of the latest version at approval time (a rollback may re-register an older hash,
+-- so the hash alone cannot be unique).
+ALTER TABLE ontology_version ADD COLUMN IF NOT EXISTS parent_id int;
+CREATE UNIQUE INDEX IF NOT EXISTS ontology_version_parent_proposal_idx ON ontology_version (parent_id)
+    WHERE source = 'proposal' AND parent_id IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS ontology_change_proposal (
     id uuid PRIMARY KEY,
     base_hash text NOT NULL,

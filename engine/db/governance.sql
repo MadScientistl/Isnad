@@ -37,6 +37,16 @@ CREATE OR REPLACE FUNCTION amarh_scn_base() RETURNS timestamptz LANGUAGE sql STA
 CREATE OR REPLACE FUNCTION amarh_now() RETURNS timestamptz LANGUAGE sql STABLE AS $fn$
   SELECT coalesce(nullif(current_setting('amarh.now', true), '')::timestamptz, now()) $fn$;
 
+-- main-only tables (graph_outbox, webhook_outbox/delivery): inserts are refused while a scenario is active
+CREATE OR REPLACE FUNCTION amarh_no_scenario_write() RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+  IF coalesce(nullif(current_setting('amarh.scenario', true), ''), '0') <> '0' THEN
+    RAISE EXCEPTION '% is main-only: no writes while a scenario is active', TG_TABLE_NAME
+      USING ERRCODE = 'integrity_constraint_violation';
+  END IF;
+  RETURN NEW;
+END $fn$;
+
 -- scenario tables (scenario, scenario_event: append-only; scenario_state, scenario_override: engine-mutable)
 CREATE TABLE IF NOT EXISTS scenario (
     id serial PRIMARY KEY CHECK (id > 0),
@@ -51,6 +61,8 @@ CREATE TABLE IF NOT EXISTS scenario (
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     expires_at timestamptz NULL
 );
+-- 'user' | 'agent' (opened by a runtime-agent run: counted in a separate quota)
+ALTER TABLE scenario ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'user';
 CREATE INDEX IF NOT EXISTS scenario_owner_idx ON scenario (owner_user);
 CREATE TABLE IF NOT EXISTS scenario_event (
     seq bigserial PRIMARY KEY,
@@ -82,25 +94,36 @@ CREATE INDEX IF NOT EXISTS scenario_override_scn_idx ON scenario_override (scena
 -- access / visibility / writability. SECURITY DEFINER (they read scenario tables whatever the caller may see).
 -- `current_setting('role') = 'none'` is the loader/owner connection (never SET ROLE amarh_app): owner code is
 -- not subject to RLS anyway. A scoped request has role = amarh_app and needs an identified amarh.role.
+-- Phase 5 review (H1): a runtime-agent identity (amarh.user = 'agent:<role>') owns the scenarios of the human it
+-- acts for (amarh.on_behalf_of, set only by principal.scoped()); it never gets the admin shortcut.
+CREATE OR REPLACE FUNCTION amarh_is_agent() RETURNS boolean LANGUAGE sql STABLE AS $fn$
+  SELECT coalesce(current_setting('amarh.user', true), '') LIKE 'agent:%' $fn$;
+CREATE OR REPLACE FUNCTION amarh_owner_match(p_owner text) RETURNS boolean LANGUAGE sql STABLE AS $fn$
+  SELECT p_owner = current_setting('amarh.user', true)
+      OR (amarh_is_agent() AND coalesce(current_setting('amarh.on_behalf_of', true), '') <> ''
+          AND p_owner = current_setting('amarh.on_behalf_of', true)) $fn$;
 CREATE OR REPLACE FUNCTION amarh_scenario_access(p_id int) RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER AS $fn$
 SELECT p_id = 0 OR current_setting('role') = 'none' OR (
   coalesce(current_setting('amarh.role', true), '') <> '' AND EXISTS (
     SELECT 1 FROM scenario s WHERE s.id = p_id AND (
-         current_setting('amarh.role', true) = 'admin'
-      OR s.owner_user = current_setting('amarh.user', true)
+         (current_setting('amarh.role', true) = 'admin' AND NOT amarh_is_agent())
+      OR amarh_owner_match(s.owner_user)
       OR current_setting('amarh.role', true) = ANY (s.shared_roles)))) $fn$;
+-- visible = access AND open (no terminal event) AND not past its expiry (an expired scenario is closed for data
+-- access even before the janitor has marked it; its governance history stays readable through _access)
 CREATE OR REPLACE FUNCTION amarh_scenario_visible(p_id int) RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER AS $fn$
 SELECT p_id = 0 OR (amarh_scenario_access(p_id) AND NOT EXISTS (
-    SELECT 1 FROM scenario_event e WHERE e.scenario_id = p_id AND e.kind IN ('merged','discarded','expired'))) $fn$;
+    SELECT 1 FROM scenario_event e WHERE e.scenario_id = p_id AND e.kind IN ('merged','discarded','expired'))
+    AND EXISTS (SELECT 1 FROM scenario s WHERE s.id = p_id AND (s.expires_at IS NULL OR s.expires_at > now()))) $fn$;
 CREATE OR REPLACE FUNCTION amarh_scenario_owns(p_id int) RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER AS $fn$
 SELECT p_id = 0 OR current_setting('role') = 'none' OR (
   coalesce(current_setting('amarh.role', true), '') <> '' AND EXISTS (
     SELECT 1 FROM scenario s WHERE s.id = p_id AND (
-         current_setting('amarh.role', true) = 'admin'
-      OR s.owner_user = current_setting('amarh.user', true)))) $fn$;
+         (current_setting('amarh.role', true) = 'admin' AND NOT amarh_is_agent())
+      OR amarh_owner_match(s.owner_user)))) $fn$;
 CREATE OR REPLACE FUNCTION amarh_scenario_writable(p_id int) RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER AS $fn$
 SELECT p_id = 0 OR (amarh_scenario_owns(p_id) AND amarh_scenario_visible(p_id)) $fn$;
@@ -118,7 +141,7 @@ DO $do$ DECLARE f text; BEGIN
     EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', f);
     EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO amarh_app', f);
   END LOOP;
-  FOREACH f IN ARRAY ARRAY['amarh_scn()','amarh_scn_base()','amarh_now()'] LOOP
+  FOREACH f IN ARRAY ARRAY['amarh_scn()','amarh_scn_base()','amarh_now()','amarh_is_agent()','amarh_owner_match(text)'] LOOP
     EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO amarh_app', f);
   END LOOP;
 END $do$;
@@ -133,11 +156,12 @@ BEGIN
   IF scn = 0 THEN
     RETURN p_sid = 0 AND (upper_inf(p_rec) OR upper(p_rec) = 'infinity') AND p_valid @> now();
   END IF;
-  IF NOT amarh_scenario_visible(scn) THEN RETURN false; END IF;
+  IF NOT coalesce(amarh_scenario_visible(scn), false) THEN RETURN false; END IF;
   nw := amarh_now();
-  IF NOT (p_valid @> nw) THEN RETURN false; END IF;
+  -- fail closed: a NULL/empty fork base or clock must never make a superseded version appear
+  IF NOT coalesce(p_valid @> nw, false) THEN RETURN false; END IF;
   IF p_sid = scn THEN RETURN upper_inf(p_rec) OR upper(p_rec) = 'infinity'; END IF;
-  IF p_sid <> 0 OR NOT (p_rec @> amarh_scn_base()) THEN RETURN false; END IF;
+  IF p_sid <> 0 OR NOT coalesce(p_rec @> amarh_scn_base(), false) THEN RETURN false; END IF;
   RETURN NOT EXISTS (SELECT 1 FROM scenario_override o WHERE o.scenario_id = scn AND o.kind = p_kind
                      AND o.type = p_type AND o.key_a = p_a AND (p_kind = 'obj' OR o.key_b = p_b));
 END $fn$;
@@ -176,7 +200,7 @@ END $$;
 CREATE POLICY sel ON scenario FOR SELECT TO amarh_app USING (amarh_scenario_access(id));
 CREATE POLICY ins ON scenario FOR INSERT TO amarh_app WITH CHECK (
     coalesce(current_setting('amarh.role', true), '') <> ''
-    AND owner_user = current_setting('amarh.user', true) AND owner_role = current_setting('amarh.role', true));
+    AND amarh_owner_match(owner_user) AND owner_role = current_setting('amarh.role', true));
 CREATE POLICY sel ON scenario_event FOR SELECT TO amarh_app USING (amarh_scenario_access(scenario_id));
 CREATE POLICY ins ON scenario_event FOR INSERT TO amarh_app WITH CHECK (
     coalesce(current_setting('amarh.role', true), '') <> '' AND actor = current_setting('amarh.user', true)
@@ -192,6 +216,19 @@ CREATE POLICY upd ON scenario_override FOR UPDATE TO amarh_app USING (
     scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))
     WITH CHECK (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id));
 -- END scenario_core
+
+-- review M6: has the open evidence scenario changed since the proposal saw data_version p_dv? (definer: an approver
+-- who may not read the scenario learns only this boolean)
+CREATE OR REPLACE FUNCTION amarh_scenario_changed(p_id int, p_dv bigint) RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER AS $fn$
+SELECT coalesce((SELECT st.data_version <> p_dv FROM scenario_state st WHERE st.scenario_id = p_id
+                  AND NOT EXISTS (SELECT 1 FROM scenario_event e WHERE e.scenario_id = p_id
+                                  AND e.kind IN ('merged','discarded','expired'))), false) $fn$;
+DO $do$ BEGIN
+  EXECUTE format('ALTER FUNCTION amarh_scenario_changed(int, bigint) SET search_path = pg_catalog, %I, public, pg_temp', current_schema());
+  REVOKE ALL ON FUNCTION amarh_scenario_changed(int, bigint) FROM PUBLIC;
+  GRANT EXECUTE ON FUNCTION amarh_scenario_changed(int, bigint) TO amarh_app;
+END $do$;
 
 -- ---------------------------------------------------------------- tables
 CREATE TABLE IF NOT EXISTS audit_event (
@@ -214,6 +251,8 @@ ALTER TABLE audit_event ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'e
 ALTER TABLE audit_event ADD COLUMN IF NOT EXISTS tool_trace jsonb;
 ALTER TABLE audit_event ADD COLUMN IF NOT EXISTS parent_execution_id uuid;
 ALTER TABLE audit_event ADD COLUMN IF NOT EXISTS scenario_id int NOT NULL DEFAULT 0;
+-- provenance of a replayed (scenario merge) execution/proposal: the original scenario action's id
+ALTER TABLE audit_event ADD COLUMN IF NOT EXISTS origin_action_id uuid;
 CREATE INDEX IF NOT EXISTS audit_event_sim_time_idx ON audit_event (sim_time);
 CREATE INDEX IF NOT EXISTS audit_event_recorded_at_idx ON audit_event (recorded_at);
 CREATE INDEX IF NOT EXISTS audit_event_action_id_idx ON audit_event (action_id);
@@ -240,6 +279,7 @@ ALTER TABLE proposal ADD COLUMN IF NOT EXISTS evidence jsonb;
 ALTER TABLE proposal ADD COLUMN IF NOT EXISTS base_versions jsonb;
 ALTER TABLE proposal ADD COLUMN IF NOT EXISTS expires_at timestamptz;
 ALTER TABLE proposal ADD COLUMN IF NOT EXISTS scenario_id int NOT NULL DEFAULT 0;  -- EVIDENCE scenario; executes on main
+ALTER TABLE proposal ADD COLUMN IF NOT EXISTS origin_action_id uuid;  -- merge: the original scenario action id
 CREATE UNIQUE INDEX IF NOT EXISTS proposal_idem_idx ON proposal (idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS proposal_proposer_idx ON proposal (proposer);
 CREATE INDEX IF NOT EXISTS proposal_seq_idx ON proposal (seq);
@@ -309,6 +349,11 @@ CREATE TABLE IF NOT EXISTS webhook_delivery (
 CREATE INDEX IF NOT EXISTS webhook_delivery_outbox_idx ON webhook_delivery (outbox_id, seq DESC);
 CREATE INDEX IF NOT EXISTS webhook_delivery_due_idx ON webhook_delivery (next_attempt_at)
     WHERE status IN ('pending', 'retry');
+
+DROP TRIGGER IF EXISTS amarh_no_scn ON webhook_outbox;
+CREATE TRIGGER amarh_no_scn BEFORE INSERT ON webhook_outbox FOR EACH ROW EXECUTE FUNCTION amarh_no_scenario_write();
+DROP TRIGGER IF EXISTS amarh_no_scn ON webhook_delivery;
+CREATE TRIGGER amarh_no_scn BEFORE INSERT ON webhook_delivery FOR EACH ROW EXECUTE FUNCTION amarh_no_scenario_write();
 
 -- Phase 4 agent audit: a run row plus an event stream (status = last 'finished' event; no updates needed).
 CREATE TABLE IF NOT EXISTS agent_run (
@@ -425,7 +470,10 @@ CREATE POLICY sel ON agent_run_event FOR SELECT TO amarh_app USING (
 -- SELECT. Policy dependency order (acyclic): proposal <- approval <- audit_event <- {execution_diff, rollback,
 -- webhook_outbox} <- webhook_delivery. Each EXISTS subquery is itself subject to the target's policy.
 -- proposal: proposer, or a role that may approve the action (GUC amarh.approves = comma list, set by scoped()).
-CREATE POLICY sel ON proposal FOR SELECT TO amarh_app USING ((scenario_id = 0 OR amarh_scenario_access(scenario_id)) AND (
+-- (an approver of the action may read the proposal row even when the evidence scenario is not theirs: they see
+-- the proposal and its impact, never the scenario's data)
+CREATE POLICY sel ON proposal FOR SELECT TO amarh_app USING ((scenario_id = 0 OR amarh_scenario_access(scenario_id)
+ OR action = ANY (string_to_array(coalesce(current_setting('amarh.approves', true), ''), ','))) AND (
     current_setting('amarh.role', true) = 'admin'
  OR (coalesce(current_setting('amarh.role', true), '') <> '' AND (
         proposer = current_setting('amarh.user', true)

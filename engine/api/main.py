@@ -25,10 +25,13 @@ import psycopg
 from psycopg import sql
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from psycopg.rows import dict_row
-from pydantic import BaseModel, ValidationError
+import math
+
+from pydantic import BaseModel, Field, ValidationError
 
 from engine.api import masking
 from engine import kpis, scenarios
@@ -98,7 +101,10 @@ def map_error(e: Exception) -> ApiError | None:
         return ApiError(422, "invalid", m)
     if isinstance(e, psycopg.errors.QueryCanceled):
         return ApiError(408, "timeout", "statement timeout")
-    if isinstance(e, (psycopg.errors.LockNotAvailable, psycopg.errors.ExclusionViolation)):
+    if isinstance(e, (psycopg.errors.DeadlockDetected, psycopg.errors.LockNotAvailable)):
+        log.info("busy: %s", str(e).splitlines()[0])  # review L6: retryable contention, never a 500
+        return ApiError(409, "busy", "the resource is busy; retry")
+    if isinstance(e, psycopg.errors.ExclusionViolation):
         log.info("conflict: %s", str(e).splitlines()[0])
         return ApiError(409, "conflict", "conflicting concurrent or overlapping change")
     if isinstance(e, (psycopg.errors.CheckViolation, psycopg.errors.NotNullViolation, psycopg.DataError)):
@@ -183,55 +189,119 @@ class InjectBody(BaseModel):
     kind: Literal["port_closure", "shipment_delay", "invoice_anomaly"]
     target: UUID | None = None
     at: datetime | None = None
-    duration_h: float | None = None
+    duration_h: float | None = Field(default=None, gt=0, le=24 * 365, allow_inf_nan=False)
+
+
+MAX_TEXT = 4000          # comment / rationale / reason / note fields
+MAX_BODY_BYTES = int(os.environ.get("AMARH_MAX_BODY_BYTES", str(2 * 1024 * 1024)))
+MAX_INJECTIONS = 20
+
+
+def _sim_days_cap() -> int:
+    return int(os.environ.get("AMARH_SCN_SIM_MAX_DAYS", "90"))
 
 
 class ExecBody(BaseModel):
     params: dict[str, Any] = {}
     valid_at: datetime | None = None
-    rationale: str | None = None
+    rationale: str | None = Field(default=None, max_length=MAX_TEXT)
 
 
 class ProposeBody(BaseModel):
     params: dict[str, Any] = {}
-    rationale: str | None = None
+    rationale: str | None = Field(default=None, max_length=MAX_TEXT)
     valid_at: datetime | None = None
 
 
 class CommentBody(BaseModel):
-    comment: str | None = None
+    comment: str | None = Field(default=None, max_length=MAX_TEXT)
 
 
 class RollbackBody(BaseModel):
-    reason: str | None = None
+    reason: str | None = Field(default=None, max_length=MAX_TEXT)
 
 
 class SparqlBody(BaseModel):
-    query: str
+    query: str = Field(max_length=50_000)
 
 
 class ScenarioBody(BaseModel):
-    name: str
-    expires_in_h: float | None = None
-    shared_roles: list[str] = []
+    name: str = Field(max_length=200)
+    expires_in_h: float | None = Field(default=None, gt=0, le=720, allow_inf_nan=False)
+    shared_roles: list[str] = Field(default=[], max_length=10)
 
 
 class MergeBody(BaseModel):
-    comment: str | None = None
+    comment: str | None = Field(default=None, max_length=MAX_TEXT)
 
 
 class InjectionBody(BaseModel):
+    """One what-if injection. Bounds (review L4): finite numbers only; magnitude in (0, 100]; times within the
+    simulated horizon (AMARH_SCN_SIM_MAX_DAYS); target is a UUID (validated by pydantic)."""
     kind: Literal["port_closure", "shipment_delay", "supplier_delay", "price_shock", "invoice_anomaly"]
     target: UUID | None = None
-    at_h: float | None = None
-    duration_h: float | None = None
-    magnitude: float | None = None
+    at_h: float | None = Field(default=None, ge=0, le=24 * 365, allow_inf_nan=False)
+    duration_h: float | None = Field(default=None, gt=0, le=24 * 365, allow_inf_nan=False)
+    magnitude: float | None = Field(default=None, gt=0, le=100, allow_inf_nan=False)
 
 
 class SimulateBody(BaseModel):
-    days: int
-    seed: int = 1
-    injections: list[InjectionBody] = []
+    days: int = Field(ge=1, le=3650)
+    seed: int = Field(default=1, ge=0, le=2**31 - 1)
+    injections: list[InjectionBody] = Field(default=[], max_length=MAX_INJECTIONS)
+
+
+class _BodyLimit:
+    """ASGI middleware: requests above MAX_BODY_BYTES are answered 413 `{code: body_too_large}` (declared
+    Content-Length is checked up front; streamed bodies are counted)."""
+
+    def __init__(self, app, max_bytes: int):
+        self.app, self.max = app, max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        too_big = False
+        try:
+            cl = int(dict(scope["headers"]).get(b"content-length", b"0") or 0)
+        except ValueError:
+            cl = 0
+        if cl > self.max:
+            too_big = True
+        seen = 0
+        started = False
+
+        async def rcv():
+            nonlocal seen, too_big
+            if too_big:
+                return {"type": "http.request", "body": b"", "more_body": False}
+            m = await receive()
+            if m["type"] == "http.request":
+                seen += len(m.get("body", b""))
+                if seen > self.max:
+                    too_big = True
+                    return {"type": "http.request", "body": b"", "more_body": False}
+            return m
+
+        async def snd(m):
+            nonlocal started
+            if too_big and not started:
+                started = True
+                body = json.dumps({"code": "body_too_large", "detail": "request body too large"}).encode()
+                await send({"type": "http.response.start", "status": 413,
+                            "headers": [(b"content-type", b"application/json"),
+                                        (b"content-length", str(len(body)).encode())]})
+                await send({"type": "http.response.body", "body": body})
+                return
+            if too_big:
+                return
+            started = True
+            await send(m)
+
+        if too_big:  # declared too large: never run the app
+            await snd({"type": "http.response.start", "status": 200, "headers": []})
+            return
+        await self.app(scope, rcv, snd)
 
 
 def create_app(ontology_path: str | None = None, schema: str | None = None,
@@ -301,6 +371,7 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
                 pass
 
     app = FastAPI(title="Amarh ontology API", lifespan=lifespan)
+    app.add_middleware(_BodyLimit, max_bytes=MAX_BODY_BYTES)
     app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
                        allow_methods=["*"], allow_headers=["*"])
     app.state.ontology = comp
@@ -309,6 +380,14 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
     @app.exception_handler(ApiError)
     async def _api_error(_: Request, e: ApiError):
         return JSONResponse(e.body, status_code=e.status)
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error(_: Request, e: RequestValidationError):
+        # the default handler echoes the offending input, which cannot be serialised for NaN / inf (-> 500) and
+        # may be huge; report location + message only
+        errs = [{"type": x.get("type"), "loc": [str(l) for l in x.get("loc", ())], "msg": x.get("msg")}
+                for x in e.errors()[:20]]
+        return JSONResponse({"code": "invalid", "detail": errs}, status_code=422)
 
     # ---------------------------------------------------------- identity + connections
     def get_principal(x_role: str | None = Header(default=None)) -> Principal:
@@ -1105,19 +1184,26 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
     sparql_slots = threading.BoundedSemaphore(4)
 
     # ------------------------------------------------------------ scenario graph / sparql
-    def _scenario_store(conn, scn):
+    def _scenario_store(conn, scn, p=None):
         from engine.sync import scenario_graph as SG
         try:
             return SG.get_store(conn, scn, comp, dsn=dsn, schema=schema)
         except SG.GraphTooLarge:
-            raise ApiError(413, "graph_too_large", "scenario is too large for graph queries")
+            # the size is data about ALL of the scenario's rows (also ones the caller cannot see): only the owner
+            # and admins are told why; everybody else gets a generic 403 (review L2)
+            row = conn.execute("SELECT owner_user FROM scenario WHERE id = %s", [scn.id]).fetchone()
+            if p is not None and (p.role == "admin" or (row is not None and row[0] == p.user)):
+                raise ApiError(413, "graph_too_large", "scenario is too large for graph queries")
+            raise ApiError(403, "graph_unavailable", "graph queries are not available for this scenario")
+        except SG.GraphBusy:
+            raise ApiError(503, "graph_busy", "graph builds are busy; retry shortly")
         except SG.ScenarioNotVisible:
             raise ApiError(404, "scenario_not_found", "scenario not found")
 
     def _scenario_graph(center, depth, as_of, include_inferred, p, scn, conn):
         if as_of not in (None, "", "live"):
             raise ApiError(400, "scenario_as_of_unsupported", "as_of is not supported inside a scenario")
-        graph_ = _scenario_store(conn, scn)
+        graph_ = _scenario_store(conn, scn, p)
         try:
             res = V.bfs(conn, center, depth, pipeline=graph_, include_inferred=include_inferred,
                         max_nodes=MAX_GRAPH_NODES, is_admin=p.role == "admin",
@@ -1139,7 +1225,7 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
 
     def _scenario_sparql(body, p, scn, conn):
         from engine.sync.sparql import SparqlError, run_query
-        graph_ = _scenario_store(conn, scn)
+        graph_ = _scenario_store(conn, scn, p)
         if not sparql_slots.acquire(blocking=False):
             raise ApiError(429, "too_many_requests", "too many concurrent queries")
         try:
@@ -1501,6 +1587,13 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
     def scn_error(conn, e: Exception):
         fail(conn, e)
 
+    def scn_view(d: dict, p: Principal) -> dict:
+        """Review L2: counters and the run id are owner/admin data (they describe rows and activity a shared
+        viewer may not see)."""
+        if p.role == "admin" or d.get("owner_user") == p.user:
+            return d
+        return {**d, "override_rows": None, "data_version": None, "run_id": None}
+
     @app.post("/scenarios", status_code=201)
     def create_scenario(body: ScenarioBody, p: Principal = Depends(get_principal), conn=Depends(wconn)):
         try:
@@ -1508,7 +1601,7 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
                                  shared_roles=body.shared_roles, ontology=comp)
         except Exception as e:  # noqa: BLE001
             scn_error(conn, e)
-        return jsonable_encoder(d)
+        return jsonable_encoder(scn_view(d, p))
 
     @app.get("/scenarios")
     def list_scenarios(status_: str = Query("open", alias="status", pattern="^(open|all|merged|discarded|expired)$"),
@@ -1518,12 +1611,12 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
             rows = scenarios.list_(conn, p, status_)
         except Exception as e:  # noqa: BLE001
             scn_error(conn, e)
-        return jsonable_encoder(rows)
+        return jsonable_encoder([scn_view(r, p) for r in rows])
 
     @app.get("/scenarios/{sid}")
     def get_scenario_route(sid: int, p: Principal = Depends(get_principal), conn=Depends(wconn)):
         try:
-            return jsonable_encoder(scenarios.get(conn, p, sid))
+            return jsonable_encoder(scn_view(scenarios.get(conn, p, sid), p))
         except Exception as e:  # noqa: BLE001
             scn_error(conn, e)
 
@@ -1658,8 +1751,13 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
             j = dict(sim_jobs.get(job_id) or {})
         if not j or j["scenario_id"] != sid:
             raise ApiError(404, "job_not_found", "job not found")
-        out = {"status": j["status"], "sim_now": j["sim_now"], "digest": j["digest"], "actions": j["actions"],
-               "kpis": None, "error": j["error"]}
+        try:
+            info = scenarios.get(conn, p, sid)
+        except Exception as e:  # noqa: BLE001
+            scn_error(conn, e)
+        mine = p.role == "admin" or info["owner_user"] == p.user  # review L2: digest/actions are owner/admin data
+        out = {"status": j["status"], "sim_now": j["sim_now"], "digest": j["digest"] if mine else None,
+               "actions": j["actions"] if mine else None, "kpis": None, "error": j["error"]}
         if j["status"] == "done":  # KPIs are recomputed for THIS viewer (RLS), never copied from the starter's view
             try:
                 out["kpis"] = kpis.compute(conn, p, sid)

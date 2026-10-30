@@ -194,7 +194,15 @@ def test_graph_too_large(w, monkeypatch):
         SG.get_store(w.c, ctx, COMP)
     assert "4" not in str(e.value) and "3" not in str(e.value)      # no counts leak
     assert SG.cache_info()["size"] == 0
-    monkeypatch.setenv("AMARH_SCN_GRAPH_MAX_OBJECTS", "4")
+    monkeypatch.setenv("AMARH_SCN_GRAPH_MAX_OBJECTS", "1000")
+    g = SG.get_store(w.c, ctx, COMP)
+    assert g.objects == 4
+    # review M4c: links count against the same cap as objects
+    SG.clear_cache()
+    monkeypatch.setenv("AMARH_SCN_GRAPH_MAX_OBJECTS", str(g.objects + g.links - 1))
+    with pytest.raises(SG.GraphTooLarge):
+        SG.get_store(w.c, ctx, COMP)
+    monkeypatch.setenv("AMARH_SCN_GRAPH_MAX_OBJECTS", str(g.objects + g.links))
     assert SG.get_store(w.c, ctx, COMP).objects == 4
 
 
@@ -287,3 +295,22 @@ def test_shacl_on_scenario_subgraph(w):
         validate_changed(p.store if False else g, [sh], NS)                      # graph without scenario=
     with pytest.raises(ValueError):
         validate_changed(g, [sh], NS, scenario=scenario_admin.ctx_of(w.c, w.fork("z").id))
+
+
+def test_concurrent_builds_are_limited_and_busy_is_reported(w, monkeypatch):
+    """Review M4c: a global semaphore bounds simultaneous scenario graph builds (GraphBusy -> HTTP 503)."""
+    ctx = w.fork()
+    monkeypatch.setenv("AMARH_SCN_MAX_GRAPH_BUILDS", "1")
+    monkeypatch.setenv("AMARH_SCN_GRAPH_TIMEOUT_S", "4")           # wait for a slot: max(1 s, timeout / 4)
+    slot = SG._slots()
+    assert slot.acquire(timeout=1)
+    try:
+        t0 = __import__("time").monotonic()
+        with pytest.raises(SG.GraphBusy):
+            SG.get_store(w.c, ctx, COMP)
+        assert __import__("time").monotonic() - t0 < 5
+    finally:
+        slot.release()
+    SG.clear_cache()
+    assert SG.get_store(w.c, ctx, COMP).scenario_id == ctx.id      # the slot is free again
+    assert SG.build_timeout_s() == 4.0
