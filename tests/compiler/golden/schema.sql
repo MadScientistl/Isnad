@@ -15,10 +15,22 @@ END $$;
 DO $$ BEGIN EXECUTE format('GRANT USAGE ON SCHEMA %I TO amarh_app', current_schema()); END $$;
 -- amarh_app may not create temp tables (a temp table could shadow an unqualified relation); the loader
 -- (connection user) keeps the privilege.
-DO $$ BEGIN
-  EXECUTE format('REVOKE TEMPORARY ON DATABASE %I FROM PUBLIC', current_database());
-  EXECUTE format('REVOKE TEMPORARY ON DATABASE %I FROM amarh_app', current_database());
-  EXECUTE format('GRANT TEMPORARY ON DATABASE %I TO %I', current_database(), current_user);
+DO $$
+DECLARE n int := 0;
+BEGIN
+  LOOP
+    BEGIN
+      EXECUTE format('REVOKE TEMPORARY ON DATABASE %I FROM PUBLIC', current_database());
+      EXECUTE format('REVOKE TEMPORARY ON DATABASE %I FROM amarh_app', current_database());
+      EXECUTE format('GRANT TEMPORARY ON DATABASE %I TO %I', current_database(), current_user);
+      EXIT;
+    EXCEPTION WHEN internal_error THEN
+      -- "tuple concurrently updated": another session is applying the same grants; retry briefly
+      n := n + 1;
+      IF n >= 20 THEN RAISE; END IF;
+      PERFORM pg_sleep(0.05 * n);
+    END;
+  END LOOP;
 END $$;
 
 CREATE OR REPLACE FUNCTION amarh_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
