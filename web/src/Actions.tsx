@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, ApiError, paramList, type ActionInfo, type ParamMeta } from "./api";
-import { toast, usePolled } from "./store";
+import { toast, usePolled, useApp } from "./store";
 
 type Obj = Record<string, any>;
 
@@ -49,10 +49,11 @@ function Field({ p, v, set }: { p: ParamMeta; v: string; set: (s: string) => voi
 }
 
 export function ActionsPanel({ type, id, onDone }: { type: string; id: string; onDone: () => void }) {
+  const { scenario } = useApp();
   const acts = usePolled(() => api.actions(type, id), [type, id]);
   const [open, setOpen] = useState<ActionInfo | null>(null);
   return (
-    <div className="card"><h3>Actions</h3>
+    <div className="card"><h3>Actions{scenario !== null && <span className="chip scn" style={{ marginLeft: 8 }}>in scenario {scenario}: nothing changes on main</span>}</h3>
       {acts.error && <div className="err">{acts.error}</div>}
       {acts.loading && !acts.data && <div className="muted">Loading…</div>}
       <div className="actions">
@@ -70,6 +71,8 @@ export function ActionsPanel({ type, id, onDone }: { type: string; id: string; o
 }
 
 function ActionDialog({ act, type, id, onClose, onDone }: { act: ActionInfo; type: string; id: string; onClose: () => void; onDone: () => void }) {
+  const { scenario } = useApp();
+  const gated = act.requires_approval && scenario === null; // no approval gate inside a scenario
   const params = paramList(act.params, act.name);
   const [vals, setVals] = useState(() => initial(params, type, id));
   const [rationale, setRationale] = useState("");
@@ -81,10 +84,10 @@ function ActionDialog({ act, type, id, onClose, onDone }: { act: ActionInfo; typ
     setErr(undefined); setFailures([]);
     let p: Record<string, unknown>;
     try { p = coerce(params, vals); } catch (e: any) { setErr(e.message); return; }
-    if (act.requires_approval && !rationale.trim()) { setErr("A rationale is required to propose this action."); return; }
+    if (gated && !rationale.trim()) { setErr("A rationale is required to propose this action."); return; }
     setBusy(true);
     try {
-      const r = act.requires_approval ? await api.propose(act.name, p, rationale) : await api.execute(act.name, p);
+      const r = gated ? await api.propose(act.name, p, rationale) : await api.execute(act.name, p);
       if (r.status === 200 && r.data.action_id) toast(`${act.name} executed`, `#/audit/${r.data.action_id}`);
       else toast(`${act.name}: proposal pending approval`, "#/approvals", "warn");
       onDone();
@@ -101,11 +104,12 @@ function ActionDialog({ act, type, id, onClose, onDone }: { act: ActionInfo; typ
     <div className="modal" role="dialog" aria-modal="true" aria-label={act.name} onClick={onClose}>
       <div className="dlg" onClick={(e) => e.stopPropagation()}>
         <h3>{act.name}</h3><p className="muted">{act.description}</p>
-        {act.requires_approval && <div className="warnbox">This action needs approval: it will be proposed and a different user with an approver role must approve it.</div>}
+        {act.requires_approval && scenario !== null && <div className="warnbox">Scenario {scenario} is active: this runs directly inside the scenario (no approval needed) and does not touch main. Merging it later turns it into a proposal.</div>}
+        {gated && <div className="warnbox">This action needs approval: it will be proposed and a different user with an approver role must approve it.</div>}
         <div className="form">{params.map((p) => <Field key={p.name} p={p} v={vals[p.name] ?? ""} set={(s) => setVals({ ...vals, [p.name]: s })} />)}
-          {act.requires_approval && <label><span>Rationale*</span><textarea value={rationale} onChange={(e) => setRationale(e.target.value)} rows={2} /></label>}</div>
+          {gated && <label><span>Rationale*</span><textarea value={rationale} onChange={(e) => setRationale(e.target.value)} rows={2} /></label>}</div>
         {err && <div className="err" role="alert">{err}{failures.length > 0 && <ul>{failures.map((f, i) => <li key={i}>{f}</li>)}</ul>}</div>}
-        <p><button className="primary" disabled={busy} onClick={submit}>{act.requires_approval ? "Propose for approval" : "Execute"}</button> <button onClick={onClose}>Cancel</button></p>
+        <p><button className="primary" disabled={busy} onClick={submit}>{gated ? "Propose for approval" : scenario !== null ? "Execute in scenario" : "Execute"}</button> <button onClick={onClose}>Cancel</button></p>
       </div>
     </div>
   );

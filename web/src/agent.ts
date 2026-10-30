@@ -1,4 +1,4 @@
-import { BASE, ApiError, getRole, req } from "./api";
+import { BASE, ApiError, getRole, req, scnHeaders } from "./api";
 
 /** Phase 4 agent types and client. All payload text is untrusted: render it as text only. */
 export type RunStatus = "running" | "completed" | "capped" | "error" | "cancelled" | "interrupted";
@@ -11,7 +11,7 @@ export interface AgentConfig {
 export interface Run {
   id: string; role: string; user: string; prompt: string; model: string; caps: Caps; started_at: string; status: RunStatus;
   summary: string | null; cap: string | null; error: string | null; tokens_in: number; tokens_out: number; cost_usd: number;
-  turns: number; tool_calls: number; proposals: number; proposal_ids: string[];
+  turns: number; tool_calls: number; proposals: number; proposal_ids: string[]; scenario_id?: number | null; scenario_ids?: number[];
 }
 export interface AgentEvent { seq: number; kind: "delta" | "message" | "tool_call" | "tool_result" | "denied" | "proposal" | "finished"; payload: any; tokens_in?: number; tokens_out?: number; cost_usd?: number; at?: string }
 export interface Provenance { asserted?: string[]; inferred?: { edge: string; rule: string; support: string[] }[] }
@@ -65,7 +65,7 @@ export async function streamRun(runId: string, onEvent: (e: AgentEvent) => void,
   while (!done && !signal.aborted) {
     try {
       const r = await fetch(`${BASE.replace(/\/$/, "")}/agent/runs/${runId}/stream${last ? `?after=${last}` : ""}`, {
-        headers: { "x-role": getRole(), accept: "text/event-stream", ...(last ? { "last-event-id": String(last) } : {}) }, signal,
+        headers: { "x-role": getRole(), ...scnHeaders(`/agent/runs/${runId}/stream`), accept: "text/event-stream", ...(last ? { "last-event-id": String(last) } : {}) }, signal,
       });
       if (!r.ok || !r.body) {
         if (r.status >= 400 && r.status < 500) throw new ApiError(r.status, await r.text(), `stream ${r.status}`);

@@ -27,3 +27,14 @@ Outcome: an organisation can let agents investigate and recommend at machine spe
 ## Scope note
 
 Amarh is a simulated, local-first reference platform, not a production deployment. Known limits (no real login, view-level masking, trusted identity settings inside a scoped session, no live Claude API run yet) are in `docs/contracts.md`.
+
+## Fit with a central data platform
+
+Assumption: a central data platform (a governed lakehouse/fabric with catalog, pipelines and identity) is the enterprise's system of record for raw data. Amarh does not replace it; it adds a meaning, permission and action layer on top.
+
+- **Read path:** platform tables are mapped by the YAML ontology into typed objects and links (Postgres, bitemporal, row-level security), then into the semantic graph for reasoning.
+- **Write path:** agents only propose. An approved action runs in one transaction, is audited, and leaves through the outbox as a webhook or API call to the source system or platform.
+- **Identity:** platform SSO groups would map to Amarh roles, replacing the non-secret `x-role` header.
+- **Governance:** platform lineage and classification can feed masking and row rules; Amarh adds per-edge filtering and audit.
+
+Not built yet: a connector to a real data platform, SSO, and a live Claude API run. Today Amarh runs on simulated data.

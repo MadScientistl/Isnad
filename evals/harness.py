@@ -5,6 +5,7 @@ import copy
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -39,12 +40,16 @@ class TeeSink:
 
     def __init__(self, db: DbSink, mem: MemorySink):
         self.db, self.mem = db, mem
+        self.times: dict = {}   # (kind, tool_call_id) -> perf_counter at emit (events carry no timestamps)
 
     def run_started(self, *a, **kw):
         self.db.run_started(*a, **kw)
         self.mem.run_started(*a, **kw)
 
     def emit(self, ev):
+        cid = (ev.get("payload") or {}).get("tool_call_id")
+        if cid and ev.get("kind") in ("tool_call", "tool_result"):
+            self.times[(ev["kind"], cid)] = time.perf_counter()
         self.db.emit(ev)
         self.mem.emit(ev)
 
@@ -79,6 +84,9 @@ class Run:
     post: dict = field(default_factory=dict)
     plan_label: str = ""
     caps: dict = field(default_factory=dict)
+    times: dict = field(default_factory=dict)
+    latency_s: float = 0.0
+    fp_before: str = ""
 
     # ---- views over the events
     def calls(self):
@@ -149,13 +157,18 @@ def run_agent(world: World, role: str, prompt: str, mode: str = "mock", plan: st
                        caps=Caps.for_role(comp().model.roles[role], **cap_kw))
     base = _max_seq(world)
     mem, db = MemorySink(), DbSink(world.factory, principal)
+    tee = TeeSink(db, mem)
+    fp_before = world.fingerprint()
+    t0 = time.perf_counter()
     try:
-        result = AgentRun(ctx, model, TeeSink(db, mem)).run(prompt)
+        result = AgentRun(ctx, model, tee).run(prompt)
     finally:
         db.close()
+    latency = time.perf_counter() - t0
     r = Run(world, role, prompt, mode, result, mem.events, model.sent, ctx.run_id,
             allowed_tools(comp().model, role), allowed_actions(comp().model, role), plan_label=label,
             caps=ctx.caps.as_dict())
+    r.times, r.latency_s, r.fp_before = tee.times, latency, fp_before
     r.proposals = admin_rows(
         world, "SELECT p.id, p.action, p.params, p.proposer, p.proposer_role, p.on_behalf_of, p.rationale, p.evidence, "
                "p.dry_run, p.expires_at, p.run_id, a.decision FROM proposal p LEFT JOIN approval a "
@@ -235,9 +248,32 @@ def load_cases(only: str | None = None) -> list:
     return cases
 
 
-def run_case(case: dict, mode: str = "mock") -> dict:
+def _trim(x, n: int = 120, depth: int = 0):
+    """Bounded copy of a tool input for the report (long strings cut, big lists/dicts capped)."""
+    if isinstance(x, str):
+        return x if len(x) <= n else x[:n] + f"...(+{len(x) - n})"
+    if isinstance(x, dict):
+        items = list(x.items())[:12]
+        return {str(k): _trim(v, n, depth + 1) for k, v in items} if depth < 4 else "{...}"
+    if isinstance(x, (list, tuple)):
+        out = [_trim(v, n, depth + 1) for v in list(x)[:8]] if depth < 4 else ["..."]
+        return out + [f"...(+{len(x) - 8} more)"] if len(x) > 8 else out
+    return x
+
+
+def tool_trace(run: Run) -> list:
+    out = []
+    for call, res, den in run.calls():
+        cid = call["tool_call_id"]
+        t0, t1 = run.times.get(("tool_call", cid)), run.times.get(("tool_result", cid))
+        out.append({"name": call["name"], "input": _trim(call.get("input")), "ok": bool(res and res.get("ok")),
+                    "denied": bool(den), "ms": round((t1 - t0) * 1000, 2) if t0 is not None and t1 is not None else None})
+    return out
+
+
+def run_case(case: dict, mode: str = "mock", seed: int = 1) -> dict:
     from evals import checks
-    world = build_world(1)
+    world = build_world(seed)
     try:
         plan = case.get("plan") or {}
         args = {k: (_fill(v, world) if isinstance(v, str) else v) for k, v in (plan.get("args") or {}).items()}
@@ -258,19 +294,21 @@ def run_case(case: dict, mode: str = "mock") -> dict:
                 status, detail = "fail", f"check crashed: {type(e).__name__}: {e}"
             outcomes.append({"class": cls, "check": name, "args": a, "status": status, "detail": detail})
         res = run.result
-        return {"id": case["id"], "role": case["role"], "description": case.get("description", ""),
+        return {"id": case["id"], "seed": seed, "role": case["role"], "description": case.get("description", ""),
                 "mode": mode, "plan": run.plan_label, "status": res.status, "cap": res.cap, "error": res.error,
+                "latency_s": round(run.latency_s, 4),
                 "telemetry": {"turns": res.turns, "tool_calls": res.tool_calls, "tokens_in": res.tokens_in,
                               "tokens_out": res.tokens_out, "cost_usd": res.cost_usd,
                               "proposals": len(run.proposals)},
+                "tool_trace": tool_trace(run), "scenario_ids": [],
                 "summary": run.summary()[:600], "outcomes": outcomes}
     finally:
         world.close()
 
 
-def run_suite(mode: str = "mock", only: str | None = None) -> list:
+def run_suite(mode: str = "mock", only: str | None = None, seeds=(1,)) -> list:
     cases = [c for c in load_cases(only) if mode in (c.get("modes") or ["mock", "live"])]
-    return [run_case(c, mode) for c in cases]
+    return [run_case(c, mode, sd) for sd in seeds for c in cases]
 
 
 def suite_summary(results: list) -> dict:
@@ -281,10 +319,46 @@ def suite_summary(results: list) -> dict:
     return {k: dict(zip(("pass", "fail", "na"), v)) for k, v in tot.items()}
 
 
-def write_report(results: list, mode: str, out_dir: Path | None = None) -> Path:
+def write_report(results: list, mode: str, out_dir: Path | None = None, md: bool = False) -> Path:
+    """JSON report (and a markdown rendering next to it with md=True). Returns the JSON path."""
     out_dir = out_dir or Path(__file__).resolve().parent / "results"
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"report_{mode}_{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}.json"
-    path.write_text(json.dumps({"mode": mode, "generated_at": datetime.now(UTC).isoformat(),
-                                "summary": suite_summary(results), "cases": results}, indent=2, default=str))
+    now = datetime.now(UTC)
+    stem = f"report_{mode}_{now.strftime('%Y%m%dT%H%M%SZ')}"
+    path = out_dir / f"{stem}.json"
+    seeds = sorted({r.get("seed", 1) for r in results})
+    report = {"mode": mode, "generated_at": now.isoformat(), "seeds": seeds,
+              "summary": suite_summary(results), "cases": results}
+    path.write_text(json.dumps(report, indent=2, default=str))
+    if md:
+        (out_dir / f"{stem}.md").write_text(render_markdown(report))
     return path
+
+
+def _counts(r: dict, cls: str) -> str:
+    os_ = [o for o in r["outcomes"] if o["class"] == cls and o["status"] != "na"]
+    return f"{sum(o['status'] == 'pass' for o in os_)}/{len(os_)}"
+
+
+def render_markdown(report: dict) -> str:
+    cases, s = report["cases"], report["summary"]
+    cost = sum(r["telemetry"]["cost_usd"] for r in cases)
+    lat = sum(r.get("latency_s", 0) for r in cases)
+    L = [f"# Eval report ({report['mode']})", "",
+         f"Generated {report['generated_at']}; seeds {report.get('seeds')}; {len(cases)} case runs.", "",
+         f"- hard: {s['hard']['pass']} pass, {s['hard']['fail']} fail, {s['hard']['na']} n/a",
+         f"- soft: {s['soft']['pass']} pass, {s['soft']['fail']} fail, {s['soft']['na']} n/a",
+         f"- telemetry: {s['telemetry']['pass']} recorded",
+         f"- total cost ${cost:.4f}, total agent latency {lat:.1f} s", "",
+         "| case | seed | role | result | hard | soft | calls | cost | latency |", "|---|---|---|---|---|---|---|---|---|"]
+    for r in cases:
+        bad = any(o["class"] == "hard" and o["status"] == "fail" for o in r["outcomes"])
+        L.append(f"| {r['id']} | {r.get('seed', 1)} | {r['role']} | {'FAIL' if bad else 'pass'} | {_counts(r, 'hard')} | "
+                 f"{_counts(r, 'soft')} | {r['telemetry']['tool_calls']} | ${r['telemetry']['cost_usd']:.4f} | "
+                 f"{r.get('latency_s', 0):.2f} s |")
+    fails = [(r, o) for r in cases for o in r["outcomes"] if o["status"] == "fail"]
+    if fails:
+        L += ["", "## Failed assertions", ""]
+        for r, o in fails:
+            L.append(f"- [{o['class']}] {r['id']} (seed {r.get('seed', 1)}) {o['check']}: {o['detail']}")
+    return "\n".join(L) + "\n"

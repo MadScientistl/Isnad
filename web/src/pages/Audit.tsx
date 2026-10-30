@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, ApiError, dryDiff, isNotFound, type AuditRow, type DiffRow, type ExecDetail, type Execution, type Proposal } from "../api";
 import { fmtT, toast, usePolled, useApp } from "../store";
+import { ScnChip } from "../ScnUi";
 
 const STATUS_CLS: Record<string, string> = {
   executed: "ok", approved: "ok", delivered: "ok", pending: "warn", pending_approval: "warn", retry: "warn",
@@ -57,7 +58,7 @@ export default function AuditPage({ parts }: { parts: string[] }) {
       <table><thead><tr><th>Time</th><th>Kind</th><th>Name</th><th>Actor</th><th>Status</th><th>Detail</th></tr></thead><tbody>
         {rows.map((r) => (
           <tr key={r.kind + r.id} className={r.action_id ? "row" : ""} onClick={() => r.action_id && open(r.action_id)}>
-            <td>{fmtT(r.at)}</td><td>{r.kind}</td><td>{r.name}</td><td>{r.actor}{r.role ? <span className="muted"> ({r.role})</span> : ""}</td><td><Chip s={r.status} /></td><td className="muted">{r.summary}</td></tr>))}
+            <td>{fmtT(r.at)}</td><td>{r.kind}</td><td>{r.name} <ScnChip id={r.scenario_id as number | undefined} /></td><td>{r.actor}{r.role ? <span className="muted"> ({r.role})</span> : ""}</td><td><Chip s={r.status} /></td><td className="muted">{r.summary}</td></tr>))}
         {!data.loading && !rows.length && <tr><td colSpan={6} className="muted">Nothing to show.</td></tr>}
       </tbody></table>
       {detailId && <Drawer id={detailId} onClose={() => { location.hash = "/audit"; }} onChanged={data.reload} />}
@@ -66,17 +67,17 @@ export default function AuditPage({ parts }: { parts: string[] }) {
 }
 
 const execRow = (e: Execution): AuditRow => ({
-  kind: e.parent_execution_id ? "rollback" : "execution", id: e.action_id, action_id: e.action_id, at: e.recorded_at, actor: e.actor, role: e.role, name: e.name,
+  kind: e.parent_execution_id ? "rollback" : "execution", scenario_id: e.scenario_id, id: e.action_id, action_id: e.action_id, at: e.recorded_at, actor: e.actor, role: e.role, name: e.name,
   status: e.rolled_back ? "rolled_back" : e.status, summary: Object.entries(e.params ?? {}).map(([k, v]) => `${k}=${j(v).slice(0, 12)}`).join(" ") + (e.error ? ` ${e.error}` : ""),
 });
 const propRow = (p: Proposal): AuditRow => ({
-  kind: "proposal", id: p.id, at: p.created_at, actor: p.proposer, role: p.proposer_role, name: p.action, status: p.state ?? (p.approval ? p.approval.decision : "pending"),
+  kind: "proposal", scenario_id: p.scenario_id, id: p.id, at: p.created_at, actor: p.proposer, role: p.proposer_role, name: p.action, status: p.state ?? (p.approval ? p.approval.decision : "pending"),
   action_id: p.approval?.execution_id ?? null, proposal_id: p.id, summary: p.rationale ?? "",
 });
 
 function Drawer({ id, onClose, onChanged }: { id: string; onClose: () => void; onChanged: () => void }) {
   const d = usePolled<ExecDetail>(() => api.execution(id), [id]);
-  const { role } = useApp();
+  const { role, scenario } = useApp();
   const [reason, setReason] = useState("");
   const [asking, setAsking] = useState(false);
   const [err, setErr] = useState<string[]>([]);
@@ -108,7 +109,7 @@ function Drawer({ id, onClose, onChanged }: { id: string; onClose: () => void; o
         <table><tbody>
           <tr><th>Action</th><td>{ex.name}</td></tr><tr><th>Status</th><td><Chip s={d.data!.rollback ? "rolled_back" : ex.status} /></td></tr>
           <tr><th>Actor</th><td>{ex.actor} {ex.role && <span className="muted">({ex.role})</span>}</td></tr>
-          <tr><th>Source</th><td>{ex.source}</td></tr><tr><th>Recorded</th><td>{fmtT(ex.recorded_at)}</td></tr>
+          <tr><th>Source</th><td>{ex.source} <ScnChip id={ex.scenario_id} /></td></tr><tr><th>Recorded</th><td>{fmtT(ex.recorded_at)}</td></tr>
           {ex.proposal_id && <tr><th>Proposal</th><td>{short(ex.proposal_id)}</td></tr>}
           {ex.parent_execution_id && <tr><th>Rollback of</th><td><a className="lnk" href={`#/audit/${ex.parent_execution_id}`}>{short(ex.parent_execution_id)}</a></td></tr>}
           {ex.error && <tr><th>Error</th><td className="bad-t">{ex.error}</td></tr>}</tbody></table>
@@ -121,7 +122,7 @@ function Drawer({ id, onClose, onChanged }: { id: string; onClose: () => void; o
           return <div key={w.outbox.id} className="wh"><b>{w.outbox.hook}</b> <span className="muted">{w.outbox.url}</span> {last && <Chip s={last.status} />}
             <table><thead><tr><th>#</th><th>Status</th><th>HTTP</th><th>Error</th><th>At</th></tr></thead><tbody>
               {w.deliveries.map((x, i) => <tr key={i}><td>{x.attempt}</td><td><Chip s={x.status} /></td><td>{x.http_status ?? ""}</td><td>{x.error ?? ""}</td><td>{fmtT(x.at)}</td></tr>)}</tbody></table>
-            {last && (last.status === "dead" || last.status === "retry") && <button onClick={() => retry(w.outbox.id)}>Retry webhook</button>}</div>;
+            {last && (last.status === "dead" || last.status === "retry") && <button disabled={scenario !== null} title={scenario !== null ? "Not available inside a scenario" : undefined} onClick={() => retry(w.outbox.id)}>Retry webhook</button>}</div>;
         })}
         {d.data!.rollback && <div className="warnbox">Rolled back by {d.data!.rollback.actor} at {fmtT(d.data!.rollback.at)}: "{d.data!.rollback.reason}" (<a className="lnk" href={`#/audit/${d.data!.rollback.rollback_action_id}`}>{short(d.data!.rollback.rollback_action_id)}</a>)</div>}
         {err.length > 0 && <div className="err" role="alert">{err[0]}{err.length > 1 && <ul>{err.slice(1).map((e, i) => <li key={i}>{e}</li>)}</ul>}</div>}

@@ -5,7 +5,7 @@ classes:
   Port: {extends: Facility}
   Warehouse: {extends: Facility}
 objectTypes:
-  Supplier:  {properties: {name: "string!", country: string}}
+  Supplier:  {properties: {name: "string!", country: string, price_index: float}}
   Port:      {properties: {name: "string!", lat: float, lon: float, location: point, status: {enum: [open, closed]}, region: {enum: [APAC, EMEA, AMER]}}}
   Warehouse: {properties: {name: "string!", lat: float, lon: float, location: point, region: {enum: [APAC, EMEA, AMER]}}}
   Shipment:
@@ -17,6 +17,7 @@ objectTypes:
       progress: float
       cargo_value: float
       delay_hours: float
+      extra_cost: float
   Carrier:   {properties: {name: "string!"}}
   Invoice:
     properties:

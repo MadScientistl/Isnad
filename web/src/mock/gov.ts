@@ -16,6 +16,12 @@ interface World {
   canSeeObj(role: string, type: string, id: string): boolean;
 }
 let W: World;
+/** Scenario in effect for the current request (0 = main). Set by mock/scenarios.ts around overlaid requests. */
+let curScn = 0;
+export const setScn = (n: number) => { curScn = n; };
+let scnKpis: () => { before: Json; after: Json } = () => ({ before: {}, after: {} });
+export const setScenarioKpis = (f: typeof scnKpis) => { scnKpis = f; };
+const impactNow = () => { const { before, after } = scnKpis(); const delta: Json = {}; for (const k of Object.keys(after)) delta[k] = (after[k] ?? 0) - (before[k] ?? 0); return { before: { kpis: before }, after: { kpis: after }, delta: { kpis: delta } }; };
 export const setWorld = (w: World) => { W = w; seed(); };
 
 const ROLES = ["admin", "finance_analyst", "planner", "regional_ops_lead"];
@@ -25,9 +31,9 @@ let n = 0;
 const gid = (p: string) => `${p}${(++n).toString(16).padStart(4, "0")}0000-0000-4000-8000-${String(n).padStart(12, "0")}`;
 
 interface Delivery { attempt: number; status: string; http_status: number | null; error: string | null; next_attempt_at: string | null; at: string }
-interface Exec { action_id: string; name: string; actor: string; role: string; source: string; status: string; params: Json; sim_time: string; recorded_at: string; proposal_id: string | null; parent_execution_id: string | null; rolled_back: boolean; error: string | null; diff: any[]; undo?: () => void }
+interface Exec { scenario_id: number; action_id: string; name: string; actor: string; role: string; source: string; status: string; params: Json; sim_time: string; recorded_at: string; proposal_id: string | null; parent_execution_id: string | null; rolled_back: boolean; error: string | null; diff: any[]; undo?: () => void }
 interface Outbox { id: string; action_id: string; hook: string; url: string; created_at: string; idempotency_key: string; deliveries: Delivery[] }
-interface Prop { id: string; action: string; params: Json; proposer: string; proposer_role: string; rationale: string; dry_run: any[]; created_at: string; on_behalf_of?: string | null; evidence?: Json[] | null; run_id?: string | null; expires_at?: string | null; staleKeys?: string[]; approval: null | { id: string; proposal_id: string; decision: string; approver: string; approver_role: string; comment: string; decided_at: string; execution_id: string | null } }
+interface Prop { scenario_id?: number; id: string; action: string; params: Json; proposer: string; proposer_role: string; rationale: string; dry_run: any[]; created_at: string; on_behalf_of?: string | null; evidence?: Json[] | null; run_id?: string | null; expires_at?: string | null; staleKeys?: string[]; approval: null | { id: string; proposal_id: string; decision: string; approver: string; approver_role: string; comment: string; decided_at: string; execution_id: string | null } }
 const execs: Exec[] = [], outbox: Outbox[] = [], props: Prop[] = [], rollbacks: Json[] = [];
 
 const err = (status: number, code: string, detail: string, extra: Json = {}): [number, unknown] => [status, { detail: { code, detail, ...extra } }];
@@ -42,7 +48,7 @@ const targetOf = (name: string, p: Json): [string, string] | null => {
 
 function record(e: Partial<Exec> & { name: string; actor: string; role: string; params: Json }, hours?: string): Exec {
   const now = hours ?? W.nowIso();
-  const x: Exec = { action_id: gid("a"), source: "api", status: "executed", sim_time: now, recorded_at: now, proposal_id: null, parent_execution_id: null, rolled_back: false, error: null, diff: [], ...e };
+  const x: Exec = { scenario_id: curScn, action_id: gid("a"), source: "api", status: "executed", sim_time: now, recorded_at: now, proposal_id: null, parent_execution_id: null, rolled_back: false, error: null, diff: [], ...e };
   execs.unshift(x); return x;
 }
 function addHooks(x: Exec, outcomes?: { status: string; http: number | null; error: string | null }[][]) {
@@ -98,6 +104,9 @@ function execVisible(role: string, x: Exec): boolean {
   return x.diff.every((d) => W.canSeeObj(role, d.type, d.key));
 }
 const propVisible = (role: string, p: Prop) => role === "admin" || p.proposer === user(role) || p.on_behalf_of === user(role) || (approversOf(p.action).includes(role));
+const inScn = (x: { scenario_id?: number }) => (x.scenario_id ?? 0) === curScn;
+// proposals made from a scenario execute on main, so the main inbox lists them (evidence scenario_id kept); inside a scenario only its own show
+const propInScn = (p: { scenario_id?: number }) => (curScn ? p.scenario_id === curScn : true);
 const rowOf = (x: Exec) => { const { diff: _d, undo: _u, ...r } = x; return r; };
 const state = (p: Prop) => (p.approval ? p.approval.decision : "pending");
 const propOut = (p: Prop) => {
@@ -105,12 +114,30 @@ const propOut = (p: Prop) => {
   return { on_behalf_of: null, evidence: null, run_id: null, expires_at: null, ...r, expired: !p.approval && !!p.expires_at && Date.parse(p.expires_at) <= Date.now(), stale: null, state: state(p) };
 };
 /** Agent-created proposal (used by the mock agent runs). */
-export function addAgentProposal(role: string, action: string, params: Json, rationale: string, evidence: Json[], runId: string, ttlMin = 60, staleKeys?: string[]): Prop {
-  const r = W.apply(action, params); let dry: any[] = [];
-  if (!("fail" in r) && !("notFound" in r)) { dry = r.diff; r.undo(); }
-  const p: Prop = { id: gid("p"), action, params, proposer: `agent:${role}`, proposer_role: role, rationale, dry_run: dry, created_at: W.nowIso(), on_behalf_of: user(role), evidence, run_id: runId,
+export function addAgentProposal(role: string, action: string, params: Json, rationale: string, evidence: Json[], runId: string, ttlMin = 60, staleKeys?: string[], scnId = 0, ev?: { diff: any[]; impact: Json }): Prop {
+  const r = scnId ? null : W.apply(action, params); let dry: any = [];
+  if (r && !("fail" in r) && !("notFound" in r)) { dry = r.diff; r.undo(); }
+  if (scnId && ev) dry = { diff: ev.diff, scenario_id: scnId, impact: ev.impact };
+  const p: Prop = { scenario_id: scnId, id: gid("p"), action, params, proposer: `agent:${role}`, proposer_role: role, rationale, dry_run: dry, created_at: W.nowIso(), on_behalf_of: user(role), evidence, run_id: runId,
     expires_at: new Date(Date.now() + ttlMin * 60000).toISOString(), staleKeys, approval: null };
   props.unshift(p); return p;
+}
+export const impactOf = impactNow;
+export const executeInScenario = (name: string, params: Json, role: string) => performExecute(name, params, role);
+/** Scenario-scoped executions (used by merge): executed user/agent actions in recorded order. */
+export const scenarioExecs = (id: number) => execs.filter((x) => x.scenario_id === id && x.status === "executed" && ["api", "agent", "ui"].includes(x.source)).reverse();
+/** Replay a scenario's recorded actions on main as `role`. Approval-gated actions become proposals. Call with curScn=0 and the main world active. */
+export function replayOnMain(id: number, role: string): { name: string; action_id?: string; proposal_id?: string }[] {
+  const out: { name: string; action_id?: string; proposal_id?: string }[] = [];
+  const prev = curScn; curScn = 0;
+  try {
+    for (const x of scenarioExecs(id)) {
+      const res = needsApproval(x.name) ? propose(x.name, x.params, `Merged from scenario ${id}`, role, 201) : performExecute(x.name, x.params, role);
+      const d = res[1] as Json;
+      if (d.proposal_id) out.push({ name: x.name, proposal_id: d.proposal_id }); else if (d.action_id) { const e = execs.find((q) => q.action_id === d.action_id); if (e) { e.source = "scenario_merge"; } out.push({ name: x.name, action_id: d.action_id }); }
+    }
+  } finally { curScn = prev; }
+  return out;
 }
 export const proposalRef = (id: string) => { const p = props.find((x) => x.id === id); return p ? { state: state(p), execution_id: p.approval?.execution_id ?? null } : null; };
 
@@ -126,8 +153,8 @@ function performExecute(name: string, params: Json, role: string, proposalId: st
     return err(422, "criteria_failed", "criteria failed", { failures: r.fail.map((message) => ({ message })) });
   }
   const x = record({ name, actor: user(role), role, params, diff: r.diff, undo: r.undo, proposal_id: proposalId });
-  addHooks(x);
-  return [200, { action_id: x.action_id, status: "executed", changed: r.diff.length, webhooks: hooksOf(name) }];
+  if (!curScn) addHooks(x); // no webhooks for scenario writes
+  return [200, { action_id: x.action_id, status: "executed", changed: r.diff.length, webhooks: curScn ? [] : hooksOf(name) }];
 }
 
 export function route(method: string, path: string, q: URLSearchParams, body: Json | undefined, role: string): [number, unknown] | null {
@@ -153,7 +180,7 @@ export function route(method: string, path: string, q: URLSearchParams, body: Js
     const name = m[1];
     if (!(name in ACTION_META)) return [404, { detail: "unknown action" }];
     if (!roleMayExec(role, name)) return performExecute(name, body?.params ?? {}, role);
-    if (needsApproval(name)) return propose(name, body?.params ?? {}, "", role, 202);
+    if (needsApproval(name) && !curScn) return propose(name, body?.params ?? {}, "", role, 202);
     return performExecute(name, body?.params ?? {}, role);
   }
   if ((m = path.match(/^\/actions\/(\w+)\/propose$/)) && method === "POST") {
@@ -162,9 +189,10 @@ export function route(method: string, path: string, q: URLSearchParams, body: Js
   }
   if (path === "/proposals") {
     const all = q.get("state") === "all";
-    return [200, props.filter((p) => propVisible(role, p) && (all || !p.approval)).map(propOut)];
+    return [200, props.filter((p) => propInScn(p) && propVisible(role, p) && (all || !p.approval)).map(propOut)];
   }
   if ((m = path.match(/^\/proposals\/([\w-]+)\/(approve|reject)$/)) && method === "POST") {
+    if (curScn) return err(400, "scenario_unsupported", "approve/reject only work on main");
     const p = props.find((x) => x.id === m![1]);
     if (!p || !propVisible(role, p)) return [404, { detail: "not found" }];
     if (p.approval) return err(422, "invalid_state", "proposal already decided");
@@ -184,7 +212,7 @@ export function route(method: string, path: string, q: URLSearchParams, body: Js
   }
   if (path === "/executions" && method === "GET") {
     const lim = Number(q.get("limit") ?? 100), name = q.get("name"), actor = q.get("actor"), status = q.get("status");
-    return [200, execs.filter((x) => execVisible(role, x) && (!name || x.name.includes(name)) && (!actor || x.actor.includes(actor)) && (!status || x.status === status || (status === "rolled_back" && x.rolled_back))).slice(0, lim).map(rowOf)];
+    return [200, execs.filter((x) => inScn(x) && execVisible(role, x) && (!name || x.name.includes(name)) && (!actor || x.actor.includes(actor)) && (!status || x.status === status || (status === "rolled_back" && x.rolled_back))).slice(0, lim).map(rowOf)];
   }
   if ((m = path.match(/^\/executions\/([\w-]+)$/))) {
     const x = execs.find((e) => e.action_id === m![1]);
@@ -207,6 +235,7 @@ export function route(method: string, path: string, q: URLSearchParams, body: Js
     return [200, { action_id: rb.action_id, status: "executed", changed: rb.diff.length, webhooks: [] }];
   }
   if ((m = path.match(/^\/webhooks\/([\w-]+)\/retry$/)) && method === "POST") {
+    if (curScn) return err(400, "scenario_unsupported", "webhooks are not available inside a scenario");
     const o = outbox.find((x) => x.id === m![1]);
     const ex = o && execs.find((e) => e.action_id === o.action_id);
     if (!o || !ex || !execVisible(role, ex)) return [404, { detail: "not found" }];
@@ -218,13 +247,13 @@ export function route(method: string, path: string, q: URLSearchParams, body: Js
   }
   if (path === "/audit") {
     const kind = q.get("kind") ?? "execution", lim = Number(q.get("limit") ?? 100);
-    if (kind === "approval") return [200, props.filter((p) => p.approval && propVisible(role, p)).map((p) => ({ kind: "approval", id: p.approval!.id, at: p.approval!.decided_at, actor: p.approval!.approver, role: p.approval!.approver_role, name: p.action, status: p.approval!.decision, action_id: p.approval!.execution_id, proposal_id: p.id, summary: p.approval!.comment }))];
+    if (kind === "approval") return [200, props.filter((p) => propInScn(p) && p.approval && propVisible(role, p)).map((p) => ({ kind: "approval", id: p.approval!.id, at: p.approval!.decided_at, actor: p.approval!.approver, role: p.approval!.approver_role, name: p.action, status: p.approval!.decision, action_id: p.approval!.execution_id, proposal_id: p.id, summary: p.approval!.comment }))];
     if (kind === "webhook") return [200, outbox.filter((o) => { const ex = execs.find((e) => e.action_id === o.action_id); return ex && execVisible(role, ex); }).slice(0, lim).map((o) => {
       const l = o.deliveries[o.deliveries.length - 1], ex = execs.find((e) => e.action_id === o.action_id)!;
       return { kind: "webhook", id: o.id, at: l.at, actor: ex.actor, name: o.hook, status: l.status, action_id: o.action_id, summary: `${o.deliveries.length} attempt(s)${l.error ? `: ${l.error}` : ""}` };
     })];
-    if (kind === "proposal") return [200, props.filter((p) => propVisible(role, p)).map((p) => ({ kind: "proposal", id: p.id, at: p.created_at, actor: p.proposer, role: p.proposer_role, name: p.action, status: state(p), proposal_id: p.id, action_id: p.approval?.execution_id ?? null, summary: p.rationale }))];
-    return [200, execs.filter((x) => execVisible(role, x) && (kind === "rollback" ? !!x.parent_execution_id : !x.parent_execution_id)).slice(0, lim).map((x) => ({ kind: x.parent_execution_id ? "rollback" : "execution", id: x.action_id, action_id: x.action_id, at: x.recorded_at, actor: x.actor, role: x.role, name: x.name, status: x.status, summary: x.error ?? "" }))];
+    if (kind === "proposal") return [200, props.filter((p) => propInScn(p) && propVisible(role, p)).map((p) => ({ kind: "proposal", id: p.id, at: p.created_at, actor: p.proposer, role: p.proposer_role, name: p.action, status: state(p), proposal_id: p.id, action_id: p.approval?.execution_id ?? null, summary: p.rationale }))];
+    return [200, execs.filter((x) => inScn(x) && execVisible(role, x) && (kind === "rollback" ? !!x.parent_execution_id : !x.parent_execution_id)).slice(0, lim).map((x) => ({ kind: x.parent_execution_id ? "rollback" : "execution", id: x.action_id, action_id: x.action_id, at: x.recorded_at, actor: x.actor, role: x.role, name: x.name, status: x.status, summary: x.error ?? "" }))];
   }
   return [404, { detail: `mock: no route ${method} ${path}` }];
 }
@@ -233,10 +262,10 @@ function propose(name: string, params: Json, rationale: string, role: string, ok
   if (!roleMayExec(role, name)) { record({ name, actor: user(role), role, params, status: "denied", error: `role ${role} may not execute ${name}` }); return err(403, "permission_denied", `role ${role} may not propose ${name}`); }
   const r = W.apply(name, params);
   if ("notFound" in r && r.notFound) return [404, { detail: "not found" }];
-  let dry: any[] = [];
+  let dry: any = [];
   if ("fail" in r) { if (r.fail.length) return err(422, "criteria_failed", "criteria failed", { failures: r.fail.map((message) => ({ message })) }); }
-  else { dry = r.diff; r.undo(); }
-  const p: Prop = { id: gid("p"), action: name, params, proposer: user(role), proposer_role: role, rationale, dry_run: dry, created_at: W.nowIso(), approval: null };
+  else { dry = curScn ? { diff: r.diff, scenario_id: curScn, impact: impactNow() } : r.diff; r.undo(); }
+  const p: Prop = { id: gid("p"), scenario_id: curScn, action: name, params, proposer: user(role), proposer_role: role, rationale, dry_run: dry, created_at: W.nowIso(), approval: null };
   props.unshift(p);
   return okStatus === 201 ? [201, { proposal_id: p.id }] : [202, { proposal_id: p.id, status: "pending_approval" }];
 }

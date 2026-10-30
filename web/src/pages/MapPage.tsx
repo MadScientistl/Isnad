@@ -30,8 +30,12 @@ const toPts = (fc?: { features: GeoFeature[] }): Pt[] => (fc?.features ?? []).fi
   pos: f.geometry.coordinates, status: String(f.properties.status ?? "open"), origin: f.properties.origin, dest: f.properties.destination, props: f.properties,
 }));
 
-export default function MapPage() {
-  const { asOfQ, live } = useAsOf();
+export default function MapPage() { return <MapView />; }
+
+/** The map. `scn` forces main ("main") or a scenario id for this map's own requests; `changed` ids get a highlight ring (compare view). */
+export function MapView({ scn, changed, embedded, title }: { scn?: number | "main"; changed?: Set<string>; embedded?: boolean; title?: string } = {}) {
+  const { asOfQ, live: liveAsOf } = useAsOf();
+  const live = liveAsOf && !embedded;
   const el = useRef<HTMLDivElement>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
   const overlay = useRef<MapboxOverlay | null>(null);
@@ -41,14 +45,14 @@ export default function MapPage() {
   const [pulse, setPulse] = useState(0);
   const [tilesFailed, setTilesFailed] = useState(false);
   const poll = live ? 2500 : undefined;
-  const ports = usePolled(() => api.geo("Port", asOfQ), [asOfQ], poll);
-  const whs = usePolled(() => api.geo("Warehouse", asOfQ), [asOfQ], poll);
-  const ships = usePolled(() => api.geo("Shipment", asOfQ), [asOfQ], poll);
+  const ports = usePolled(() => api.geo("Port", asOfQ, scn), [asOfQ], poll);
+  const whs = usePolled(() => api.geo("Warehouse", asOfQ, scn), [asOfQ], poll);
+  const ships = usePolled(() => api.geo("Shipment", asOfQ, scn), [asOfQ], poll);
   const error = ports.error ?? whs.error ?? ships.error;
 
   useEffect(() => {
     if (!el.current) return;
-    const map = new maplibregl.Map({ container: el.current, style: OSM_STYLE, center: [30, 25], zoom: 2, attributionControl: { compact: true } });
+    const map = new maplibregl.Map({ container: el.current, style: OSM_STYLE, center: [30, 20], zoom: embedded ? 0.3 : 2, attributionControl: { compact: true } });
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
     const ov = new MapboxOverlay({ layers: [] });
     map.addControl(ov as unknown as maplibregl.IControl);
@@ -73,8 +77,11 @@ export default function MapPage() {
     const ov = overlay.current; if (!ov) return;
     const arcData = arcs === "off" ? [] : S.filter((s) => s.origin && s.dest && (arcs === "all" || (sel && sel.id === s.id)));
     const closed = P.filter((p) => p.status === "closed");
+    const hl = changed ? [...P, ...W, ...S].filter((p) => changed.has(p.id)) : [];
     ov.setProps({
       layers: [
+        new ScatterplotLayer<Pt>({ id: "changed", data: hl, getPosition: (d) => d.pos, stroked: true, filled: true, radiusUnits: "pixels", lineWidthUnits: "pixels", getRadius: 17, lineWidthMinPixels: 3,
+          getFillColor: [204, 31, 138, 50], getLineColor: [204, 31, 138, 255] }),
         new ArcLayer<Pt>({ id: "arcs", data: arcData, getSourcePosition: (d) => d.origin!, getTargetPosition: (d) => d.dest!, getWidth: (d) => (sel?.id === d.id ? 3 : 1.5),
           getSourceColor: (d) => (COL[d.status] ?? COL.planned).map((v, i) => (i === 3 ? 160 : v)) as RGBA, getTargetColor: (d) => (COL[d.status] ?? COL.planned).map((v, i) => (i === 3 ? 160 : v)) as RGBA, updateTriggers: { getWidth: sel?.id } }),
         new ScatterplotLayer<Pt>({ id: "pulse", data: closed, getPosition: (d) => d.pos, stroked: true, filled: false, radiusUnits: "pixels", lineWidthUnits: "pixels", lineWidthMinPixels: 2,
@@ -91,7 +98,7 @@ export default function MapPage() {
           getColor: [28, 32, 36, 255], outlineWidth: 3, outlineColor: [255, 255, 255, 230], fontSettings: { sdf: true }, getTextAnchor: "middle", getAlignmentBaseline: "top" }),
       ],
     });
-  }, [P, W, S, arcs, sel, pulse]);
+  }, [P, W, S, arcs, sel, pulse, changed]);
 
   const counts = useMemo(() => {
     const c: Record<string, number> = {};
@@ -100,7 +107,8 @@ export default function MapPage() {
   }, [ships.data]);
 
   return (
-    <div className="mappage">
+    <div className={`mappage${embedded ? " embedded" : ""}`}>
+      {title && <div className="maptitle">{title}</div>}
       <div className="mapcanvas" ref={el} aria-label="Map of ports, warehouses and shipments" />
       <div className="mapctl">
         <label><input type="checkbox" checked={showArrived} onChange={(e) => setShowArrived(e.target.checked)} /> Show arrived shipments</label>
@@ -109,7 +117,7 @@ export default function MapPage() {
         {error && <span className="err" style={{ margin: 0 }}>{error}</span>}
         {tilesFailed && <span className="warnbox" style={{ margin: 0 }}>Basemap tiles unavailable (offline?). Showing plain background.</span>}
       </div>
-      <div className="maplegend" aria-label="Legend">
+      {!embedded && <div className="maplegend" aria-label="Legend">
         <b>Legend</b>
         <span style={{ color: "#009E73" }}><i className="sw circle" /><span className="ink">Port, open</span></span>
         <span style={{ color: "#D55E00" }}><i className="sw diamond" /><span className="ink">Port, closed (pulsing ring)</span></span>
@@ -118,8 +126,8 @@ export default function MapPage() {
         <span style={{ color: "#E69F00" }}><i className="sw tri" /><span className="ink">Shipment delayed ({counts.delayed ?? 0})</span></span>
         <span style={{ color: "#8a94a6" }}><i className="sw tri" /><span className="ink">Shipment planned ({counts.planned ?? 0})</span></span>
         {showArrived && <span style={{ color: "#56B4E9" }}><i className="sw tri" /><span className="ink">Shipment arrived ({counts.arrived ?? 0})</span></span>}
-      </div>
-      {sel && <Panel sel={sel} asOf={asOfQ} onClose={() => setSel(null)} />}
+      </div>}
+      {sel && !embedded && <Panel sel={sel} asOf={asOfQ} onClose={() => setSel(null)} />}
     </div>
   );
 }

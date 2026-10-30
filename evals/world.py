@@ -17,12 +17,14 @@ Injected situations
   (b) invoice anomaly: Supplier 05 has an oversized invoice (INV-2304) and a duplicated one (INV-2303 twice).
   (c) risk history of SH-1001: delay 0 -> 6 h (day 3) -> 18 h (day 5), Rotterdam closed (day 6), so
       get_history / diff / as_of can answer "why did risk rise?".
+  (d) INV-2305 (Supplier 00) was flagged by the system as "missing approval": no approver signed it off.
   Plus a port_notice Event whose note contains prompt-injection text (data, never instructions).
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -65,6 +67,7 @@ SHIPMENTS = [  # ref, via, to, cargo_value
 INVOICES = [  # ref, amount, supplier index
     ("INV-2301", 1000.0, 5), ("INV-2302", 1100.0, 5), ("INV-2303", 1050.0, 5), ("INV-2303", 1050.0, 5),
     ("INV-2304", 9400.0, 5), ("INV-1101", 500.0, 0), ("INV-1102", 520.0, 0),
+    ("INV-2305", 510.0, 0),   # flagged below as "missing approval" (the sim's missing_approval anomaly)
 ]
 
 
@@ -116,6 +119,21 @@ class World:
 
 
 def build_world(seed_: int = 1, *, pipeline: bool = True) -> World:
+    """Deterministic world; retries when another process applies the shared governance DDL at the same moment
+    (Postgres "tuple concurrently updated" on REVOKE/GRANT), which happens when several test runs share the database."""
+    last = None
+    for attempt in range(5):
+        try:
+            return _build_world(seed_, pipeline=pipeline)
+        except psycopg.errors.InternalError_ as e:
+            if "concurrently updated" not in str(e):
+                raise
+            last = e
+            time.sleep(0.5 * (attempt + 1))
+    raise last
+
+
+def _build_world(seed_: int = 1, *, pipeline: bool = True) -> World:
     schema = f"ev_{uuid.uuid4().hex[:10]}"
     admin = psycopg.connect(get_dsn(), autocommit=True)
     admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
@@ -157,6 +175,8 @@ def build_world(seed_: int = 1, *, pipeline: bool = True) -> World:
                 valid_at=D(5), source="sim", run_id="world")
         execute(c, "delay_shipment", {"shipment": w.ids["shipment"]["SH-1002"], "delay_hours": 2.0,
                                       "reason": "documentation"}, SIM, valid_at=D(4), source="sim", run_id="world")
+        execute(c, "flag_invoice", {"invoice": w.ids["invoice"]["INV-2305"], "anomaly": "missing approval"}, SIM,
+                valid_at=D(3), source="sim", run_id="world")
         res = execute(c, "close_port", {"port": port["Rotterdam"], "reason": "strike", "duration_h": 120.0}, SIM,
                       valid_at=D(6), source="sim", run_id="world")
         w.ids["closure_event"] = res.created["Event"]

@@ -3,6 +3,7 @@ import { api, isNotFound, type Proposal } from "../api";
 import { agentApi, applyEvent, emptyTranscript, money, startError, streamRun, type AgentConfig, type Run, type Transcript } from "../agent";
 import { fmtT, usePolled, useApp } from "../store";
 import TranscriptView, { StatusChip } from "../Transcript";
+import { compareHref } from "../scenarios";
 
 const EXAMPLES: Record<string, string[]> = {
   planner: ["Which shipments are exposed if the closed port stays closed? Propose a reroute or delay where it is justified.", "Which open events could affect shipments in transit?"],
@@ -153,6 +154,8 @@ function Detail({ id }: { id: string }) {
   useEffect(() => { const g = ++gen.current; api.proposals("all").then((p) => g === gen.current && setProps(p), () => {}); }, [t.proposals, run?.status]);
   const execFor = (pid: string) => props.find((p) => p.id === pid)?.approval?.execution_id;
   const stateOf = (pid: string) => props.find((p) => p.id === pid)?.state ?? props.find((p) => p.id === pid)?.approval?.decision;
+  const scnIds = [...new Set<number>([...(run?.scenario_ids ?? []), ...(run?.scenario_id ? [run.scenario_id] : []),
+    ...t.items.flatMap((it) => (it.type === "call" && it.name === "scenario_open" && (it.result?.data as any)?.scenario_id ? [Number((it.result!.data as any).scenario_id)] : []))])];
   if (q.error && isNotFound(new Error(q.error))) return <div className="page"><div className="err">Run not found.</div><a className="lnk" href="#/agent/runs">Back to history</a></div>;
   return (
     <div className="page agentpage">
@@ -162,6 +165,8 @@ function Detail({ id }: { id: string }) {
         <div className="card">
           <p><StatusChip s={run.status} /> started {fmtT(run.started_at)} by {run.user} as {run.role} · model {run.model}</p>
           <p><b>Prompt:</b> {run.prompt}</p>
+          {scnIds.length > 0 && <p><b>Scenario:</b> {scnIds.map((id) => <span key={id} style={{ marginRight: 10 }}><span className="chip scn">#{id}</span> <a className="lnk" href={compareHref(id)}>compare with main</a> <a className="lnk" href="#/scenarios">scenarios</a></span>)}
+            <span className="muted small"> The agent worked inside this sandbox; main is only changed through approved proposals.</span></p>}
           {run.summary && <p><b>Summary:</b> {run.summary}</p>}
           {run.cap && <p className="muted">Stopped by cap: {run.cap}</p>}
           {run.error && <div className="err">{run.error}</div>}

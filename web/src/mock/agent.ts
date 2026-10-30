@@ -6,15 +6,16 @@
  */
 import { ACTION_META } from "@sdk/client";
 import { addAgentProposal, proposalRef } from "./gov";
+import { agentApply, agentCompare, agentOpen, agentProposalEvidence } from "./scenarios";
 
 type Json = Record<string, any>;
 interface Ev { seq: number; kind: string; payload: Json; tokens_in: number; tokens_out: number; cost_usd: number; at: string }
 interface MRun { id: string; role: string; user: string; prompt: string; model: string; caps: Json; started_at: string; status: string; summary: string | null; cap: string | null; error: string | null;
-  tokens_in: number; tokens_out: number; cost_usd: number; turns: number; tool_calls: number; proposals: number; proposal_ids: string[]; events: Ev[]; subs: Set<(e: Ev | null) => void>; timers: number[]; seq: number }
+  tokens_in: number; tokens_out: number; cost_usd: number; turns: number; tool_calls: number; proposals: number; proposal_ids: string[]; scenario_id?: number | null; events: Ev[]; subs: Set<(e: Ev | null) => void>; timers: number[]; seq: number }
 
 const CAPS = { max_turns: 8, max_tool_calls: 24, max_output_tokens: 6000, max_cost_usd: 0.5, max_wall_s: 120 };
 const LIMITS = { max_concurrent: 1, runs_per_minute: 6, daily_usd: 5, max_global: 4, prompt_max_chars: 4000 };
-const TOOLS = ["query_objects", "traverse", "find_paths", "impact_analysis", "get_history", "as_of", "diff", "run_function", "propose_action"];
+const TOOLS = ["query_objects", "traverse", "find_paths", "impact_analysis", "get_history", "as_of", "diff", "run_function", "propose_action", "scenario_open", "scenario_apply", "scenario_simulate", "scenario_compare"];
 const ALLOW: Record<string, string[]> = {
   planner: ["delay_shipment", "reroute_shipment", "close_port"], finance_analyst: ["flag_invoice", "pay_invoice"],
   regional_ops_lead: ["close_port", "reopen_port"], admin: ["flag_invoice", "delay_shipment", "close_port", "reopen_port", "reroute_shipment"],
@@ -48,10 +49,16 @@ const denied = (id: string, name: string, input: Json, kind: string, reason: str
   { wait: 250, fn: (r) => { r.tool_calls++; emit(r, "tool_call", { tool_call_id: id, name, input, flags: [] }); } },
   { wait: 300, fn: (r) => emit(r, "denied", { tool_call_id: id, name, kind, reason }) },
 ];
+/** A tool call whose result is computed when it runs (scenario tools create real mock scenarios). */
+const dyn = (id: string, name: string, input: Json, make: (r: MRun) => Json): Step[] => [
+  { wait: 250, fn: (r) => { r.tool_calls++; emit(r, "tool_call", { tool_call_id: id, name, input, flags: [] }); } },
+  { wait: 500, fn: (r) => { let data: Json; let ok = true; try { data = make(r); } catch (e) { ok = false; data = { error: String(e) }; } emit(r, "tool_result", { tool_call_id: id, name, ok, result: { ok, untrusted: true, truncated: false, data }, flags: [] }); } },
+];
 const propose = (id: string, action: string, params: Json, rationale: string, evidence: Json[]): Step[] => [
   ...call(id, "propose_action", { action, params, rationale }, { ok: true, data: { status: "pending_approval" } }),
   { wait: 200, fn: (r) => {
-    const p = addAgentProposal(r.role, action, params, rationale, evidence, r.id);
+    const sid = r.scenario_id ?? 0;
+    const p = addAgentProposal(r.role, action, params, rationale, evidence, r.id, 60, undefined, sid, sid ? agentProposalEvidence(sid, r.role, action, params) : undefined);
     r.proposals++; r.proposal_ids.push(p.id);
     emit(r, "proposal", { tool_call_id: id, proposal_id: p.id, action, params, expires_at: p.expires_at });
   } },
@@ -65,11 +72,15 @@ function script(role: string, prompt: string): Step[] {
     ...say(2, "One shipment ships via the affected port. Checking downstream impact and trying the invoices as well.", ["tc_2", "tc_3"]),
     ...call("tc_2", "impact_analysis", { start: PORT, depth: 3 }, { data: { impacted: 5, by_type: { Shipment: 3, Warehouse: 2 } }, truncated: true, provenance: { asserted: [`Port/${PORT.slice(0, 8)}`], inferred: [{ edge: "Supplier supplies Warehouse", rule: "supplies-transitive", support: ["e1", "e2"] }] } }),
     ...denied("tc_3", "query_objects", { type: "Invoice", limit: 5 }, "permission", "role planner cannot read type Invoice"),
-    ...say(3, "Invoices are not visible to my role, which is fine. The port has an open storm event, so I will propose closing it for 24 hours and let an approver decide.", ["tc_4"]),
+    ...say(3, "Invoices are not visible to my role, which is fine. Before proposing a closure I will test it in a sandbox scenario and compare the KPIs with main.", ["tc_s1"]),
+    ...dyn("tc_s1", "scenario_open", { name: "Rotterdam closure what-if" }, (r) => { r.scenario_id = agentOpen(r.role, r.id, "Agent: Rotterdam closure what-if"); return { scenario_id: r.scenario_id }; }),
+    ...dyn("tc_s2", "scenario_apply", { action: "close_port", params: { port: PORT, reason: "storm", duration_h: 24 } }, (r) => agentApply(r.scenario_id!, r.role, "close_port", { port: PORT, reason: "storm", duration_h: 24 })),
+    ...dyn("tc_s3", "scenario_compare", {}, (r) => agentCompare(r.scenario_id!, r.role)),
+    ...say(4, "The sandbox shows the closure raises value at risk, but the port has an open storm event, so I will propose closing it for 24 hours and let an approver decide.", ["tc_4"]),
     ...propose("tc_4", "close_port", { port: PORT, reason: "storm", duration_h: 24 }, "Open storm event at the port; one in-transit shipment and two warehouses are exposed.", [
       { ref: `Port/${PORT.slice(0, 8)}`, claim: "Open storm event affects this port", kind: "asserted", tool_call_id: "tc_1" },
       { ref: "Supplier supplies Warehouse", claim: "Two warehouses are exposed through the supply chain", kind: "inferred", tool_call_id: "tc_2" }]),
-    ...say(4, "I proposed close_port for approval. One shipment (SHP-0003) is exposed; invoices were out of scope for my role."),
+    ...say(5, "I proposed close_port for approval. One shipment (SHP-0003) is exposed; invoices were out of scope for my role."),
     ...fin("Proposed closing the port; 1 shipment at risk."),
   ];
   if (role === "finance_analyst") return [

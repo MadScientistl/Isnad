@@ -180,11 +180,13 @@ def test_link_outbox(conn):
 
 
 def test_scenario_isolation(conn):
+    from engine.db import scenario_admin
     i = uuid.uuid4()
     put(conn, i, "A", T(2020))
-    put(conn, i, "Sim", T(2020), scenario_id=1)
+    sid = scenario_admin.create_base(conn, name="t", owner_user="u", owner_role="planner")["id"]
+    put(conn, i, "Sim", T(2020), scenario_id=sid)
     assert bt.get_object(conn, "Supplier", i)["name"] == "A"
-    assert bt.get_object(conn, "Supplier", i, scenario_id=1)["name"] == "Sim"
+    assert bt.get_object(conn, "Supplier", i, scenario_id=sid)["name"] == "Sim"
 
 
 def test_bulk_load(conn):

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { compareHref, KPI_META, deltaCls, fmtDelta, fmtKpi } from "./scenarios";
 import { type CallItem, type Transcript, type Item, type Provenance } from "./agent";
 
 /** Everything here renders agent/tool text as plain text: no HTML, no markdown, no auto-links. */
@@ -16,6 +17,21 @@ function Prov({ p }: { p?: Provenance }) {
   );
 }
 
+/** Friendly summary for the scenario tools (open/apply/simulate/compare). Data is untrusted: rendered as text only. */
+function ScnSummary({ c }: { c: CallItem }) {
+  const d: any = c.result?.data, inp: any = c.input;
+  if (!c.result?.ok) return null;
+  if (c.name === "scenario_open" && d?.scenario_id) return <div className="scnsum">Forked scenario <b>#{String(d.scenario_id)}</b>{inp?.name ? ` "${String(inp.name)}"` : ""} <a className="lnk" href={compareHref(Number(d.scenario_id))}>compare with main</a></div>;
+  if (c.name === "scenario_apply") return <div className="scnsum">Applied <b>{String(inp?.action ?? "")}</b> inside the scenario only. Main was not touched.</div>;
+  if (c.name === "scenario_simulate") return <div className="scnsum">Simulated {String(inp?.days ?? "?")} day(s){Array.isArray(inp?.injections) ? ` with ${inp.injections.length} injection(s)` : ""}{d?.digest ? <>; digest <code className="ref">{String(d.digest).slice(0, 12)}</code></> : null}</div>;
+  if (c.name === "scenario_compare" && d?.kpis) {
+    const k = d.kpis, m = k.main ?? {}, sc = k.scenario ?? {}, de = k.delta ?? {};
+    return <table className="diff impact"><thead><tr><th>KPI</th><th>Main</th><th>Scenario</th><th>Delta</th></tr></thead><tbody>
+      {KPI_META.filter((x) => x.k in m || x.k in sc).map((x) => { const dv = Number(de[x.k] ?? (sc[x.k] ?? 0) - (m[x.k] ?? 0)); return <tr key={x.k}><td>{x.label}</td><td>{fmtKpi(m[x.k], x.fmt)}</td><td>{fmtKpi(sc[x.k], x.fmt)}</td><td className={`delta ${deltaCls(dv, x.good)}`}>{fmtDelta(dv, x.fmt)}</td></tr>; })}</tbody></table>;
+  }
+  return null;
+}
+
 function Call({ c }: { c: CallItem }) {
   const [open, setOpen] = useState(!!c.denied);
   const state = c.denied ? "denied" : c.result ? (c.result.ok ? "ok" : "failed") : "running";
@@ -23,11 +39,12 @@ function Call({ c }: { c: CallItem }) {
   return (
     <div className={`call ${c.denied ? "denied" : state === "failed" ? "failed" : ""}`}>
       <button className="callhead" aria-expanded={open} onClick={() => setOpen(!open)}>
-        <span className="caret" aria-hidden>{open ? "▾" : "▸"}</span> <b>{c.name}</b>
+        <span className="caret" aria-hidden>{open ? "▾" : "▸"}</span> <b>{c.name}</b>{c.name.startsWith("scenario_") && <span className="chip scn">scenario</span>}
         <span className={`chip ${state === "ok" ? "ok" : state === "running" ? "info" : "bad"}`}>{state}</span>
         {c.result?.truncated && <span className="chip warn">truncated</span>}
         {flags.length > 0 && <span className="chip warn" title={flags.join(", ")}>⚠ injection flag: {flags.join(", ")}</span>}
       </button>
+      {c.name.startsWith("scenario_") && <ScnSummary c={c} />}
       {c.denied && <div className="err" role="alert"><b>Denied ({c.denied.kind}):</b> {c.denied.reason}</div>}
       {open && (
         <div className="callbody">

@@ -89,6 +89,7 @@ export interface ShipmentProps {
   progress?: number;
   cargo_value?: number;
   delay_hours?: number;
+  extra_cost?: number;
 }
 
 export interface Shipment extends ShipmentProps {
@@ -102,6 +103,7 @@ export interface Shipment extends ShipmentProps {
 export interface SupplierProps {
   name: string;
   country?: string;
+  price_index?: number;
 }
 
 export interface Supplier extends SupplierProps {

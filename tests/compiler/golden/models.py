@@ -85,11 +85,13 @@ class Shipment(BaseModel):
     progress: Optional[float] = None
     cargo_value: Optional[float] = None
     delay_hours: Optional[float] = None
+    extra_cost: Optional[float] = None
 
 class Supplier(BaseModel):
     id: UUID
     name: str
     country: Optional[str] = None
+    price_index: Optional[float] = None
 
 class Warehouse(BaseModel):
     id: UUID
