@@ -94,6 +94,7 @@ class Entry:
     buf: list = field(default_factory=list)
     done: bool = False
     thread: threading.Thread | None = None
+    streams: int = 0          # open SSE connections (each holds a worker thread)
 
     def push(self, ev: dict) -> None:
         with self.cond:
@@ -121,6 +122,9 @@ def _env_num(name: str, default, cast):
         return cast(os.environ.get(name, default))
     except (TypeError, ValueError):
         return default
+
+
+MAX_STREAMS_PER_RUN = 4
 
 
 def limits() -> dict:
@@ -371,9 +375,24 @@ def mount(app, *, comp, get_principal, connect_fn, get_pipeline, model_factory=N
             except ValueError:
                 a = 0
         entry = reg.runs.get(rid)             # take the live handle BEFORE reading stored events
+        if entry is not None and not entry.done:
+            with entry.cond:
+                if entry.streams >= MAX_STREAMS_PER_RUN:
+                    return _err(429, "rate_limited", "too many open streams for this run", retry_after=2)
+                entry.streams += 1
+        else:
+            entry = None
         stored = fetch_events(p, rid, a)
 
         def gen():
+            try:
+                yield from gen2()
+            finally:
+                if entry is not None:
+                    with entry.cond:
+                        entry.streams -= 1
+
+        def gen2():
             last = a
             for ev in stored:
                 yield frame(ev)

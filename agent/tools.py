@@ -545,7 +545,11 @@ def propose_action(ctx, conn, a: ProposeIn, call_id) -> Result:
     for k, s in specs.items():
         v = a.params.get(k)
         if s.base == "uuid" and v is not None:
-            if str(v).lower() not in ctx.seen_ids:
+            try:
+                canon = str(UUID(str(v)))
+            except ValueError:
+                raise ToolError(f"param {k!r}: not a valid uuid") from None
+            if canon not in ctx.seen_ids:
                 raise ToolError(f"param {k!r}: this id was not retrieved by this run; look the object up first "
                                 "(ids cannot be invented, and optional id params must be omitted)")
     key = hashlib.sha256(json.dumps([ctx.run_id, a.action, _canon(a.params)], sort_keys=True,
@@ -642,16 +646,18 @@ def _shrink(data):
     return {"note": "result too large; narrow the query"}, True
 
 
-_REF_RE = re.compile(r"^[A-Za-z_]+:[0-9a-fA-F-]{36}(>[0-9a-fA-F-]{36})?$")
+_U = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+_REF_RE = re.compile(rf"[A-Za-z_]+:{_U}(>{_U})?")
 
 
 def _walk_refs(x, out):
     """Facts = dicts whose "ref" has the canonical form (property values named "ref" are not facts)."""
     if isinstance(x, dict):
-        if isinstance(x.get("ref"), str) and _REF_RE.match(x["ref"]):
+        if isinstance(x.get("ref"), str) and _REF_RE.fullmatch(x["ref"]):
             out.append(x)
-        for v in x.values():
-            _walk_refs(v, out)
+        for k, v in x.items():
+            if k != "props":   # property values are data, never facts (a property may be named "ref")
+                _walk_refs(v, out)
     elif isinstance(x, list):
         for v in x:
             _walk_refs(v, out)

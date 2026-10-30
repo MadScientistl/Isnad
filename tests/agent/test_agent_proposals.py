@@ -7,7 +7,7 @@ import pytest
 from agent import MemorySink, Turn
 from agent import tools as T
 from agent_helpers import T0, ctx_for, results, run_agent, tu
-from conftest import INJECTION
+from agent_helpers import INJECTION
 from engine.db import bitemporal as bt
 from engine.db.principal import OWNER, scoped
 

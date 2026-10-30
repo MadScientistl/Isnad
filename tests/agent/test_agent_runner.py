@@ -179,3 +179,9 @@ def test_sink_failure_ends_run_as_error(world, factory):
             raise OSError("disk full")
     res, *_ = run_agent("planner", factory, [Turn(text="hi")], sink=Boom())
     assert res.status == "error" and "OSError" in res.error
+
+
+def test_failed_model_call_is_charged_an_estimate(world, factory):
+    res, sink, *_ = run_agent("planner", factory, [Turn(tool_uses=[Q("a")])])   # 2nd call fails
+    assert res.status == "error" and sink.events[-1]["kind"] == "finished"
+    assert sink.events[-1]["cost_usd"] > 0

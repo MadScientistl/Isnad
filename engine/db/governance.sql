@@ -218,7 +218,18 @@ CREATE POLICY ins_known ON agent_run        FOR INSERT TO amarh_app WITH CHECK (
     AND role = current_setting('amarh.role', true));
 CREATE POLICY ins_known ON agent_run_event  FOR INSERT TO amarh_app WITH CHECK (
     coalesce(current_setting('amarh.role', true), '') <> ''
-    AND EXISTS (SELECT 1 FROM agent_run r WHERE r.id = agent_run_event.run_id));
+    AND EXISTS (SELECT 1 FROM agent_run r WHERE r.id = agent_run_event.run_id
+                AND r."user" = current_setting('amarh.user', true)));
+-- a run is closed by its "finished" event: nothing can be appended after it (definer: must see all events)
+CREATE OR REPLACE FUNCTION amarh_run_open() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM agent_run_event f WHERE f.run_id = NEW.run_id AND f.kind = 'finished') THEN
+        RAISE EXCEPTION 'agent run % is already finished', NEW.run_id USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+    RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS amarh_run_open ON agent_run_event;
+CREATE TRIGGER amarh_run_open BEFORE INSERT ON agent_run_event FOR EACH ROW EXECUTE FUNCTION amarh_run_open();
 CREATE POLICY sel ON agent_run FOR SELECT TO amarh_app USING (
     current_setting('amarh.role', true) = 'admin'
  OR (coalesce(current_setting('amarh.role', true), '') <> '' AND "user" = current_setting('amarh.user', true)));

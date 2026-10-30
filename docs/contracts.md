@@ -178,3 +178,17 @@ Effective agent permissions = user RLS (reads) AND role.actions AND agent.allowl
 
 ## Tool result envelope
 `{"ok": bool, "data": <masked, truncated>, "untrusted": true, "provenance": {"asserted": [..], "inferred": [{edge, rule, support}]}, "truncated": bool}`. Caps: query_objects limit 50; traverse depth 3, fan-out 25, nodes 100; find_paths hops 4, paths 10.
+
+## Known limitations after Phase 4 review
+Read-only security review of `agent/`, `agent_routes`, `decide` and the agent tables found no blocker: the model cannot change role, user, schema or approver set, cannot execute anything (only create a pending proposal), and cannot read what the launching human cannot. Fixed after review: property values named `ref` no longer register as facts, refs and uuid params use strict full-match and canonical UUID parsing (M3); stale detection also fails when an object or link existed at approval but was not in the proposal's snapshot (M4); a failed model call is charged an estimate against the daily budget (M6); no event can be appended to a finished run or to another user's run (trigger `amarh_run_open` + insert policy); DB/network errors are reduced to their class name in `finished.error`; at most 4 open SSE streams per live run (429). Remaining, accepted for now:
+1. **P4/D3 are only as strong as `x-role`.** One user per role (`demo-<role>`): whoever launched a planner run can send `x-role: admin` and approve it. The launcher ban holds at engine level (tests) but not against a header switch; it needs real auth. The admin agent's proposals (`on_behalf_of` demo-admin, approvers `[admin]`) cannot be approved by anyone.
+2. Admin can read every run, prompt and transcript (by design).
+3. Evidence is bound to refs the run retrieved, not to the truth of the claim; the UI shows claims as the agent's, unverified.
+4. Stale detection covers the keys in the dry-run diff; volatile props (`position`, `progress`) are ignored by design (TODO: move to YAML).
+5. Run registry, concurrency, global limit and cancel are in-process (one uvicorn worker). Per-minute and daily limits are DB-backed. Distinct `x-role` values are distinct users, so an anonymous client gets one budget per role; no global daily cap.
+6. `rationale`, `evidence.claim` and `dry_run` are written from the launcher's view and are not filtered by the approver's visibility; harmless while the only approver is admin.
+7. No retention or pagination for `agent_run_event`; `GET /agent/runs/{id}` returns all events. SSE and read routes have no rate limit beyond the per-run stream cap (not load-tested).
+8. Idempotent re-propose returns the existing proposal id with `pending_approval` even if it was since decided or expired (same run only).
+9. The injection scanner is regex-only telemetry; the defence is structural (low-privilege tools, intersection permissions, human approval).
+10. No live Claude API call has been made (no key in this environment): `AnthropicModel` is tested against a stub only. Mock evals prove platform enforcement and plumbing, not model judgement.
+11. Phase 3 limitations still hold (identity GUCs trusted inside a scoped session, view-level masking).

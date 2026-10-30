@@ -14,6 +14,8 @@ import queue
 import threading
 from dataclasses import dataclass, field
 
+import psycopg
+
 from .audit import MemorySink
 from .policy import allowed_tools
 from .pricing import cost_usd
@@ -63,6 +65,7 @@ class AgentRun:
         self._on_event = None
         self.tokens_in = self.tokens_out = 0
         self.cost = 0.0
+        self._unbilled = 0.0   # estimated spend of a model call that failed before reporting usage
 
     # ---- events
     def _emit(self, kind, payload, **usage):
@@ -108,10 +111,14 @@ class AgentRun:
                 cap = self._cap()
                 if cap:
                     status = "capped"; break
+                max_tok = max(1, min(PER_CALL_MAX_TOKENS, ctx.caps.max_output_tokens - self.tokens_out))
+                # worst case if this call dies mid-flight: it is still billed upstream but reports no usage
+                self._unbilled = cost_usd(self.model.name, {
+                    "input_tokens": len(json.dumps(messages, default=str)) // 3, "output_tokens": max_tok})
                 t = self.model.complete(
                     system=self.system, messages=messages, tools=schemas,
-                    max_tokens=max(1, min(PER_CALL_MAX_TOKENS, ctx.caps.max_output_tokens - self.tokens_out)),
-                    on_text=self._delta, timeout=max(1.0, ctx.remaining_s()))
+                    max_tokens=max_tok, on_text=self._delta, timeout=max(1.0, ctx.remaining_s()))
+                self._unbilled = 0.0
                 res.turns = turn_no
                 tc = cost_usd(self.model.name, t.usage)
                 self.tokens_in += sum(t.usage.get(k, 0) for k in (
@@ -149,7 +156,10 @@ class AgentRun:
                 status, cap = "capped", "turns"
             res.status, res.cap = status, cap
         except Exception as e:  # noqa: BLE001 - model/sink failure: end the run, never crash the caller
-            res.status, res.error = "error", f"{type(e).__name__}: {str(e)[:300]}"
+            res.status = "error"
+            # database/network errors can carry host, user or SQL: keep only the class name
+            res.error = (f"internal_error: {type(e).__name__}" if isinstance(e, (psycopg.Error, OSError))
+                         else f"{type(e).__name__}: {str(e)[:300]}")
         res.tool_calls, res.tokens_in, res.tokens_out, res.cost_usd = ctx.tool_calls, self.tokens_in, self.tokens_out, round(self.cost, 6)
         if res.status == "completed":
             res.summary = last_text
@@ -160,7 +170,7 @@ class AgentRun:
         try:
             self._emit("finished", {"status": res.status, "summary": res.summary[:4000], "turns": res.turns,
                                     "tool_calls": res.tool_calls, "proposals": res.proposals, "cap": res.cap,
-                                    "error": res.error}, tokens_in=0, tokens_out=0, cost_usd=0.0)
+                                    "error": res.error}, tokens_in=0, tokens_out=0, cost_usd=self._unbilled)
         except Exception as e:  # noqa: BLE001
             res.error = res.error or f"audit sink failed: {type(e).__name__}"
             res.status = "error"

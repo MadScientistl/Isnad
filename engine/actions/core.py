@@ -844,7 +844,10 @@ def _stale_keys(base, diff) -> list[str]:
         return []
     now = {f"{d['kind']}:{d['type']}:{d['key']}": _stable(json.loads(json.dumps(d["before"], default=str)))
            for d in diff}
-    return sorted(k for k, b in base.items() if now.get(k, "<missing>") != b)
+    changed = {k for k, b in base.items() if now.get(k, "<missing>") != b}
+    # something that already existed at approval but was not part of the proposal (e.g. a link added since)
+    changed |= {k for k, v in now.items() if k not in base and v is not None}
+    return sorted(changed)
 
 
 def _guarded_decide(conn, model, pr, proposal_id, vt0, source, tool_trace, fn, ctx_name):
