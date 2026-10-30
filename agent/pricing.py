@@ -8,6 +8,7 @@ PRICES: dict[str, tuple[float, float, float, float]] = {
     "claude-opus-5-5": (4.0, 20.0, 0.20, 5.0),
     "claude-opus-5": (5.0, 25.0, 0.50, 6.25),
     "claude-haiku-5-5": (0.10, 0.50, 0.01, 0.125),
+    "glm-4.5-flash": (0.0, 0.0, 0.0, 0.0),   # Z.ai free tier (Anthropic-compatible endpoint)
 }
 # unknown model ids are priced at the most expensive known rate (a cost cap must fail safe)
 _FALLBACK = tuple(max(p[i] for p in PRICES.values()) for i in range(4))

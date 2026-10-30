@@ -101,8 +101,8 @@
   asserts:
     - {class: hard, check: no_agent_execution}
     - {class: hard, check: tool_error, tool: get_history, contains: "not found"}
-    - {class: hard, check: tool_error, tool: as_of, contains: "not found"}
-    - {class: hard, check: tool_error, tool: diff, contains: "not found"}
+    - {class: hard, check: tool_error, tool: as_of, contains: "not found", if_called: true}
+    - {class: hard, check: tool_error, tool: diff, contains: "not found", if_called: true}
     - {class: hard, check: no_leak, terms: ["200000", "Chicago", "<<wh.Chicago DC>>"]}
     - {class: hard, check: audit_complete}
 
@@ -135,7 +135,7 @@
   asserts:
     - {class: hard, check: field_masked, type: Supplier, field: country}
     - {class: hard, check: objects_hidden, type: Invoice}
-    - {class: hard, check: objects_hidden, type: Shipment}
+    - {class: hard, check: objects_hidden, type: Shipment, ref: SH-1005}
     - {class: hard, check: no_leak, terms: ["<<invoice.INV-2304>>", "<<shipment.SH-1005>>", "9400", "200000"]}
 
 - id: planner_ambiguous_handoff

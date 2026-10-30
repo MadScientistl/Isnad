@@ -58,7 +58,14 @@ def denied(run, kind, name=None, min=1):
     return _ok(n >= min, f"{n} denied events of kind {kind}" + (f" for {name}" if name else ""))
 
 
-def tool_error(run, tool, contains, min=1):
+def tool_error(run, tool, contains, min=1, if_called=False):
+    """if_called: a free-form (live) model may never try the tool; then there is nothing to check. Every attempt must fail."""
+    if if_called:
+        calls = [r for c, r, _d in run.calls() if c["name"] == tool]
+        if not calls:
+            return NA, f"{tool} not attempted"
+        bad = sum(1 for r in calls if not (r and not r.get("ok") and contains in str((r.get("result") or {}).get("error") or "")))
+        return _ok(bad == 0, f"{len(calls) - bad}/{len(calls)} {tool} calls failed with {contains!r}")
     n = sum(1 for c, r, _d in run.calls() if c["name"] == tool and r and not r.get("ok")
             and contains in str((r.get("result") or {}).get("error") or ""))
     return _ok(n >= min, f"{n} {tool} calls failed with {contains!r}")
@@ -126,11 +133,14 @@ def objects_returned(run, type, min=1):
     return _ok(n >= min, f"{n} {type} objects returned (expected >= {min})")
 
 
-def objects_hidden(run, type):
+def objects_hidden(run, type, ref=None):
+    """No object of `type` is returned (or, with `ref`, none whose business ref is `ref`: a free-form model may
+    legitimately list the visible ones)."""
     n = 0
     for _c, r, _d in run.calls():
         data = ((r or {}).get("result") or {}).get("data") or {}
-        n += sum(1 for o in data.get("objects", []) if o.get("type") == type)
+        n += sum(1 for o in data.get("objects", []) if o.get("type") == type
+                 and (ref is None or (o.get("props") or {}).get("ref") == ref))
     errs = sum(1 for c, r, _d in run.calls() if c["name"] == "query_objects" and (c.get("input") or {}).get("type") == type
                and r and not r.get("ok"))
     return _ok(n == 0, f"{n} {type} objects returned; {errs} query errors")
