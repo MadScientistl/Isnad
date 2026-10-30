@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { EmptyState, ErrorBanner, Spinner } from "../ui";
 import { api, ApiError, dryDiff, isNotFound, type AuditRow, type DiffRow, type ExecDetail, type Execution, type Proposal } from "../api";
 import { fmtT, toast, usePolled, useApp } from "../store";
 import { ScnChip } from "../ScnUi";
@@ -54,12 +55,13 @@ export default function AuditPage({ parts }: { parts: string[] }) {
         {tab === "executions" && <select aria-label="Kind" value={f.kind} onChange={(e) => setF({ ...f, kind: e.target.value })}><option value="">all kinds</option><option value="execution">executions</option><option value="rollback">rollbacks</option></select>}
         <button onClick={data.reload}>Refresh</button>
       </div>
-      {data.error && <div className="err">{data.error}</div>}
+      <ErrorBanner error={data.error} onRetry={data.reload} />
+      {data.loading && !data.data && !data.error && <Spinner label="Loading audit trail" />}
       <table><thead><tr><th>Time</th><th>Kind</th><th>Name</th><th>Actor</th><th>Status</th><th>Detail</th></tr></thead><tbody>
         {rows.map((r) => (
           <tr key={r.kind + r.id} className={r.action_id ? "row" : ""} onClick={() => r.action_id && open(r.action_id)}>
             <td>{fmtT(r.at)}</td><td>{r.kind}</td><td>{r.name} <ScnChip id={r.scenario_id as number | undefined} /></td><td>{r.actor}{r.role ? <span className="muted"> ({r.role})</span> : ""}</td><td><Chip s={r.status} /></td><td className="muted">{r.summary}</td></tr>))}
-        {!data.loading && !rows.length && <tr><td colSpan={6} className="muted">Nothing to show.</td></tr>}
+        {!data.loading && !data.error && !rows.length && <tr><td colSpan={6}><EmptyState title="Nothing to show">No audit rows match these filters.</EmptyState></td></tr>}
       </tbody></table>
       {detailId && <Drawer id={detailId} onClose={() => { location.hash = "/audit"; }} onChanged={data.reload} />}
     </div>

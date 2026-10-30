@@ -6,7 +6,9 @@ const SPEEDS: { v: Speed; l: string }[] = [{ v: "paused", l: "Paused" }, { v: "1
 const H = 3600000;
 
 export default function TimeBar() {
-  const { sim, simError, setSim, asOf, setAsOf, scenario } = useApp();
+  const { sim, simError, setSim, asOf, setAsOf, scenario, simAvailable } = useApp();
+  const noSim = simAvailable === false;
+  const [nowMs] = useState(() => Date.now());
   const lock = scenario !== null;
   const lockTip = lock ? "Not available inside a scenario: main's simulation is not touched. Use the scenario's what-if panel instead." : undefined;
   const [err, setErr] = useState<string>();
@@ -14,29 +16,29 @@ export default function TimeBar() {
     try { setSim(await api.simControl(b)); setErr(undefined); } catch (e: any) { setErr(String(e.message ?? e)); }
   };
   const reset = () => { if (confirm("Reset the simulation to its start? All simulated state is re-seeded.")) { setAsOf(null); ctl({ reset: true }); } };
-  const min = sim ? Date.parse(sim.epoch) : 0;
-  const max = sim ? Date.parse(sim.sim_now) : 0;
+  const min = sim ? Date.parse(sim.epoch) : noSim ? nowMs - 30 * 24 * H : 0;
+  const max = sim ? Date.parse(sim.sim_now) : noSim ? nowMs : 0;
   const value = asOf ? Math.min(Math.max(asOf.getTime(), min), max) : max;
   const live = asOf === null;
   return (
-    <div className="timebar" role="region" aria-label="Simulation time controls">
-      <div className="tb-clock" title="Simulation clock">
+    <div className="timebar" role="region" aria-label={noSim ? "Time controls" : "Simulation time controls"}>
+      {!noSim && <div className="tb-clock" title="Simulation clock">
         <span className="tb-k">{lock ? "Main sim time" : "Sim time"}</span><b data-testid="sim-now">{sim ? fmtT(sim.sim_now) : "..."}</b>
-      </div>
-      <div className="seg" role="group" aria-label="Simulation speed" title={lockTip}>
+      </div>}
+      {!noSim && <><div className="seg" role="group" aria-label="Simulation speed" title={lockTip}>
         {SPEEDS.map((s) => (
           <button key={s.v} className={sim?.speed === s.v ? "on" : ""} aria-pressed={sim?.speed === s.v} disabled={lock} onClick={() => ctl({ speed: s.v })}>{s.l}</button>))}
       </div>
       <button disabled={lock} onClick={() => ctl({ step: true })} title={lockTip ?? "Advance one simulated hour"}>Step +1 h</button>
-      <button className="danger" disabled={lock} title={lockTip} onClick={reset}>Reset</button>
+      <button className="danger" disabled={lock} title={lockTip} onClick={reset}>Reset</button></>}
       <div className="tb-slider">
-        <label htmlFor="asof" className="tb-k">As of</label>
-        <input id="asof" type="range" min={min} max={Math.max(max, min + H)} step={H} value={value} disabled={!sim}
+        <label htmlFor="asof" className="tb-k">{noSim ? "Data as of" : "As of"}</label>
+        <input id="asof" type="range" min={min} max={Math.max(max, min + H)} step={H} value={value} disabled={!sim && !noSim}
           onChange={(e) => setAsOf(new Date(Number(e.target.value)))} aria-valuetext={live ? "live" : fmtT(asOf)} />
         <b className="tb-asof">{live ? "Live" : fmtT(asOf)}</b>
         <button className={live ? "on" : ""} aria-pressed={live} onClick={() => setAsOf(null)}>Live</button>
       </div>
-      <Inject lock={lock} tip={lockTip} />
+      {!noSim && <Inject lock={lock} tip={lockTip} />}
       <div className="tb-stat" aria-live="polite">
         {sim?.achieved_hours_per_s != null && <span className="muted">{sim.achieved_hours_per_s.toFixed(1)} h/s achieved</span>}
         {(sim?.last_error || err || simError) && <span className="tb-err" role="alert">{sim?.last_error ?? err ?? simError}</span>}

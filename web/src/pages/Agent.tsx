@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { EmptyState, ErrorBanner, Spinner } from "../ui";
 import { api, isNotFound, type Proposal } from "../api";
 import { agentApi, applyEvent, emptyTranscript, money, startError, streamRun, type AgentConfig, type Run, type Transcript } from "../agent";
 import { fmtT, usePolled, useApp } from "../store";
@@ -88,7 +89,8 @@ function Console() {
   return (
     <div className="page agentpage">
       <h2>Agent console <a className="lnk small" href="#/agent/runs">run history</a></h2>
-      {cfg.error && <div className="err">{noAgent ? `The ${role} role has no agent.` : cfg.error}</div>}
+      {noAgent ? <EmptyState title={`The ${role} role has no agent`}>Switch to a role that has an agent configured in the ontology.</EmptyState> : <ErrorBanner error={cfg.error} onRetry={cfg.reload} />}
+      {cfg.loading && !cfg.data && !cfg.error && <Spinner label="Loading agent configuration" />}
       {cfg.data && <ConfigPanel cfg={cfg.data} />}
       {unavailable && <div className="warnbox" role="alert">The agent is disabled: no model API key is configured on the server, so runs cannot start. Reading history still works.</div>}
       <form className="promptbox" onSubmit={(e) => { e.preventDefault(); if (prompt.trim() && !running) start(); }}>
@@ -120,7 +122,8 @@ export function History() {
     <div className="page">
       <h2>Agent runs <a className="lnk small" href="#/agent">console</a></h2>
       <p className="muted small">Runs started by you as {role}.</p>
-      {q.error && <div className="err">{q.error}</div>}
+      <ErrorBanner error={q.error} onRetry={q.reload} />
+      {q.loading && !q.data && !q.error && <Spinner label="Loading runs" />}
       {q.data && (q.data.length ? (
         <table><thead><tr><th>Started</th><th>Role</th><th>Prompt</th><th>Status</th><th>Turns</th><th>Tools</th><th>Tokens</th><th>Cost</th><th>Proposals</th></tr></thead><tbody>
           {q.data.map((r) => (
@@ -128,7 +131,7 @@ export function History() {
               <td className="prompt"><a className="lnk" href={`#/agent/${r.id}`}>{r.prompt.length > 90 ? r.prompt.slice(0, 90) + "…" : r.prompt}</a></td>
               <td><StatusChip s={r.status} /></td><td>{r.turns}</td><td>{r.tool_calls}</td><td>{r.tokens_in + r.tokens_out}</td><td>{money(r.cost_usd)}</td><td>{r.proposals}</td></tr>
           ))}</tbody></table>
-      ) : <p className="muted">No runs yet.</p>)}
+      ) : <EmptyState title="No runs yet" action={<a className="lnk" href="#/agent">Start one in the console</a>}>Agent runs you start are listed here with their tool trace and cost.</EmptyState>)}
     </div>
   );
 }

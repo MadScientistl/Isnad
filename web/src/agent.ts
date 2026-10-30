@@ -1,4 +1,4 @@
-import { BASE, ApiError, getRole, req, scnHeaders } from "./api";
+import { getBase, ApiError, getRole, req, scnHeaders } from "./api";
 
 /** Phase 4 agent types and client. All payload text is untrusted: render it as text only. */
 export type RunStatus = "running" | "completed" | "capped" | "error" | "cancelled" | "interrupted";
@@ -64,7 +64,7 @@ export async function streamRun(runId: string, onEvent: (e: AgentEvent) => void,
   let last = 0, done = false, fails = 0;
   while (!done && !signal.aborted) {
     try {
-      const r = await fetch(`${BASE.replace(/\/$/, "")}/agent/runs/${runId}/stream${last ? `?after=${last}` : ""}`, {
+      const r = await fetch(`${getBase()}/agent/runs/${runId}/stream${last ? `?after=${last}` : ""}`, {
         headers: { "x-role": getRole(), ...scnHeaders(`/agent/runs/${runId}/stream`), accept: "text/event-stream", ...(last ? { "last-event-id": String(last) } : {}) }, signal,
       });
       if (!r.ok || !r.body) {

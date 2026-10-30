@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import maplibregl from "maplibre-gl";
 import { MapboxOverlay } from "@deck.gl/mapbox";
-import { ArcLayer, IconLayer, ScatterplotLayer, TextLayer } from "@deck.gl/layers";
-import { api, client, type GeoFeature } from "../api";
-import { useAsOf, usePolled } from "../store";
+import { ArcLayer, GeoJsonLayer, IconLayer, ScatterplotLayer, TextLayer } from "@deck.gl/layers";
+import { api, client, type GeoCollection, type GeoFeature } from "../api";
+import { useApp, useAsOf, usePolled, useTypeStyles } from "../store";
+import { ALERT_STATUS, hexToRgba } from "../palette";
+import { EmptyState, ErrorBanner, Spinner, Trunc } from "../ui";
 
 type RGBA = [number, number, number, number];
 const ATLAS = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="256" height="64" viewBox="0 0 256 64" fill="#fff">
@@ -13,11 +15,8 @@ const MAPPING = {
   diamond: { x: 128, y: 0, width: 64, height: 64, mask: true }, tri: { x: 192, y: 0, width: 64, height: 64, mask: true },
 };
 const ICON = { iconAtlas: ATLAS, iconMapping: MAPPING };
-// Okabe-Ito based, colourblind-safe; status is also encoded by shape.
-const COL: Record<string, RGBA> = {
-  open: [0, 158, 115, 255], closed: [213, 94, 0, 255], warehouse: [0, 114, 178, 255],
-  in_transit: [31, 42, 68, 255], delayed: [230, 159, 0, 255], planned: [138, 148, 166, 255], arrived: [86, 180, 233, 255],
-};
+const ALERT: RGBA = [213, 94, 0, 255];
+const DONE_STATUS = new Set(["arrived", "completed", "done", "delivered"]);
 const OSM_STYLE: maplibregl.StyleSpecification = {
   version: 8,
   sources: { osm: { type: "raster", tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"], tileSize: 256, maxzoom: 19, attribution: "&copy; OpenStreetMap contributors" } },
@@ -25,30 +24,37 @@ const OSM_STYLE: maplibregl.StyleSpecification = {
 };
 
 interface Pt { id: string; type: string; name: string; pos: [number, number]; status: string; origin?: [number, number] | null; dest?: [number, number] | null; props: GeoFeature["properties"] }
-const toPts = (fc?: { features: GeoFeature[] }): Pt[] => (fc?.features ?? []).filter((f) => f.geometry).map((f) => ({
+const toPts = (fc?: { features: GeoFeature[] }): Pt[] => (fc?.features ?? []).filter((f) => f.geometry && f.geometry.type === "Point").map((f) => ({
   id: f.id ?? f.properties.id, type: f.properties.type, name: String(f.properties.name ?? f.properties.ref ?? f.properties.id.slice(0, 6)),
-  pos: f.geometry.coordinates, status: String(f.properties.status ?? "open"), origin: f.properties.origin, dest: f.properties.destination, props: f.properties,
+  pos: f.geometry.coordinates as [number, number], status: String(f.properties.status ?? ""), origin: f.properties.origin, dest: f.properties.destination, props: f.properties,
 }));
 
 export default function MapPage() { return <MapView />; }
 
-/** The map. `scn` forces main ("main") or a scenario id for this map's own requests; `changed` ids get a highlight ring (compare view). */
+/** The map. Layers come from the runtime type list (types with a geometry property). `scn` forces main ("main") or a scenario id for this map's own requests; `changed` ids get a highlight ring (compare view). */
 export function MapView({ scn, changed, embedded, title }: { scn?: number | "main"; changed?: Set<string>; embedded?: boolean; title?: string } = {}) {
   const { asOfQ, live: liveAsOf } = useAsOf();
+  const { types, typesError, reloadTypes } = useApp();
+  const styles = useTypeStyles();
   const live = liveAsOf && !embedded;
   const el = useRef<HTMLDivElement>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
   const overlay = useRef<MapboxOverlay | null>(null);
-  const [showArrived, setShowArrived] = useState(false);
+  const [showDone, setShowDone] = useState(false);
+  const [hiddenTypes, setHiddenTypes] = useState<Set<string>>(new Set());
   const [arcs, setArcs] = useState<"selected" | "all" | "off">("selected");
   const [sel, setSel] = useState<Pt | null>(null);
   const [pulse, setPulse] = useState(0);
   const [tilesFailed, setTilesFailed] = useState(false);
   const poll = live ? 2500 : undefined;
-  const ports = usePolled(() => api.geo("Port", asOfQ, scn), [asOfQ], poll);
-  const whs = usePolled(() => api.geo("Warehouse", asOfQ, scn), [asOfQ], poll);
-  const ships = usePolled(() => api.geo("Shipment", asOfQ, scn), [asOfQ], poll);
-  const error = ports.error ?? whs.error ?? ships.error;
+  const geoTypes = useMemo(() => (types?.objectTypes ?? []).filter((t) => t.geo).map((t) => t.name), [types]);
+  const geoKey = geoTypes.join("|");
+  const data = usePolled(async () => {
+    const out: Record<string, GeoCollection> = {};
+    await Promise.all(geoTypes.map(async (t) => { out[t] = await api.geo(t, asOfQ, scn); }));
+    return out;
+  }, [asOfQ, geoKey, scn], geoTypes.length ? poll : undefined);
+  const error = typesError ?? data.error;
 
   useEffect(() => {
     if (!el.current) return;
@@ -62,70 +68,103 @@ export function MapView({ scn, changed, embedded, title }: { scn?: number | "mai
     return () => { map.remove(); mapRef.current = null; overlay.current = null; };
   }, []);
 
-  const hasClosed = (ports.data?.features ?? []).some((f) => f.properties.status === "closed");
+  const byType = useMemo(() => {
+    const m: Record<string, Pt[]> = {};
+    for (const t of geoTypes) m[t] = toPts(data.data?.[t]);
+    return m;
+  }, [data.data, geoKey]);
+  const shapes = useMemo(() => {
+    const m: Record<string, GeoFeature[]> = {};
+    for (const t of geoTypes) m[t] = (data.data?.[t]?.features ?? []).filter((f) => f.geometry && f.geometry.type !== "Point");
+    return m;
+  }, [data.data, geoKey]);
+  const visible = useMemo(() => {
+    const m: Record<string, Pt[]> = {};
+    for (const t of geoTypes) m[t] = hiddenTypes.has(t) ? [] : (byType[t] ?? []).filter((p) => showDone || !DONE_STATUS.has(p.status));
+    return m;
+  }, [byType, hiddenTypes, showDone, geoKey]);
+  const all = useMemo(() => Object.values(visible).flat(), [visible]);
+  const alerts = useMemo(() => all.filter((p) => ALERT_STATUS.has(p.status)), [all]);
   useEffect(() => {
-    if (!hasClosed) return;
+    if (!alerts.length) return;
     const h = setInterval(() => setPulse((p) => (p + 0.05) % 1), 70);
     return () => clearInterval(h);
-  }, [hasClosed]);
-
-  const P = useMemo(() => toPts(ports.data), [ports.data]);
-  const W = useMemo(() => toPts(whs.data), [whs.data]);
-  const S = useMemo(() => toPts(ships.data).filter((s) => showArrived || s.status !== "arrived"), [ships.data, showArrived]);
+  }, [alerts.length]);
 
   useEffect(() => {
     const ov = overlay.current; if (!ov) return;
-    const arcData = arcs === "off" ? [] : S.filter((s) => s.origin && s.dest && (arcs === "all" || (sel && sel.id === s.id)));
-    const closed = P.filter((p) => p.status === "closed");
-    const hl = changed ? [...P, ...W, ...S].filter((p) => changed.has(p.id)) : [];
+    const arcData = arcs === "off" ? [] : all.filter((s) => s.origin && s.dest && (arcs === "all" || (sel && sel.id === s.id)));
+    const hl = changed ? all.filter((p) => changed.has(p.id)) : [];
+    const rgb = (t: string) => hexToRgba(styles[t]?.color ?? "#4b5563");
+    const typeLayers = geoTypes.map((t) => {
+      const st = styles[t];
+      return new IconLayer<Pt>({ id: `t-${t}`, data: visible[t] ?? [], pickable: true, getPosition: (d) => d.pos, sizeUnits: "pixels", getSize: (d) => (sel?.id === d.id ? 22 : ALERT_STATUS.has(d.status) ? 22 : 17),
+        ...ICON, getIcon: () => st?.shape ?? "circle", getColor: (d) => (ALERT_STATUS.has(d.status) ? ALERT : rgb(t)), updateTriggers: { getSize: sel?.id, getColor: [t, geoKey] },
+        onClick: (i) => i.object && setSel(i.object as Pt) });
+    });
+    const shapeFeatures = geoTypes.flatMap((t) => (hiddenTypes.has(t) ? [] : shapes[t] ?? []).map((f) => ({ ...f, properties: { ...f.properties, __t: t } })));
+    // Static (non-moving) types with few objects get name labels.
+    const labelled = geoTypes.flatMap((t) => ((visible[t]?.length ?? 0) <= 40 && !visible[t]?.some((p) => p.origin) ? visible[t] ?? [] : []));
     ov.setProps({
       layers: [
+        new GeoJsonLayer({ id: "shapes", data: shapeFeatures as any, stroked: true, filled: true, lineWidthUnits: "pixels", lineWidthMinPixels: 2, getLineColor: (f: any) => rgb(f.properties.__t), getFillColor: (f: any) => hexToRgba(styles[f.properties.__t]?.color ?? "#4b5563", 60) }),
         new ScatterplotLayer<Pt>({ id: "changed", data: hl, getPosition: (d) => d.pos, stroked: true, filled: true, radiusUnits: "pixels", lineWidthUnits: "pixels", getRadius: 17, lineWidthMinPixels: 3,
           getFillColor: [204, 31, 138, 50], getLineColor: [204, 31, 138, 255] }),
         new ArcLayer<Pt>({ id: "arcs", data: arcData, getSourcePosition: (d) => d.origin!, getTargetPosition: (d) => d.dest!, getWidth: (d) => (sel?.id === d.id ? 3 : 1.5),
-          getSourceColor: (d) => (COL[d.status] ?? COL.planned).map((v, i) => (i === 3 ? 160 : v)) as RGBA, getTargetColor: (d) => (COL[d.status] ?? COL.planned).map((v, i) => (i === 3 ? 160 : v)) as RGBA, updateTriggers: { getWidth: sel?.id } }),
-        new ScatterplotLayer<Pt>({ id: "pulse", data: closed, getPosition: (d) => d.pos, stroked: true, filled: false, radiusUnits: "pixels", lineWidthUnits: "pixels", lineWidthMinPixels: 2,
+          getSourceColor: (d) => hexToRgba(styles[d.type]?.color ?? "#4b5563", 170), getTargetColor: (d) => hexToRgba(styles[d.type]?.color ?? "#4b5563", 170), updateTriggers: { getWidth: sel?.id } }),
+        new ScatterplotLayer<Pt>({ id: "pulse", data: alerts, getPosition: (d) => d.pos, stroked: true, filled: false, radiusUnits: "pixels", lineWidthUnits: "pixels", lineWidthMinPixels: 2,
           getRadius: 14 + pulse * 16, getLineColor: [213, 94, 0, Math.round((1 - pulse) * 220)], updateTriggers: { getRadius: pulse, getLineColor: pulse } }),
-        new IconLayer<Pt>({ id: "ports", data: P, pickable: true, getPosition: (d) => d.pos, sizeUnits: "pixels", getSize: (d) => (d.status === "closed" ? 24 : 20),
-          ...ICON, getIcon: (d) => (d.status === "closed" ? "diamond" : "circle"), getColor: (d) => (d.status === "closed" ? COL.closed : COL.open),
-          onClick: (i) => i.object && setSel(i.object as Pt) }),
-        new IconLayer<Pt>({ id: "warehouses", data: W, pickable: true, getPosition: (d) => d.pos, sizeUnits: "pixels", getSize: 16,
-          ...ICON, getIcon: () => "square", getColor: COL.warehouse, onClick: (i) => i.object && setSel(i.object as Pt) }),
-        new IconLayer<Pt>({ id: "ships", data: S, pickable: true, getPosition: (d) => d.pos, sizeUnits: "pixels", getSize: (d) => (sel?.id === d.id ? 20 : 14),
-          ...ICON, getIcon: () => "tri", getColor: (d) => COL[d.status] ?? COL.planned, updateTriggers: { getSize: sel?.id },
-          onClick: (i) => i.object && setSel(i.object as Pt) }),
-        new TextLayer<Pt>({ id: "labels", data: [...P, ...W], getPosition: (d) => d.pos, getText: (d) => d.name + (d.status === "closed" ? " (closed)" : ""), getSize: 11, getPixelOffset: [0, 16],
+        ...typeLayers,
+        new TextLayer<Pt>({ id: "labels", data: labelled, getPosition: (d) => d.pos, getText: (d) => d.name + (ALERT_STATUS.has(d.status) ? ` (${d.status})` : ""), getSize: 11, getPixelOffset: [0, 16],
           getColor: [28, 32, 36, 255], outlineWidth: 3, outlineColor: [255, 255, 255, 230], fontSettings: { sdf: true }, getTextAnchor: "middle", getAlignmentBaseline: "top" }),
       ],
     });
-  }, [P, W, S, arcs, sel, pulse, changed]);
+  }, [visible, shapes, all, alerts, arcs, sel, pulse, changed, styles, geoKey, hiddenTypes]);
 
-  const counts = useMemo(() => {
-    const c: Record<string, number> = {};
-    for (const s of toPts(ships.data)) c[s.status] = (c[s.status] ?? 0) + 1;
-    return c;
-  }, [ships.data]);
+  // Fit the view to the data once per set of layers (the first time it has any).
+  const fitted = useRef("");
+  useEffect(() => {
+    const map = mapRef.current; if (!map || !data.data || fitted.current === geoKey) return;
+    const pts: [number, number][] = Object.values(byType).flat().map((p) => p.pos);
+    const walk = (c: any) => { if (typeof c?.[0] === "number") pts.push([c[0], c[1]]); else if (Array.isArray(c)) c.forEach(walk); };
+    for (const fs of Object.values(shapes)) for (const f of fs) walk(f.geometry.coordinates);
+    if (!pts.length) return;
+    fitted.current = geoKey;
+    const b = new maplibregl.LngLatBounds(pts[0], pts[0]); pts.forEach((p) => b.extend(p));
+    map.fitBounds(b, { padding: 70, maxZoom: 12, duration: 0 });
+  }, [data.data, byType, shapes, geoKey]);
+
+  const statusCounts = useMemo(() => {
+    const m: Record<string, Record<string, number>> = {};
+    for (const t of geoTypes) for (const p of byType[t] ?? []) if (p.status) { (m[t] ??= {})[p.status] = (m[t][p.status] ?? 0) + 1; }
+    return m;
+  }, [byType, geoKey]);
+  const toggle = (t: string) => setHiddenTypes((h) => { const n = new Set(h); n.has(t) ? n.delete(t) : n.add(t); return n; });
+  const noGeo = !!types && !geoTypes.length;
 
   return (
     <div className={`mappage${embedded ? " embedded" : ""}`}>
       {title && <div className="maptitle">{title}</div>}
-      <div className="mapcanvas" ref={el} aria-label="Map of ports, warehouses and shipments" />
+      <div className="mapcanvas" ref={el} aria-label={`Map of ${geoTypes.join(", ") || "objects"}`} />
       <div className="mapctl">
-        <label><input type="checkbox" checked={showArrived} onChange={(e) => setShowArrived(e.target.checked)} /> Show arrived shipments</label>
-        <label>Routes <select value={arcs} onChange={(e) => setArcs(e.target.value as any)}><option value="selected">Selected shipment</option><option value="all">All shipments</option><option value="off">Hidden</option></select></label>
+        <label><input type="checkbox" checked={showDone} onChange={(e) => setShowDone(e.target.checked)} /> Show finished objects (arrived, completed)</label>
+        <label>Routes <select value={arcs} onChange={(e) => setArcs(e.target.value as any)}><option value="selected">Selected object</option><option value="all">All objects</option><option value="off">Hidden</option></select></label>
         <span className="muted">{live ? "Live, refreshing every 2.5 s" : "Historical view"}</span>
-        {error && <span className="err" style={{ margin: 0 }}>{error}</span>}
+        {data.loading && !data.data && geoTypes.length > 0 && <Spinner label="Loading map data" />}
+        {error && <ErrorBanner error={error} onRetry={typesError ? reloadTypes : data.reload} />}
         {tilesFailed && <span className="warnbox" style={{ margin: 0 }}>Basemap tiles unavailable (offline?). Showing plain background.</span>}
       </div>
-      {!embedded && <div className="maplegend" aria-label="Legend">
+      {!types && !typesError && <div className="mapnote"><Spinner label="Loading types" /></div>}
+      {noGeo && <div className="mapnote"><EmptyState title="Nothing to map">None of this ontology's object types has a point or line property. Add a geometry property to see objects here.</EmptyState></div>}
+      {!embedded && geoTypes.length > 0 && <div className="maplegend" aria-label="Legend">
         <b>Legend</b>
-        <span style={{ color: "#009E73" }}><i className="sw circle" /><span className="ink">Port, open</span></span>
-        <span style={{ color: "#D55E00" }}><i className="sw diamond" /><span className="ink">Port, closed (pulsing ring)</span></span>
-        <span style={{ color: "#0072B2" }}><i className="sw square" /><span className="ink">Warehouse</span></span>
-        <span style={{ color: "#1f2a44" }}><i className="sw tri" /><span className="ink">Shipment in transit ({counts.in_transit ?? 0})</span></span>
-        <span style={{ color: "#E69F00" }}><i className="sw tri" /><span className="ink">Shipment delayed ({counts.delayed ?? 0})</span></span>
-        <span style={{ color: "#8a94a6" }}><i className="sw tri" /><span className="ink">Shipment planned ({counts.planned ?? 0})</span></span>
-        {showArrived && <span style={{ color: "#56B4E9" }}><i className="sw tri" /><span className="ink">Shipment arrived ({counts.arrived ?? 0})</span></span>}
+        {geoTypes.map((t) => (
+          <label key={t} className="legrow" style={{ color: styles[t]?.color }}>
+            <input type="checkbox" checked={!hiddenTypes.has(t)} onChange={() => toggle(t)} aria-label={`Show ${t}`} />
+            <i className={`sw ${styles[t]?.shape}`} /><span className="ink"><Trunc max={28}>{t}</Trunc> ({byType[t]?.length ?? 0}{shapes[t]?.length ? ` + ${shapes[t].length} shapes` : ""})</span>
+            {statusCounts[t] && <span className="muted small">{Object.entries(statusCounts[t]).slice(0, 4).map(([k, n]) => `${k} ${n}`).join(", ")}</span>}
+          </label>))}
+        {alerts.length > 0 && <span style={{ color: "#D55E00" }}><i className="sw circle" /><span className="ink">Needs attention: pulsing orange ({alerts.length})</span></span>}
       </div>}
       {sel && !embedded && <Panel sel={sel} asOf={asOfQ} onClose={() => setSel(null)} />}
     </div>

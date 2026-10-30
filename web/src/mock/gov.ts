@@ -163,7 +163,7 @@ export function route(method: string, path: string, q: URLSearchParams, body: Js
   if (!ROLES.includes(role)) return err(403, "permission_denied", `unknown or non-selectable role '${role}'`);
   let m: RegExpMatchArray | null;
   if (path === "/me") return [200, { ...W.whoAmI(role), actions: Object.keys(ACTION_META).filter((a) => roleMayExec(role, a)) }];
-  if (path === "/roles") return [200, ROLES];
+  if (path === "/roles") return [200, ROLES.map((r) => ({ role: r, description: `${r.replace(/_/g, " ")} (mock)`, region: r === "regional_ops_lead" ? "EMEA" : null, user: `demo-${r}` }))];
   if (path === "/actions" && method === "GET") {
     const type = q.get("type") ?? "", id = q.get("id") ?? "";
     if (!W.visibleKey(type, id)) return [404, { detail: "not found" }];

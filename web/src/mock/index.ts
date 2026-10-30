@@ -15,6 +15,8 @@
 import * as gov from "./gov";
 import { agentRoute } from "./agent";
 import * as scn from "./scenarios";
+import * as ing from "./ingest";
+import { makeWorld, DEFAULT_NAMES } from "./workspace";
 const H = 3600000;
 const EPOCH = Date.parse("2026-01-01T00:00:00Z");
 const iso = (h: number) => new Date(EPOCH + h * H).toISOString();
@@ -170,7 +172,9 @@ function summary(h: number) {
   const closed = PORTS.filter((_, i) => portStatus(i, h) === "closed").length;
   const risk = sh.filter((s, i) => s.status !== "arrived" && (portStatus(via(i), h) === "closed" || s.status === "delayed")).reduce((a, s) => a + s.cargo_value, 0);
   return { as_of: iso(h), shipments: { planned: cnt("planned"), in_transit: cnt("in_transit"), delayed: cnt("delayed"), arrived: cnt("arrived") }, ports: { open: PORTS.length - closed, closed },
-    invoices: NO_READ[curRole]?.includes("Invoice") ? { open: 0, approved: 0, paid: 0, flagged: 0 } : { open: ic("open"), approved: ic("approved"), paid: ic("paid"), flagged: ic("flagged") }, value_at_risk: risk, delay_hours_total: sh.reduce((a, s) => a + s.delay_hours, 0), open_events: evObjs().filter((w) => h >= w.start && h < w.end).length };
+    invoices: NO_READ[curRole]?.includes("Invoice") ? { open: 0, approved: 0, paid: 0, flagged: 0 } : { open: ic("open"), approved: ic("approved"), paid: ic("paid"), flagged: ic("flagged") }, value_at_risk: risk, delay_hours_total: sh.reduce((a, s) => a + s.delay_hours, 0), open_events: evObjs().filter((w) => h >= w.start && h < w.end).length,
+    counts: Object.fromEntries(["Port", "Warehouse", "Shipment", "Carrier", "Supplier", "Invoice", "Event"].filter((t) => !NO_READ[curRole]?.includes(t)).map((t) => [t, vobjs(t, h).length])),
+    enums: { Shipment: { status: { planned: cnt("planned"), in_transit: cnt("in_transit"), delayed: cnt("delayed"), arrived: cnt("arrived") } } }, kpis: { value_at_risk: risk } };
 }
 function metric(m: string, h: number) {
   const s = summary(h);
@@ -266,7 +270,7 @@ function route(method: string, path: string, q: URLSearchParams, body: any): [nu
     const set = new Set(ids);
     return [200, { center: c, as_of: live ? null : q.get("as_of"), inferred_available: live, truncated: seen.size > 300, nodes: ids.map((id) => idx.get(id)).filter(Boolean), edges: es.filter((e) => set.has(e.src) && set.has(e.dst)) }];
   }
-  if (path === "/types") return [200, { namespace: "mock", classes: {}, role: curRole, linkTypes: [], objectTypes: Object.entries(TYPES).filter(([n]) => !NO_READ[curRole]?.includes(n)).map(([name, ps]) => ({ name, properties: ps.map((p) => ({ name: p, type: "string", required: false, enum: ENUMS[p] ?? [] })) })) }];
+  if (path === "/types") return [200, { namespace: "mock", classes: {}, role: curRole, linkTypes: [], objectTypes: Object.entries(TYPES).filter(([n]) => !NO_READ[curRole]?.includes(n)).map(([name, ps]) => ({ name, geo: ["Port", "Warehouse", "Shipment"].includes(name), properties: ps.map((p) => ({ name: p, type: "string", required: false, enum: ENUMS[p] ?? [] })) })) }];
   if ((m = path.match(/^\/objects\/(\w+)$/)) && method === "GET") return [200, vobjs(m[1], asOfH).slice(Number(q.get("offset") ?? 0), Number(q.get("offset") ?? 0) + Number(q.get("limit") ?? 100))];
   if ((m = path.match(/^\/objects\/(\w+)\/([\w-]+)\/history$/))) return [200, vobjs(m[1], st.simH).filter((o) => o.id === m![2]).map((o) => ({ ...o, recorded_from: iso(0), recorded_to: null }))];
   if ((m = path.match(/^\/objects\/(\w+)\/([\w-]+)$/)) && method === "GET") { const o = vobjs(m[1], asOfH).find((x) => x.id === m![2]); return o ? [200, o] : [404, { detail: "not found" }]; }
@@ -278,30 +282,58 @@ function route(method: string, path: string, q: URLSearchParams, body: any): [nu
   return [404, { detail: `mock: no route ${method} ${path}` }];
 }
 
+const wsWorlds = new Map<string, ReturnType<typeof makeWorld>>();
+const MOCK_AUTH = !!((import.meta as any).env?.VITE_MOCK_AUTH);
+
 export function installMock(base: string) {
   const w = window as any;
   w.__mockLog = [] as unknown[];
+  ing.setHost(base);
   const orig = window.fetch.bind(window);
   setInterval(() => { if (st.speed !== "paused") { st.simH += Number(st.speed); st.tick += Number(st.speed); } }, 1000);
+  const json = (status: number, data: unknown) => new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
   window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     if (!url.startsWith(base)) return orig(input, init);
     const u = new URL(url), method = (init?.method ?? "GET").toUpperCase();
-    const body = init?.body ? JSON.parse(String(init.body)) : undefined;
-    const role = (init?.headers as Record<string, string> | undefined)?.["x-role"];
-    w.__mockLog.push({ method, path: u.pathname, query: Object.fromEntries(u.searchParams), role, body });
+    const rawBody = init?.body;
+    const blob = rawBody instanceof Blob ? rawBody : undefined;
+    let body: any;
+    if (rawBody && !blob) { try { body = JSON.parse(String(rawBody)); } catch { body = undefined; } }
+    const hdrs = (init?.headers as Record<string, string> | undefined) ?? {};
+    const tok = ing.tokenRole(hdrs.authorization);
+    let role = hdrs["x-role"];
+    // workspace prefix: /__ws/<slug>/... is served by another mock world
+    let pathname = u.pathname, wsSlug = "default";
+    const wm = pathname.match(/^\/__ws\/([\w-]+)(\/.*)$/);
+    if (wm) { wsSlug = wm[1]; pathname = wm[2]; }
+    w.__mockLog.push({ method, path: u.pathname, query: Object.fromEntries(u.searchParams), role, body, ws: wsSlug });
     if (w.__mockLog.length > 500) w.__mockLog.splice(0, 250);
+    await new Promise((r) => setTimeout(r, 30));
+    if (pathname === "/auth/login") return json(...ing.login(body));
+    if (MOCK_AUTH) { if (!tok) return json(401, { detail: { code: "unauthenticated", detail: "login required" } }); role = tok.role; }
     curRole = role ?? "admin";
-    const scnHdr = (init?.headers as Record<string, string> | undefined)?.["x-scenario"];
+    if (wm) {
+      let world = wsWorlds.get(wsSlug);
+      if (!world) {
+        const roles = [{ role: "admin", description: "Full access" }, ...(ing.workspaceRoles[wsSlug] ?? [{ role: "operator", description: "Operates" }, { role: "viewer", description: "Read-only" }]).filter((r) => r.role !== "admin")];
+        world = makeWorld({ ...DEFAULT_NAMES, ...(ing.wsNames[wsSlug] ?? {}) }, roles); wsWorlds.set(wsSlug, world);
+      }
+      const o = ing.ontRoute(method, pathname, u.searchParams, body, curRole, wsSlug) ?? world.route(method, pathname, u.searchParams, curRole);
+      return o ? json(...o) : json(404, { detail: `mock: no route ${method} ${pathname} in workspace ${wsSlug}` });
+    }
+    const adm = ing.route(method, pathname, u.searchParams, body, curRole, blob) ?? ing.ontRoute(method, pathname, u.searchParams, body, curRole, "default");
+    if (adm) return json(...adm);
+    const scnHdr = hdrs["x-scenario"];
     const dispatch = (): Response | [number, unknown] => {
-      const ar = agentRoute(method, u.pathname, u.searchParams, body, curRole);
+      const ar = agentRoute(method, pathname, u.searchParams, body, curRole);
       if (ar) return ar;
-      const sr = scn.route(method, u.pathname, u.searchParams, body, curRole);
-      return sr ?? route(method, u.pathname, u.searchParams, body);
+      const sr = scn.route(method, pathname, u.searchParams, body, curRole);
+      return sr ?? route(method, pathname, u.searchParams, body);
     };
-    const out = scnHdr && !u.pathname.startsWith("/scenarios") && !u.pathname.startsWith("/agent") ? scn.overlay(scnHdr, u.pathname, method, curRole, dispatch) : dispatch();
+    const out = scnHdr && !pathname.startsWith("/scenarios") && !pathname.startsWith("/agent") ? scn.overlay(scnHdr, pathname, method, curRole, dispatch) : dispatch();
     if (out instanceof Response) return out;
     const [status, data] = out;
-    return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
+    return json(status, data);
   };
 }

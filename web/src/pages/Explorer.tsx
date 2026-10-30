@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { EmptyState, ErrorBanner, Spinner } from "../ui";
 import cytoscape from "cytoscape";
 import { type TypesResponse, type ObjectTypeName, type Neighbour } from "@sdk/client";
 import { client, isNotFound } from "../api";
@@ -18,7 +19,7 @@ function useAsync<T>(fn: () => Promise<T>, deps: unknown[]) {
   return { ...s, reload: () => setN((x) => x + 1) };
 }
 const label = (o: Obj | null | undefined, id: string) => (o && (o.name || o.ref)) || id.slice(0, 8);
-const Err = ({ e }: { e?: string }) => (e ? <div className="err">{e}</div> : null);
+const Err = ({ e, retry }: { e?: string; retry?: () => void }) => <ErrorBanner error={e} onRetry={retry} />;
 const fmt = (v: unknown) => (v === null || v === undefined ? "" : typeof v === "object" ? JSON.stringify(v) : String(v));
 const rng = (a: string, b: string | null) => `${a.slice(0, 19)} → ${b && !b.startsWith("infinity") && !b.startsWith("9999") ? b.slice(0, 19) : "∞"}`;
 const go = (h: string) => { location.hash = "/" + h; };
@@ -36,14 +37,15 @@ export default function ExplorerPage({ parts }: { parts: string[] }) {
   return (
     <div className="layout">
       <nav className="side" aria-label="Object types">
-        {types.loading && !types.data && <div className="muted">Loading...</div>}
+        {types.loading && !types.data && <Spinner label="Loading types" />}
+        {types.data && !types.data.objectTypes.length && <EmptyState title="No object types">This ontology defines no object types yet.</EmptyState>}
         {types.data?.objectTypes.map((t) => (
           <a key={t.name} href={`#/${t.name}`} className={t.name === type ? "on" : ""}>{t.name}<span className="muted">{counts.data?.[t.name] ?? "..."}</span></a>
         ))}
       </nav>
       <main className="main">
-        <Err e={types.error} />
-        {!type && <p className="muted">Select an object type.</p>}
+        <Err e={types.error} retry={types.reload} />
+        {!type && types.data?.objectTypes.length ? <p className="muted">Select an object type.</p> : null}
         {type && tdef && !id && <Explorer key={type + role + asOfIso} type={type} tdef={tdef} asOf={asOfIso} go={go} />}
         {type && tdef && id && <Object360 key={type + id + role + asOfIso} type={type} id={id} tdef={tdef} asOf={asOfIso} go={go} types={types.data!} onChanged={counts.reload} />}
       </main>
@@ -60,12 +62,12 @@ function Explorer({ type, tdef, asOf, go }: { type: ObjectTypeName; tdef: TypesR
   const rows = (r.data ?? []) as Obj[];
   return (
     <div>
-      <h2>{type}</h2><Err e={r.error} />
-      {r.loading && <div className="muted">Loading…</div>}
+      <h2>{type}</h2><Err e={r.error} retry={r.reload} />
+      {r.loading && !r.data && <Spinner label="Loading objects" />}
       <table><thead><tr>{tdef.properties.map((p) => <th key={p.name}>{p.name}</th>)}</tr></thead>
         <tbody>{rows.slice(0, PAGE).map((o) => (
           <tr key={o.id} className="row" onClick={() => go(`${type}/${o.id}`)}>{tdef.properties.map((p) => <td key={p.name}>{masked.includes(p.name) && o[p.name] == null ? <Restricted /> : fmt(o[p.name])}</td>)}</tr>))}
-          {!r.loading && !rows.length && <tr><td colSpan={99} className="muted">No objects.</td></tr>}</tbody></table>
+          {!r.loading && !r.error && !rows.length && <tr><td colSpan={99}><EmptyState title={`No ${type} objects`}>Nothing at the selected time, or your role cannot see any.</EmptyState></td></tr>}</tbody></table>
       <p><button disabled={page === 0} onClick={() => setPage(page - 1)}>Prev</button> Page {page + 1} <button disabled={rows.length <= PAGE} onClick={() => setPage(page + 1)}>Next</button></p>
     </div>
   );

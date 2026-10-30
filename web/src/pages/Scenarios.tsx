@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { SELECTABLE_ROLES } from "@sdk/client";
 import { ApiError } from "../api";
+import { EmptyState, ErrorBanner } from "../ui";
 import { fmtT, toast, useApp, usePolled } from "../store";
 import { INJECTION_KINDS, KPI_META, compareHref, fmtKpi, scnApi, type Injection, type Scenario, type SimJob } from "../scenarios";
 
@@ -8,7 +8,7 @@ const ago = (iso: string) => { const s = Math.max(0, (Date.now() - Date.parse(is
 const errText = (e: any) => (e instanceof ApiError ? (e.status === 429 ? `Limit reached: ${e.text}` : e.status === 403 ? `Not allowed: ${e.text}` : e.text) : String(e?.message ?? e));
 
 export default function ScenariosPage() {
-  const { role, scenario, setScenario, refreshScenario } = useApp();
+  const { role, roles, scenario, setScenario, refreshScenario } = useApp();
   const [all, setAll] = useState(false);
   const list = usePolled(() => scnApi.list(all ? "all" : "open"), [all, role], 5000);
   const [name, setName] = useState("");
@@ -37,14 +37,14 @@ export default function ScenariosPage() {
         <form className="form inline" onSubmit={(e) => { e.preventDefault(); create(); }}>
           <label><span>Name*</span><input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Rotterdam closed for a week" maxLength={80} /></label>
           <label><span>Expires after (hours)</span><input type="number" min={1} max={720} value={hours} onChange={(e) => setHours(Number(e.target.value))} style={{ width: 90 }} /></label>
-          <fieldset className="roles"><legend>Share with roles</legend>{SELECTABLE_ROLES.filter((r) => r !== role).map((r) => (
+          <fieldset className="roles"><legend>Share with roles</legend>{roles.map((x) => x.role).filter((r) => r !== role).map((r) => (
             <label key={r} className="chk"><input type="checkbox" checked={shared.includes(r)} onChange={(e) => setShared(e.target.checked ? [...shared, r] : shared.filter((x) => x !== r))} /> {r}</label>))}</fieldset>
           <button className="primary" type="submit" disabled={busy}>{busy ? "Creating…" : "Create and switch"}</button>
         </form>
         {err && <div className="err" role="alert">{err}</div>}
       </section>
       <section className="card"><h3>Your scenarios <label className="chk" style={{ marginLeft: 12, textTransform: "none" }}><input type="checkbox" checked={all} onChange={(e) => setAll(e.target.checked)} /> include merged, discarded, expired</label></h3>
-        {list.error && <div className="err">{list.error}</div>}
+        <ErrorBanner error={list.error} onRetry={list.reload} />
         <table><thead><tr><th>#</th><th>Name</th><th>Owner</th><th>Status</th><th>Age</th><th>Rows</th><th>Shared with</th><th></th></tr></thead><tbody>
           {(list.data ?? []).map((s) => (
             <tr key={s.id} className={scenario === s.id ? "scn-active" : ""}>
@@ -67,6 +67,7 @@ export default function ScenariosPage() {
 const blank = (): Injection => ({ kind: "port_closure", target: "", at_h: 0, duration_h: 48, magnitude: 1.5 });
 
 function WhatIf({ scenario, onDone }: { scenario: Scenario | null; onDone: () => void }) {
+  const { simAvailable } = useApp();
   const [days, setDays] = useState(7);
   const [seed, setSeed] = useState(1);
   const [inj, setInj] = useState<Injection[]>([blank()]);
@@ -76,6 +77,7 @@ function WhatIf({ scenario, onDone }: { scenario: Scenario | null; onDone: () =>
   const timer = useRef<number>();
   useEffect(() => () => window.clearTimeout(timer.current), []);
   useEffect(() => { setJob(null); setErr(undefined); }, [scenario?.id]);
+  if (simAvailable === false) return <section className="card"><h3>What-if simulation</h3><EmptyState title="Not available for this ontology">This workspace has no simulation, so scenarios hold manual changes only.</EmptyState></section>;
   if (!scenario) return <section className="card"><h3>What-if simulation</h3><p className="muted">Switch to a scenario to run a what-if simulation inside it. Main's simulation is never touched.</p></section>;
   const set = (i: number, p: Partial<Injection>) => setInj(inj.map((x, k) => (k === i ? { ...x, ...p } : x)));
   const clean = (x: Injection): Injection => {
@@ -124,7 +126,7 @@ function WhatIf({ scenario, onDone }: { scenario: Scenario | null; onDone: () =>
       {res?.status === "done" && <div role="status">
         <p><span className="chip ok">done</span> sim time now {res.sim_now ? fmtT(res.sim_now) : ""} · digest <code className="ref">{res.digest}</code>
           {res.actions && <> · {Object.entries(res.actions).map(([k, v]) => `${v} ${k}`).join(", ")}</>}</p>
-        {res.kpis && <div className="kpigrid">{KPI_META.map((m) => <div key={m.k} className="kpicard"><div className="k">{m.label}</div><div className="vals"><b>{fmtKpi(res.kpis![m.k], m.fmt)}</b></div></div>)}</div>}
+        {res.kpis && <div className="kpigrid">{KPI_META.filter((m) => m.k in res.kpis!).map((m) => <div key={m.k} className="kpicard"><div className="k">{m.label}</div><div className="vals"><b>{fmtKpi(res.kpis![m.k], m.fmt)}</b></div></div>)}</div>}
         <p><a className="lnk" href={compareHref(scenario.id)}>Compare with main</a></p></div>}
     </section>
   );
