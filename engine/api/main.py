@@ -1075,8 +1075,7 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
               include_inferred: bool = True, p: Principal = Depends(get_principal),
               scn: ScenarioCtx | None = Depends(get_scenario), conn=Depends(rdb)):
         if scn is not None:
-            # TODO(main session): wire engine.sync.scenario_graph.get_store(conn, scn, comp) + V.bfs(..., scenario=scn)
-            raise ApiError(501, "scenario_graph_pending", "graph inside a scenario is not wired yet")
+            return _scenario_graph(center, depth, as_of, include_inferred, p, scn, conn)
         t = parse_ts(as_of)
         live = t is None
         pl = get_pipeline() if live else None
@@ -1105,12 +1104,57 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
     # ------------------------------------------------------------ SPARQL
     sparql_slots = threading.BoundedSemaphore(4)
 
+    # ------------------------------------------------------------ scenario graph / sparql
+    def _scenario_store(conn, scn):
+        from engine.sync import scenario_graph as SG
+        try:
+            return SG.get_store(conn, scn, comp, dsn=dsn, schema=schema)
+        except SG.GraphTooLarge:
+            raise ApiError(413, "graph_too_large", "scenario is too large for graph queries")
+        except SG.ScenarioNotVisible:
+            raise ApiError(404, "scenario_not_found", "scenario not found")
+
+    def _scenario_graph(center, depth, as_of, include_inferred, p, scn, conn):
+        if as_of not in (None, "", "live"):
+            raise ApiError(400, "scenario_as_of_unsupported", "as_of is not supported inside a scenario")
+        graph_ = _scenario_store(conn, scn)
+        try:
+            res = V.bfs(conn, center, depth, pipeline=graph_, include_inferred=include_inferred,
+                        max_nodes=MAX_GRAPH_NODES, is_admin=p.role == "admin",
+                        deadline=time.monotonic() + GRAPH_DEADLINE_S, cfg=cfg, scenario=scn)
+        except V.NotVisible:
+            raise HTTPException(404, f"object {center} not found")
+        except TimeoutError:
+            raise ApiError(408, "timeout", "graph query timed out")
+        infos = V.node_infos(conn, res.order, cfg=cfg, model=om, scenario=scn)
+        nodes = [infos[str(i)] for i in res.order if str(i) in infos]
+        ok = {n["id"] for n in nodes}
+        edges = [{"src": str(s_), "dst": str(d), "link": l, "inferred": False} for s_, l, d in res.edges
+                 if str(s_) in ok and str(d) in ok]
+        edges += [{"src": str(s_), "dst": str(d), "link": l, "inferred": True} for s_, l, d in res.inferred
+                  if str(s_) in ok and str(d) in ok]
+        return {"center": str(center), "as_of": "live", "scenario": scn.id,
+                "inferred_available": res.inferred_available, "truncated": res.truncated,
+                "nodes": nodes, "edges": edges}
+
+    def _scenario_sparql(body, p, scn, conn):
+        from engine.sync.sparql import SparqlError, run_query
+        graph_ = _scenario_store(conn, scn)
+        if not sparql_slots.acquire(blocking=False):
+            raise ApiError(429, "too_many_requests", "too many concurrent queries")
+        try:
+            return run_query(graph_, conn, p.role == "admin", body.query, scenario=scn)
+        except SparqlError as e:
+            raise ApiError(408 if e.code == "timeout" else 400, f"sparql_{e.code}", str(e))
+        finally:
+            sparql_slots.release()
+
+
     @app.post("/sparql")
     def sparql(body: SparqlBody, p: Principal = Depends(get_principal),
                scn: ScenarioCtx | None = Depends(get_scenario), conn=Depends(rdb)):
         if scn is not None:
-            # TODO(main session): wire engine.sync.scenario_graph.get_store + run_query(graph, conn, ..., scenario=scn)
-            raise ApiError(501, "scenario_graph_pending", "SPARQL inside a scenario is not wired yet")
+            return _scenario_sparql(body, p, scn, conn)
         from engine.sync.sparql import SparqlError, run_query
         pl = get_pipeline()
         if pl is None:

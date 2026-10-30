@@ -113,12 +113,21 @@ def test_unsupported_routes_are_400(cl, mk):
     assert cl.get("/sim/state", headers=H("admin")).status_code != 400                           # main unaffected
 
 
-def test_graph_and_sparql_have_a_pending_hook(cl, mk):
+def test_graph_and_sparql_run_inside_a_scenario(cl, mk, ship):
     sid = mk()
-    r = cl.get(f"/graph?center={port()}", headers=H("planner", sid))
-    assert r.status_code == 501 and r.json()["code"] == "scenario_graph_pending"
-    r = cl.post("/sparql", json={"query": "SELECT * WHERE {?s ?p ?o} LIMIT 1"}, headers=H("planner", sid))
-    assert r.status_code == 501 and r.json()["code"] == "scenario_graph_pending"
+    h = H("planner", sid)
+    r = cl.get(f"/graph?center={ship}&depth=1", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["scenario"] == sid and any(n["id"] == ship for n in r.json()["nodes"])
+    # a scenario-only change appears in the scenario graph, not in main
+    close = cl.post("/actions/delay_shipment/execute", json={"params": {"shipment": ship, "delay_hours": 5.0}}, headers=h)
+    assert close.status_code in (200, 202), close.text
+    r = cl.post("/sparql", json={"query": "SELECT ?s WHERE {?s a ?t} LIMIT 3"}, headers=h)
+    assert r.status_code == 200, r.text
+    r = cl.get(f"/graph?center={ship}&as_of=2026-01-02T00:00:00Z", headers=h)
+    assert r.status_code == 400 and r.json()["code"] == "scenario_as_of_unsupported"
+    # another user's scenario stays invisible
+    assert cl.get(f"/graph?center={ship}", headers=H("finance_analyst", sid)).status_code == 404
 
 
 # ------------------------------------------------------------------ scenario CRUD
