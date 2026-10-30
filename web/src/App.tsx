@@ -8,8 +8,9 @@ import GraphPage from "./pages/GraphPage";
 import Dashboard from "./pages/Dashboard";
 import AuditPage from "./pages/Audit";
 import ApprovalsPage from "./pages/Approvals";
+import AgentPage from "./pages/Agent";
 
-const NAV = [["dashboard", "Dashboard"], ["map", "Map"], ["graph", "Graph"], ["", "Explorer"], ["audit", "Audit"], ["approvals", "Approvals"]] as const;
+const NAV = [["dashboard", "Dashboard"], ["map", "Map"], ["graph", "Graph"], ["", "Explorer"], ["audit", "Audit"], ["approvals", "Approvals"], ["agent", "Agent"]] as const;
 
 function useParts(): string[] {
   const [h, setH] = useState(location.hash.slice(2));
@@ -21,7 +22,7 @@ function Shell() {
   const { role, setRole, me, meError } = useApp();
   const parts = useParts();
   const page = parts[0] ?? "";
-  const section = ["map", "graph", "dashboard", "audit", "approvals"].includes(page) ? page : "";
+  const section = ["map", "graph", "dashboard", "audit", "approvals", "agent"].includes(page) ? page : "";
   return (
     <div className="shell">
       <header className="top">
@@ -44,6 +45,7 @@ function Shell() {
         {page === "dashboard" && <Dashboard />}
         {page === "audit" && <AuditPage parts={parts} />}
         {page === "approvals" && <ApprovalsPage />}
+        {page === "agent" && <AgentPage parts={parts} />}
         {!section && <ExplorerPage parts={parts} />}
       </div>
     </div>

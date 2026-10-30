@@ -430,6 +430,39 @@
               "EMEA",
               "AMER"
             ]
+          },
+          "agent": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "allowlist": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]*$"
+                },
+                "uniqueItems": true
+              },
+              "tools": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]*$"
+                },
+                "uniqueItems": true
+              },
+              "instructions": {
+                "type": "string"
+              },
+              "max_tool_calls": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "max_cost_usd": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              }
+            }
           }
         }
       }
@@ -464,6 +497,38 @@
           },
           "description": {
             "type": "string"
+          }
+        }
+      }
+    },
+    "functions": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]*$"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "params": {
+            "type": "object",
+            "propertyNames": {
+              "pattern": "^[a-z][a-z0-9_]*$"
+            },
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "roles": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]*$"
+            },
+            "uniqueItems": true
           }
         }
       }

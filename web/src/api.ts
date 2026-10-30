@@ -85,7 +85,9 @@ export interface Approval { id: string; proposal_id: string; decision: "approved
 export interface Proposal {
   id: string; action: string; params: Record<string, unknown>; proposer: string; proposer_role: string; rationale: string | null;
   dry_run: DiffRow[] | { diff: DiffRow[] } | null; created_at: string; state?: "pending" | "approved" | "rejected"; approval?: Approval | null;
+  on_behalf_of?: string | null; evidence?: Evidence[] | null; run_id?: string | null; expires_at?: string | null; expired?: boolean; stale?: boolean | null;
 }
+export interface Evidence { ref: string; claim: string; kind: "asserted" | "inferred"; tool_call_id?: string | null }
 export interface AuditRow { kind: string; id: string; at: string; actor: string; role?: string; name: string; status: string; action_id?: string | null; proposal_id?: string | null; summary?: string; [k: string]: unknown }
 export const dryDiff = (d: Proposal["dry_run"]): DiffRow[] => (Array.isArray(d) ? d : d && Array.isArray((d as { diff: DiffRow[] }).diff) ? (d as { diff: DiffRow[] }).diff : []);
 export const paramList = (p: ActionInfo["params"], name: string): ParamMeta[] =>

@@ -64,6 +64,12 @@ CREATE TABLE IF NOT EXISTS proposal (
     run_id text,
     tool_trace jsonb
 );
+ALTER TABLE proposal ADD COLUMN IF NOT EXISTS on_behalf_of text;
+ALTER TABLE proposal ADD COLUMN IF NOT EXISTS idempotency_key text;
+ALTER TABLE proposal ADD COLUMN IF NOT EXISTS evidence jsonb;
+ALTER TABLE proposal ADD COLUMN IF NOT EXISTS base_versions jsonb;
+ALTER TABLE proposal ADD COLUMN IF NOT EXISTS expires_at timestamptz;
+CREATE UNIQUE INDEX IF NOT EXISTS proposal_idem_idx ON proposal (idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS proposal_proposer_idx ON proposal (proposer);
 CREATE INDEX IF NOT EXISTS proposal_seq_idx ON proposal (seq);
 
@@ -131,6 +137,30 @@ CREATE INDEX IF NOT EXISTS webhook_delivery_outbox_idx ON webhook_delivery (outb
 CREATE INDEX IF NOT EXISTS webhook_delivery_due_idx ON webhook_delivery (next_attempt_at)
     WHERE status IN ('pending', 'retry');
 
+-- Phase 4 agent audit: a run row plus an event stream (status = last 'finished' event; no updates needed).
+CREATE TABLE IF NOT EXISTS agent_run (
+    id uuid PRIMARY KEY,
+    seq bigserial,
+    role text NOT NULL,
+    "user" text NOT NULL,
+    prompt text NOT NULL,
+    model text,
+    caps jsonb,
+    started_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE INDEX IF NOT EXISTS agent_run_user_idx ON agent_run ("user", seq DESC);
+CREATE TABLE IF NOT EXISTS agent_run_event (
+    seq bigserial PRIMARY KEY,
+    run_id uuid NOT NULL,
+    kind text NOT NULL CHECK (kind IN ('message','tool_call','tool_result','denied','proposal','finished')),
+    payload jsonb,
+    tokens_in int NOT NULL DEFAULT 0,
+    tokens_out int NOT NULL DEFAULT 0,
+    cost_usd numeric NOT NULL DEFAULT 0,
+    at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE INDEX IF NOT EXISTS agent_run_event_run_idx ON agent_run_event (run_id, seq);
+
 -- latest delivery row per outbox id (no DISTINCT, so FOR UPDATE SKIP LOCKED works on it)
 CREATE OR REPLACE VIEW webhook_state WITH (security_invoker = true) AS
   SELECT d.* FROM webhook_delivery d
@@ -152,7 +182,7 @@ DO $$
 DECLARE t text; p record; owner_role text := current_user;
 BEGIN
   FOREACH t IN ARRAY ARRAY['audit_event','proposal','approval','execution_diff','rollback',
-                           'webhook_outbox','webhook_delivery'] LOOP
+                           'webhook_outbox','webhook_delivery','agent_run','agent_run_event'] LOOP
     EXECUTE format('DROP TRIGGER IF EXISTS amarh_no_update ON %I', t);
     EXECUTE format('CREATE TRIGGER amarh_no_update BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION amarh_append_only()', t);
     EXECUTE format('DROP TRIGGER IF EXISTS amarh_no_truncate ON %I', t);
@@ -160,7 +190,7 @@ BEGIN
     EXECUTE format('GRANT INSERT, SELECT ON %I TO amarh_app', t);
   END LOOP;
   FOREACH t IN ARRAY ARRAY['audit_event','proposal','approval','execution_diff','rollback',
-                           'webhook_outbox','webhook_delivery','inferred_support'] LOOP
+                           'webhook_outbox','webhook_delivery','inferred_support','agent_run','agent_run_event'] LOOP
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
     EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
     FOR p IN SELECT policyname FROM pg_policies WHERE schemaname = current_schema() AND tablename = t LOOP
@@ -182,6 +212,29 @@ CREATE POLICY ins_known ON execution_diff   FOR INSERT TO amarh_app WITH CHECK (
 CREATE POLICY ins_known ON rollback         FOR INSERT TO amarh_app WITH CHECK (coalesce(current_setting('amarh.role', true), '') <> '');
 CREATE POLICY ins_known ON webhook_outbox   FOR INSERT TO amarh_app WITH CHECK (coalesce(current_setting('amarh.role', true), '') <> '');
 CREATE POLICY ins_known ON webhook_delivery FOR INSERT TO amarh_app WITH CHECK (coalesce(current_setting('amarh.role', true), '') <> '');
+-- a run row can only be written for the caller's own identity; events only into a run the caller can see
+CREATE POLICY ins_known ON agent_run        FOR INSERT TO amarh_app WITH CHECK (
+    coalesce(current_setting('amarh.role', true), '') <> '' AND "user" = current_setting('amarh.user', true)
+    AND role = current_setting('amarh.role', true));
+CREATE POLICY ins_known ON agent_run_event  FOR INSERT TO amarh_app WITH CHECK (
+    coalesce(current_setting('amarh.role', true), '') <> ''
+    AND EXISTS (SELECT 1 FROM agent_run r WHERE r.id = agent_run_event.run_id
+                AND r."user" = current_setting('amarh.user', true)));
+-- a run is closed by its "finished" event: nothing can be appended after it (definer: must see all events)
+CREATE OR REPLACE FUNCTION amarh_run_open() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM agent_run_event f WHERE f.run_id = NEW.run_id AND f.kind = 'finished') THEN
+        RAISE EXCEPTION 'agent run % is already finished', NEW.run_id USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+    RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS amarh_run_open ON agent_run_event;
+CREATE TRIGGER amarh_run_open BEFORE INSERT ON agent_run_event FOR EACH ROW EXECUTE FUNCTION amarh_run_open();
+CREATE POLICY sel ON agent_run FOR SELECT TO amarh_app USING (
+    current_setting('amarh.role', true) = 'admin'
+ OR (coalesce(current_setting('amarh.role', true), '') <> '' AND "user" = current_setting('amarh.user', true)));
+CREATE POLICY sel ON agent_run_event FOR SELECT TO amarh_app USING (
+    EXISTS (SELECT 1 FROM agent_run r WHERE r.id = agent_run_event.run_id));
 
 -- SELECT. Policy dependency order (acyclic): proposal <- approval <- audit_event <- {execution_diff, rollback,
 -- webhook_outbox} <- webhook_delivery. Each EXISTS subquery is itself subject to the target's policy.
@@ -190,6 +243,7 @@ CREATE POLICY sel ON proposal FOR SELECT TO amarh_app USING (
     current_setting('amarh.role', true) = 'admin'
  OR (coalesce(current_setting('amarh.role', true), '') <> '' AND (
         proposer = current_setting('amarh.user', true)
+     OR on_behalf_of = current_setting('amarh.user', true)
      OR action = ANY (string_to_array(coalesce(current_setting('amarh.approves', true), ''), ','))
  )));
 CREATE POLICY sel ON approval FOR SELECT TO amarh_app USING (

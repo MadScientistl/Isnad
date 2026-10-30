@@ -27,7 +27,7 @@ const gid = (p: string) => `${p}${(++n).toString(16).padStart(4, "0")}0000-0000-
 interface Delivery { attempt: number; status: string; http_status: number | null; error: string | null; next_attempt_at: string | null; at: string }
 interface Exec { action_id: string; name: string; actor: string; role: string; source: string; status: string; params: Json; sim_time: string; recorded_at: string; proposal_id: string | null; parent_execution_id: string | null; rolled_back: boolean; error: string | null; diff: any[]; undo?: () => void }
 interface Outbox { id: string; action_id: string; hook: string; url: string; created_at: string; idempotency_key: string; deliveries: Delivery[] }
-interface Prop { id: string; action: string; params: Json; proposer: string; proposer_role: string; rationale: string; dry_run: any[]; created_at: string; approval: null | { id: string; proposal_id: string; decision: string; approver: string; approver_role: string; comment: string; decided_at: string; execution_id: string | null } }
+interface Prop { id: string; action: string; params: Json; proposer: string; proposer_role: string; rationale: string; dry_run: any[]; created_at: string; on_behalf_of?: string | null; evidence?: Json[] | null; run_id?: string | null; expires_at?: string | null; staleKeys?: string[]; approval: null | { id: string; proposal_id: string; decision: string; approver: string; approver_role: string; comment: string; decided_at: string; execution_id: string | null } }
 const execs: Exec[] = [], outbox: Outbox[] = [], props: Prop[] = [], rollbacks: Json[] = [];
 
 const err = (status: number, code: string, detail: string, extra: Json = {}): [number, unknown] => [status, { detail: { code, detail, ...extra } }];
@@ -77,6 +77,18 @@ function seed() {
   const rej: Prop = { id: gid("p"), action: "pay_invoice", params: { invoice: obj("Invoice", 5) }, proposer: user("finance_analyst"), proposer_role: "finance_analyst", rationale: "Pay early for discount.",
     dry_run: [], created_at: T(50), approval: { id: gid("c"), proposal_id: "", decision: "rejected", approver: user("admin"), approver_role: "admin", comment: "Discount terms not confirmed", decided_at: T(52), execution_id: null } };
   rej.approval!.proposal_id = rej.id; props.push(rej);
+  const W0 = Date.now(), ev = (ref: string, claim: string, kind: string, tc: string) => ({ ref, claim, kind, tool_call_id: tc });
+  props.unshift({ id: gid("p"), action: "close_port", params: { port: obj("Port", 2), reason: "storm", duration_h: 24 }, proposer: "agent:planner", proposer_role: "planner", rationale: "Open storm event at this port; six shipments route through it.",
+    dry_run: [{ kind: "object", type: "Port", key: obj("Port", 2), op: "modify", before: { status: "open" }, after: { status: "closed" } }], created_at: T(90), on_behalf_of: user("planner"), run_id: "e0000000-0000-4000-8000-000000000001",
+    evidence: [ev(`Event/${obj("Port", 2).slice(0, 8)}`, "Storm event is open and affects the port", "asserted", "tc_1"), ev(`Port/${obj("Port", 2).slice(0, 8)}`, "Shipments exposed via supplies chain", "inferred", "tc_2")],
+    expires_at: new Date(W0 + 3 * 3600000).toISOString(), approval: null });
+  props.unshift({ id: gid("p"), action: "pay_invoice", params: { invoice: obj("Invoice", 6) }, proposer: "agent:finance_analyst", proposer_role: "finance_analyst", rationale: "Invoice matches the PO; no anomaly signals.",
+    dry_run: [{ kind: "object", type: "Invoice", key: obj("Invoice", 6), op: "modify", before: { status: "open" }, after: { status: "paid" } }], created_at: T(85), on_behalf_of: user("finance_analyst"), run_id: "e0000000-0000-4000-8000-000000000002",
+    evidence: [ev(`Invoice/${obj("Invoice", 6).slice(0, 8)}`, "Anomaly score 0.05, below threshold", "asserted", "tc_3")],
+    expires_at: new Date(W0 + 2 * 3600000).toISOString(), staleKeys: ["status", "amount"], approval: null });
+  props.unshift({ id: gid("p"), action: "pay_invoice", params: { invoice: obj("Invoice", 7) }, proposer: "agent:finance_analyst", proposer_role: "finance_analyst", rationale: "Paid early per terms.",
+    dry_run: [], created_at: T(70), on_behalf_of: user("finance_analyst"), run_id: "e0000000-0000-4000-8000-000000000002", evidence: [],
+    expires_at: new Date(W0 - 60000).toISOString(), approval: null });
 }
 
 /** Row-level visibility of an execution for a role (admin all; others own rows plus rows whose objects they can see). */
@@ -85,10 +97,22 @@ function execVisible(role: string, x: Exec): boolean {
   if (x.status === "denied" || !x.diff.length) return false;
   return x.diff.every((d) => W.canSeeObj(role, d.type, d.key));
 }
-const propVisible = (role: string, p: Prop) => role === "admin" || p.proposer === user(role) || (approversOf(p.action).includes(role));
+const propVisible = (role: string, p: Prop) => role === "admin" || p.proposer === user(role) || p.on_behalf_of === user(role) || (approversOf(p.action).includes(role));
 const rowOf = (x: Exec) => { const { diff: _d, undo: _u, ...r } = x; return r; };
 const state = (p: Prop) => (p.approval ? p.approval.decision : "pending");
-const propOut = (p: Prop) => ({ ...p, state: state(p) });
+const propOut = (p: Prop) => {
+  const { staleKeys: _s, ...r } = p;
+  return { on_behalf_of: null, evidence: null, run_id: null, expires_at: null, ...r, expired: !p.approval && !!p.expires_at && Date.parse(p.expires_at) <= Date.now(), stale: null, state: state(p) };
+};
+/** Agent-created proposal (used by the mock agent runs). */
+export function addAgentProposal(role: string, action: string, params: Json, rationale: string, evidence: Json[], runId: string, ttlMin = 60, staleKeys?: string[]): Prop {
+  const r = W.apply(action, params); let dry: any[] = [];
+  if (!("fail" in r) && !("notFound" in r)) { dry = r.diff; r.undo(); }
+  const p: Prop = { id: gid("p"), action, params, proposer: `agent:${role}`, proposer_role: role, rationale, dry_run: dry, created_at: W.nowIso(), on_behalf_of: user(role), evidence, run_id: runId,
+    expires_at: new Date(Date.now() + ttlMin * 60000).toISOString(), staleKeys, approval: null };
+  props.unshift(p); return p;
+}
+export const proposalRef = (id: string) => { const p = props.find((x) => x.id === id); return p ? { state: state(p), execution_id: p.approval?.execution_id ?? null } : null; };
 
 function performExecute(name: string, params: Json, role: string, proposalId: string | null = null): [number, unknown] {
   if (!roleMayExec(role, name)) {
@@ -144,6 +168,8 @@ export function route(method: string, path: string, q: URLSearchParams, body: Js
     const p = props.find((x) => x.id === m![1]);
     if (!p || !propVisible(role, p)) return [404, { detail: "not found" }];
     if (p.approval) return err(422, "invalid_state", "proposal already decided");
+    if (m[2] === "approve" && p.expires_at && Date.parse(p.expires_at) <= Date.now()) return err(409, "proposal_expired", "proposal expired");
+    if (m[2] === "approve" && p.staleKeys?.length) return err(409, "stale_proposal", "the data changed since the proposal was made", { changed: p.staleKeys });
     if (!approversOf(p.action).includes(role)) return err(403, "permission_denied", `role ${role} may not approve ${p.action}`);
     if (p.proposer === user(role)) return err(403, "permission_denied", "a proposer cannot approve their own proposal");
     const approve = m[2] === "approve";

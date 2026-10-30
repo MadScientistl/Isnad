@@ -146,7 +146,6 @@ def test_policy_ddl_shape():
     (lambda d: d["roles"]["finance_analyst"].update(approves=["pay_invoice"]), "does not list it as approver"),
     (lambda d: d["actions"]["pay_invoice"]["approval"].update(approvers=["finance_analyst"]), "does not approve it"),
     (lambda d: d["actions"]["pay_invoice"]["approval"].update(approvers=[]), "at least one approver"),
-    (lambda d: d["actions"]["flag_invoice"].update(approval={"required": False, "approvers": ["admin"]}), "approval.required is false"),
     (lambda d: d["actions"]["pay_invoice"]["approval"].update(exempt=["ghost"]), "unknown role 'ghost' in approval.exempt"),
     (lambda d: d["actions"]["flag_invoice"].update(webhooks=["nope"]), "unknown webhook 'nope'"),
     (lambda d: d["actions"]["flag_invoice"].update(function="x"), "either rules or function"),

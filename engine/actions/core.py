@@ -69,6 +69,17 @@ class ApprovalRequired(Exception):
         self.action, self.approvers = action, approvers
 
 
+class StaleProposal(Exception):
+    """The data a proposal was based on changed before approval."""
+    def __init__(self, changed):
+        self.changed = list(changed)
+        super().__init__(f"proposal is stale: {', '.join(self.changed)} changed since it was proposed")
+
+
+class ProposalExpired(Exception):
+    pass
+
+
 class RollbackConflict(Exception):
     def __init__(self, keys: list[str]):
         super().__init__(f"cannot roll back: current state differs from the recorded result for {keys}")
@@ -393,6 +404,15 @@ def _delay_shipment(c, p):
     c.merge("Shipment", p["shipment"], **ch)
 
 
+def _reroute_shipment(c, p):
+    """End every current ships_via link of the shipment, then route it via the new port."""
+    ship, new = p["shipment"], p["new_port"]
+    for old in bt.neighbours(c.conn, "ships_via", ship, "out", as_of_valid=c.vt):
+        if old != new:
+            c.unlink("ships_via", ship, old)
+    c.link("ships_via", ship, new)
+
+
 def _open_closure(c, port):
     """Open port_closure Event (ended unset) affecting `port`, as of valid_at."""
     for ev in bt.neighbours(c.conn, "affects", port, "in", as_of_valid=c.vt):
@@ -453,6 +473,7 @@ def _end_link(c, p):
 
 
 HANDLERS = {
+    "reroute_shipment": _reroute_shipment,
     "create_object": _create_object, "update_object": _update_object,
     "delete_object": _delete_object, "create_link": _create_link, "end_link": _end_link,
     "ship_depart": _ship_depart, "ship_position": _ship_position, "ship_arrive": _ship_arrive,
@@ -690,8 +711,13 @@ def dry_run(conn, name: str, params: dict, principal, *, valid_at: datetime, ont
             return ActionResult(aid, c.changed, name, c.before, c.after, None, c.created, "dry_run", c.diff())
 
 
+PROPOSAL_TTL_H = float(os.environ.get("AMARH_PROPOSAL_TTL_H", "24"))
+
+
 def propose(conn, name: str, params: dict, principal, rationale: str | None = None, *, valid_at: datetime,
-            source: str = "api", run_id: str | None = None, tool_trace=None, ontology=None) -> UUID:
+            source: str = "api", run_id: str | None = None, tool_trace=None, ontology=None,
+            on_behalf_of: str | None = None, evidence=None, idempotency_key: str | None = None,
+            ttl_h: float | None = None) -> UUID:
     """Store a proposal (with a dry-run preview). Writes nothing else; the role must be allowed to
     execute the action. Criteria are checked now so that doomed proposals are refused early."""
     model = _load(ontology)
@@ -710,11 +736,22 @@ def propose(conn, name: str, params: dict, principal, rationale: str | None = No
                         raise _Preview(clean, preview)
                 except _Preview as pv:
                     clean, preview = pv.clean, pv.preview
+                if idempotency_key:
+                    dup = conn.execute("SELECT id FROM proposal WHERE idempotency_key=%s",
+                                       [idempotency_key]).fetchone()
+                    if dup:
+                        return dup[0]
+                ttl = PROPOSAL_TTL_H if ttl_h is None else ttl_h
                 conn.execute(
                     "INSERT INTO proposal (id, action, params, proposer, proposer_role, rationale, dry_run, "
-                    "run_id, tool_trace) VALUES (%s,%s,%s::jsonb,%s,%s,%s,%s::jsonb,%s,%s::jsonb)",
+                    "run_id, tool_trace, on_behalf_of, idempotency_key, evidence, base_versions, expires_at) "
+                    "VALUES (%s,%s,%s::jsonb,%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s,%s,%s::jsonb,%s::jsonb,"
+                    "clock_timestamp() + make_interval(secs => %s))",
                     [pid, name, _jdump(clean), pr.user, pr.role, rationale, _jdump(preview), run_id,
-                     None if tool_trace is None else _jdump(tool_trace)])
+                     None if tool_trace is None else _jdump(tool_trace), on_behalf_of, idempotency_key,
+                     None if evidence is None else _jdump(evidence),
+                     _jdump(_base_versions(preview["diff"])),
+                     ttl * 3600])
         conn.commit()
         return pid
 
@@ -739,27 +776,35 @@ def decide(conn, proposal_id: UUID, principal, approve: bool, comment: str | Non
         with conn.transaction():
             with scoped(conn, principal):
                 row = conn.execute(
-                    "SELECT action, params, proposer, proposer_role, dry_run, run_id FROM proposal WHERE id=%s",
+                    "SELECT action, params, proposer, proposer_role, dry_run, run_id, on_behalf_of, "
+                    "base_versions, expires_at < clock_timestamp() FROM proposal WHERE id=%s",
                     [proposal_id]).fetchone()
                 if row is None:
                     raise NotFound(f"proposal {proposal_id} not found")
-                action, params, proposer, _prole, dry, run_id = row
+                action, params, proposer, _prole, dry, run_id, behalf, base, expired = row
                 ctx_name["n"] = action
                 conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", [str(proposal_id)])
                 if conn.execute("SELECT 1 FROM approval WHERE proposal_id=%s", [proposal_id]).fetchone():
                     raise ValueError(f"proposal {proposal_id} was already decided")
                 if not pr.owner and not model.role_can_approve(pr.role, action):
                     raise PermissionDenied(f"role {pr.role!r} may not approve {action!r}")
-                if proposer == pr.user:
-                    raise PermissionDenied("the proposer cannot decide their own proposal")
+                if proposer == pr.user or (behalf and behalf == pr.user):
+                    raise PermissionDenied("the proposer (or the user the agent acted for) cannot decide "
+                                           "their own proposal")
+                if approve and expired:
+                    raise ProposalExpired(f"proposal {proposal_id} has expired")
                 aid = uuid4()
                 res = None
                 if approve:
-                    vt = _vt(valid_at) if valid_at is not None else datetime.fromisoformat(
-                        (dry or {}).get("valid_at") or datetime.now(UTC).isoformat())
+                    # executes at approval time (not the proposal's valid time) so binds and criteria see
+                    # current data; anything that changed since the dry run makes the proposal stale
+                    vt = _vt(valid_at) if valid_at is not None else datetime.now(UTC)
                     res = _do_execute(conn, model, _action(model, action), params, pr, vt, aid, source=source,
                                       run_id=run_id, proposal_id=proposal_id, tool_trace=tool_trace,
-                                      on_behalf_of=proposer, gate=False)
+                                      on_behalf_of=behalf or proposer, gate=False)
+                    changed = _stale_keys(base, res.diff)
+                    if changed:
+                        raise StaleProposal(changed)
                 try:
                     conn.execute(
                         "INSERT INTO approval (id, proposal_id, decision, approver, approver_role, comment, "
@@ -779,6 +824,32 @@ def decide(conn, proposal_id: UUID, principal, approve: bool, comment: str | Non
         pass
 
 
+# Properties the simulation rewrites constantly; they must not make every proposal about a moving shipment
+# stale. TODO: declare as `volatile: true` in the YAML ontology instead of a constant.
+VOLATILE_PROPS = frozenset({"position", "progress"})
+
+
+def _stable(snap):
+    return {k: v for k, v in snap.items() if k not in VOLATILE_PROPS} if isinstance(snap, dict) else snap
+
+
+def _base_versions(diff) -> dict:
+    """What a proposal was based on: the 'before' snapshot of every object/link the action touches."""
+    return {f"{d['kind']}:{d['type']}:{d['key']}": _stable(d["before"]) for d in diff}
+
+
+def _stale_keys(base, diff) -> list[str]:
+    """Keys whose recorded base differs from what the approval run saw."""
+    if not base:
+        return []
+    now = {f"{d['kind']}:{d['type']}:{d['key']}": _stable(json.loads(json.dumps(d["before"], default=str)))
+           for d in diff}
+    changed = {k for k, b in base.items() if now.get(k, "<missing>") != b}
+    # something that already existed at approval but was not part of the proposal (e.g. a link added since)
+    changed |= {k for k, v in now.items() if k not in base and v is not None}
+    return sorted(changed)
+
+
 def _guarded_decide(conn, model, pr, proposal_id, vt0, source, tool_trace, fn, ctx_name):
     try:
         try:
@@ -791,6 +862,9 @@ def _guarded_decide(conn, model, pr, proposal_id, vt0, source, tool_trace, fn, c
         raise
     except CriteriaFailed as e:
         _deny(conn, model, pr, proposal_id, vt0, source, tool_trace, ctx_name, str(e), e.failures)
+        raise
+    except (StaleProposal, ProposalExpired) as e:
+        _deny(conn, model, pr, proposal_id, vt0, source, tool_trace, ctx_name, str(e), None)
         raise
 
 

@@ -146,3 +146,49 @@ Expression language (no eval): `$param`, `$now`, `$actor`, `alias.prop`, literal
 - A create with an id that already exists (hidden or not) returns a generic 409, so existence of a hidden id is still distinguishable from a free id.
 - SERVICE federation cannot be disabled in pyoxigraph 0.5 (verified); it is blocked by validation only. Add egress filtering in deployment.
 - Runaway SPARQL queries cannot be cancelled in Oxigraph; the worker thread continues after the 5 s timeout (concurrency is capped at 4 requests, 429 beyond).
+
+# Phase 4 contracts (owned by the main session; frozen before implementation)
+
+Decisions (user approved the plan; the open questions take the recommended defaults, all configurable in YAML): P1 default model `claude-sonnet-5-5` (override with `AMARH_AGENT_MODEL`); P2 caps per run: 12 model turns, 25 tool calls, 60k output tokens, USD 0.50, 120 s wall clock; per user 1 concurrent run, 6 run starts per minute, USD 5 per day; P3 the agent never executes anything, no auto-execute class; P4 the user who started a run cannot approve its proposals; P5 proposals expire after 24 wall hours and stale approvals are hard-blocked (409 `stale_proposal`); P6 new action `reroute_shipment` and a read-only `functions:` registry are added; P7 the admin agent gets a small explicit allowlist, never `all`.
+
+## Identity
+The agent's `Principal` is created server-side when a run starts (`get_principal`, same seam as the UI) and stored on the run. No tool parameter, prompt text or tool result can change it. Proposals created by an agent: `proposer = "agent:<role>"`, `proposer_role = role`, `on_behalf_of = <launching user>`. `decide` refuses an approver equal to `proposer` or `on_behalf_of` (`PermissionDenied`).
+
+## YAML additions
+```yaml
+roles:
+  planner:
+    agent:
+      allowlist: [delay_shipment, reroute_shipment, close_port]   # propose-only; must be in role.actions; generic actions rejected
+      tools: [query_objects, traverse, find_paths, impact_analysis, get_history, as_of, diff, run_function, propose_action]
+      instructions: "..."            # role persona/focus appended to the system prompt
+      max_tool_calls: 25             # optional overrides of the P2 defaults
+      max_cost_usd: 0.5
+functions:                           # read-only, role-gated, registered in Python (engine/functions.py)
+  shipments_at_risk: {description: ..., params: {port: "uuid!"}, roles: [planner, regional_ops_lead, admin]}
+```
+Effective agent permissions = user RLS (reads) AND role.actions AND agent.allowlist (propose) AND agent.tools. Compile fails on unknown names, allowlist entries outside role.actions, or generic actions (`create_object`, `update_object`, `delete_object`, `create_link`, `end_link`).
+
+## Tables (engine/db/governance.sql, append-only like the others)
+- `proposal` gains `on_behalf_of text`, `idempotency_key text UNIQUE NULLS DISTINCT`, `evidence jsonb`, `base_versions jsonb` (per touched object: `{type:id -> recorded_lower}`), `expires_at timestamptz`.
+- `agent_run(id uuid pk, seq, role, user, prompt, model, caps jsonb, started_at)` and `agent_run_event(seq, run_id, kind 'message'|'tool_call'|'tool_result'|'denied'|'proposal'|'finished', payload jsonb, tokens_in, tokens_out, cost_usd, at)`. Status is derived from the last `finished` event (`completed|capped|error|cancelled`). SELECT policy: admin all; otherwise `user = amarh.user`. Stored tool results are already masked.
+
+## API
+`POST /agent/runs {prompt}` -> 201 `{run_id}` (429 on limits); `GET /agent/runs/{id}/stream` (SSE events `delta|tool_call|tool_result|denied|proposal|finished`, each `{seq, ...}`); `GET /agent/runs?limit`; `GET /agent/runs/{id}` -> `{run, events:[..]}`; `POST /agent/runs/{id}/cancel`; `GET /agent/config` -> role's tools, allowlist, caps. Another role's run is a 404. `/proposals` rows gain `on_behalf_of, evidence, expires_at, expired: bool, stale: bool|null`. Approving a stale proposal: 409 `{code:'stale_proposal', changed:[keys]}`; an expired one: 409 `{code:'proposal_expired'}`.
+
+## Tool result envelope
+`{"ok": bool, "data": <masked, truncated>, "untrusted": true, "provenance": {"asserted": [..], "inferred": [{edge, rule, support}]}, "truncated": bool}`. Caps: query_objects limit 50; traverse depth 3, fan-out 25, nodes 100; find_paths hops 4, paths 10.
+
+## Known limitations after Phase 4 review
+Read-only security review of `agent/`, `agent_routes`, `decide` and the agent tables found no blocker: the model cannot change role, user, schema or approver set, cannot execute anything (only create a pending proposal), and cannot read what the launching human cannot. Fixed after review: property values named `ref` no longer register as facts, refs and uuid params use strict full-match and canonical UUID parsing (M3); stale detection also fails when an object or link existed at approval but was not in the proposal's snapshot (M4); a failed model call is charged an estimate against the daily budget (M6); no event can be appended to a finished run or to another user's run (trigger `amarh_run_open` + insert policy); DB/network errors are reduced to their class name in `finished.error`; at most 4 open SSE streams per live run (429). Remaining, accepted for now:
+1. **P4/D3 are only as strong as `x-role`.** One user per role (`demo-<role>`): whoever launched a planner run can send `x-role: admin` and approve it. The launcher ban holds at engine level (tests) but not against a header switch; it needs real auth. The admin agent's proposals (`on_behalf_of` demo-admin, approvers `[admin]`) cannot be approved by anyone.
+2. Admin can read every run, prompt and transcript (by design).
+3. Evidence is bound to refs the run retrieved, not to the truth of the claim; the UI shows claims as the agent's, unverified.
+4. Stale detection covers the keys in the dry-run diff; volatile props (`position`, `progress`) are ignored by design (TODO: move to YAML).
+5. Run registry, concurrency, global limit and cancel are in-process (one uvicorn worker). Per-minute and daily limits are DB-backed. Distinct `x-role` values are distinct users, so an anonymous client gets one budget per role; no global daily cap.
+6. `rationale`, `evidence.claim` and `dry_run` are written from the launcher's view and are not filtered by the approver's visibility; harmless while the only approver is admin.
+7. No retention or pagination for `agent_run_event`; `GET /agent/runs/{id}` returns all events. SSE and read routes have no rate limit beyond the per-run stream cap (not load-tested).
+8. Idempotent re-propose returns the existing proposal id with `pending_approval` even if it was since decided or expired (same run only).
+9. The injection scanner is regex-only telemetry; the defence is structural (low-privilege tools, intersection permissions, human approval).
+10. No live Claude API call has been made (no key in this environment): `AnthropicModel` is tested against a stub only. Mock evals prove platform enforcement and plumbing, not model judgement.
+11. Phase 3 limitations still hold (identity GUCs trusted inside a scoped session, view-level masking).

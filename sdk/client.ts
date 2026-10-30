@@ -129,7 +129,7 @@ export interface Warehouse extends WarehouseProps {
 
 export type ObjectTypeName = "Carrier" | "Event" | "Invoice" | "Port" | "PurchaseOrder" | "Shipment" | "Supplier" | "Warehouse";
 export type LinkTypeName = "affects" | "billed_by" | "invoices_for" | "operated_by" | "ships_from" | "ships_to" | "ships_via" | "supplies";
-export type ActionName = "close_port" | "create_link" | "create_object" | "delay_shipment" | "delete_object" | "end_link" | "flag_invoice" | "issue_invoice" | "pay_invoice" | "reopen_port" | "ship_arrive" | "ship_depart" | "ship_position" | "update_object";
+export type ActionName = "close_port" | "create_link" | "create_object" | "delay_shipment" | "delete_object" | "end_link" | "flag_invoice" | "issue_invoice" | "pay_invoice" | "reopen_port" | "reroute_shipment" | "ship_arrive" | "ship_depart" | "ship_position" | "update_object";
 export interface ActionParams {
   close_port: { port: string; reason?: string; duration_h?: number; event_id?: string };
   create_link: { link: string; src: string; dst: string };
@@ -141,6 +141,7 @@ export interface ActionParams {
   issue_invoice: { shipment: string; supplier: string; amount: number; currency?: string; due?: string; invoice_id?: string; ref?: string };
   pay_invoice: { invoice: string };
   reopen_port: { port: string };
+  reroute_shipment: { shipment: string; new_port: string; reason?: string };
   ship_arrive: { shipment: string };
   ship_depart: { shipment: string };
   ship_position: { shipment: string; position: GeoJSONPoint; progress: number };
@@ -184,7 +185,9 @@ export const ACTION_META: Record<ActionName, ActionMeta> = {
       }
     ],
     "requiresApproval": false,
-    "approvers": [],
+    "approvers": [
+      "admin"
+    ],
     "roles": [
       "admin",
       "planner",
@@ -285,7 +288,9 @@ export const ACTION_META: Record<ActionName, ActionMeta> = {
       }
     ],
     "requiresApproval": false,
-    "approvers": [],
+    "approvers": [
+      "admin"
+    ],
     "roles": [
       "admin",
       "planner",
@@ -368,7 +373,9 @@ export const ACTION_META: Record<ActionName, ActionMeta> = {
       }
     ],
     "requiresApproval": false,
-    "approvers": [],
+    "approvers": [
+      "admin"
+    ],
     "roles": [
       "admin",
       "finance_analyst",
@@ -468,12 +475,47 @@ export const ACTION_META: Record<ActionName, ActionMeta> = {
       }
     ],
     "requiresApproval": false,
-    "approvers": [],
+    "approvers": [
+      "admin"
+    ],
     "roles": [
       "admin",
       "planner",
       "regional_ops_lead",
       "sim"
+    ],
+    "webhooks": [],
+    "rollback": "compensate"
+  },
+  "reroute_shipment": {
+    "description": "Reroute a shipment from its current port to a new open port.",
+    "params": [
+      {
+        "name": "shipment",
+        "type": "uuid",
+        "ref": "Shipment",
+        "required": true
+      },
+      {
+        "name": "new_port",
+        "type": "uuid",
+        "ref": "Port",
+        "required": true
+      },
+      {
+        "name": "reason",
+        "type": "string",
+        "ref": null,
+        "required": false
+      }
+    ],
+    "requiresApproval": false,
+    "approvers": [
+      "admin"
+    ],
+    "roles": [
+      "admin",
+      "planner"
     ],
     "webhooks": [],
     "rollback": "compensate"
@@ -581,6 +623,141 @@ export const ACTION_META: Record<ActionName, ActionMeta> = {
     ],
     "webhooks": [],
     "rollback": "compensate"
+  }
+};
+export interface FunctionMeta { description: string; params: ActionParamMeta[]; roles: RoleName[] }
+export const FUNCTION_META: Record<string, FunctionMeta> = {
+  "invoice_anomaly_score": {
+    "description": "Deterministic anomaly score in [0,1] for an invoice (amount vs the supplier's other invoices), with reasons.",
+    "params": [
+      {
+        "name": "invoice",
+        "type": "uuid",
+        "ref": "Invoice",
+        "required": true
+      }
+    ],
+    "roles": [
+      "admin",
+      "finance_analyst"
+    ]
+  },
+  "risk_factors": {
+    "description": "Delay hours, closed ports on the route and open events affecting those ports for a shipment.",
+    "params": [
+      {
+        "name": "shipment",
+        "type": "uuid",
+        "ref": "Shipment",
+        "required": true
+      }
+    ],
+    "roles": [
+      "admin",
+      "finance_analyst",
+      "planner",
+      "regional_ops_lead"
+    ]
+  },
+  "shipments_at_risk": {
+    "description": "Non-arrived shipments that ship via a given port.",
+    "params": [
+      {
+        "name": "port",
+        "type": "uuid",
+        "ref": "Port",
+        "required": true
+      }
+    ],
+    "roles": [
+      "admin",
+      "finance_analyst",
+      "planner",
+      "regional_ops_lead"
+    ]
+  }
+};
+/** Per-role agent configuration (instructions are server-side only). */
+export const AGENT_META: Partial<Record<RoleName, { allowlist: ActionName[]; tools: string[]; max_tool_calls: number | null; max_cost_usd: number | null }>> = {
+  "admin": {
+    "allowlist": [
+      "flag_invoice",
+      "delay_shipment",
+      "close_port",
+      "reopen_port",
+      "reroute_shipment"
+    ],
+    "tools": [
+      "query_objects",
+      "traverse",
+      "find_paths",
+      "impact_analysis",
+      "get_history",
+      "as_of",
+      "diff",
+      "run_function",
+      "propose_action"
+    ],
+    "max_tool_calls": null,
+    "max_cost_usd": null
+  },
+  "finance_analyst": {
+    "allowlist": [
+      "flag_invoice",
+      "pay_invoice"
+    ],
+    "tools": [
+      "query_objects",
+      "traverse",
+      "find_paths",
+      "impact_analysis",
+      "get_history",
+      "as_of",
+      "diff",
+      "run_function",
+      "propose_action"
+    ],
+    "max_tool_calls": null,
+    "max_cost_usd": null
+  },
+  "planner": {
+    "allowlist": [
+      "delay_shipment",
+      "reroute_shipment",
+      "close_port"
+    ],
+    "tools": [
+      "query_objects",
+      "traverse",
+      "find_paths",
+      "impact_analysis",
+      "get_history",
+      "as_of",
+      "diff",
+      "run_function",
+      "propose_action"
+    ],
+    "max_tool_calls": null,
+    "max_cost_usd": null
+  },
+  "regional_ops_lead": {
+    "allowlist": [
+      "close_port",
+      "reopen_port"
+    ],
+    "tools": [
+      "query_objects",
+      "traverse",
+      "find_paths",
+      "impact_analysis",
+      "get_history",
+      "as_of",
+      "diff",
+      "run_function",
+      "propose_action"
+    ],
+    "max_tool_calls": null,
+    "max_cost_usd": null
   }
 };
 

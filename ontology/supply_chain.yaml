@@ -56,7 +56,11 @@ roles:
       PurchaseOrder: {read: true}
       Invoice: {read: false}
     links: [ships_via, ships_from, ships_to, operated_by, supplies, affects]
-    actions: [create_object, update_object, delete_object, create_link, end_link, ship_depart, ship_position, ship_arrive, delay_shipment, close_port, reopen_port]
+    actions: [create_object, update_object, delete_object, create_link, end_link, ship_depart, ship_position, ship_arrive, delay_shipment, reroute_shipment, close_port, reopen_port]
+    agent:
+      allowlist: [delay_shipment, reroute_shipment, close_port]
+      tools: [query_objects, traverse, find_paths, impact_analysis, get_history, as_of, diff, run_function, propose_action]
+      instructions: "Focus on shipments, ports and rerouting. Use shipments_at_risk and risk_factors before proposing a delay or reroute; propose close_port only when an open Event justifies it. Invoices are not visible to you."
   finance_analyst:
     description: Finance analyst. Works with invoices and purchase orders; proposes payments for approval.
     types:
@@ -70,6 +74,10 @@ roles:
       Event: {read: true}
     links: [invoices_for, billed_by, supplies, ships_via, ships_from, ships_to, operated_by, affects]
     actions: [create_object, update_object, create_link, end_link, issue_invoice, flag_invoice, pay_invoice]
+    agent:
+      allowlist: [flag_invoice, pay_invoice]
+      tools: [query_objects, traverse, find_paths, impact_analysis, get_history, as_of, diff, run_function, propose_action]
+      instructions: "Focus on invoices and anomalies. Use invoice_anomaly_score to find suspicious invoices and propose flag_invoice with the reasons. Never pay an invoice without approval: pay_invoice is only ever proposed, and only for open, unflagged invoices."
   regional_ops_lead:
     description: Regional operations lead (EMEA). Sees and operates only ports and warehouses of their region and the shipments heading to them.
     region: EMEA
@@ -82,17 +90,38 @@ roles:
       Event: {read: true, write: true}
     links: [ships_via, ships_from, ships_to, operated_by, supplies, affects]
     actions: [close_port, reopen_port]
+    agent:
+      allowlist: [close_port, reopen_port]
+      tools: [query_objects, traverse, find_paths, impact_analysis, get_history, as_of, diff, run_function, propose_action]
+      instructions: "You serve the EMEA region only. Consider only ports, warehouses and shipments visible to you, and propose port closures or reopenings for EMEA ports."
   admin:
     description: Administrator. Full access, approves every approval-gated action.
     types: all
     links: all
     actions: all
     approves: all
+    agent:
+      allowlist: [flag_invoice, delay_shipment, close_port, reopen_port, reroute_shipment]
+      tools: [query_objects, traverse, find_paths, impact_analysis, get_history, as_of, diff, run_function, propose_action]
+      instructions: "Administrator assistant with a deliberately small proposal allowlist. Prefer read-only analysis; propose only when evidence is clear. You cannot approve your own proposals."
   sim:
     description: System role used by the simulation. Never selectable from the UI.
     types: all
     links: all
     actions: [create_object, create_link, ship_depart, ship_position, ship_arrive, delay_shipment, close_port, reopen_port, issue_invoice, flag_invoice, pay_invoice]
+functions:
+  shipments_at_risk:
+    description: Non-arrived shipments that ship via a given port.
+    params: {port: "uuid(Port)!"}
+    roles: [planner, regional_ops_lead, finance_analyst, admin]
+  invoice_anomaly_score:
+    description: Deterministic anomaly score in [0,1] for an invoice (amount vs the supplier's other invoices), with reasons.
+    params: {invoice: "uuid(Invoice)!"}
+    roles: [finance_analyst, admin]
+  risk_factors:
+    description: Delay hours, closed ports on the route and open events affecting those ports for a shipment.
+    params: {shipment: "uuid(Shipment)!"}
+    roles: [planner, regional_ops_lead, finance_analyst, admin]
 webhooks:
   notify_ops: {url_env: AMARH_WEBHOOK_OPS_URL, method: POST, max_attempts: 5, description: Notify operations of port disruptions.}
   notify_finance: {url_env: AMARH_WEBHOOK_FINANCE_URL, method: POST, max_attempts: 5, description: Notify finance of flagged invoices.}
@@ -144,6 +173,7 @@ actions:
   delay_shipment:
     description: Mark a shipment delayed and push its ETA back.
     params: {shipment: "uuid!", delay_hours: "float!", reason: string}
+    approval: {approvers: [admin]}   # who may approve proposals (agent proposals)
     roles: [planner, admin, sim]
     bind: {sh: {type: Shipment, id: $shipment}}
     criteria:
@@ -152,13 +182,25 @@ actions:
   close_port:
     description: Close a port, open a port_closure Event affecting it.
     params: {port: "uuid!", reason: string, duration_h: float, event_id: uuid}
+    approval: {approvers: [admin]}   # who may approve proposals (agent proposals)
     roles: [planner, regional_ops_lead, admin, sim]
     bind: {port: {type: Port, id: $port}}
     function: close_port
     webhooks: [notify_ops]
+  reroute_shipment:
+    description: Reroute a shipment from its current port to a new open port.
+    params: {shipment: "uuid(Shipment)!", new_port: "uuid(Port)!", reason: string}
+    approval: {approvers: [admin]}   # who may approve proposals (agent proposals)
+    roles: [planner, admin]
+    bind: {sh: {type: Shipment, id: $shipment}, np: {type: Port, id: $new_port}}
+    criteria:
+      - {expr: "sh.status != 'arrived'", message: "Shipment has already arrived"}
+      - {expr: "np.status == 'open'", message: "New port is not open"}
+    function: reroute_shipment
   reopen_port:
     description: Reopen a port and end its open closure Event.
     params: {port: "uuid!"}
+    approval: {approvers: [admin]}   # who may approve proposals (agent proposals)
     roles: [planner, regional_ops_lead, admin, sim]
     bind: {port: {type: Port, id: $port}}
     function: reopen_port
@@ -173,6 +215,7 @@ actions:
   flag_invoice:
     description: Flag an invoice as anomalous.
     params: {invoice: "uuid!", anomaly: "string!"}
+    approval: {approvers: [admin]}   # who may approve proposals (agent proposals)
     roles: [finance_analyst, admin, sim]
     bind: {inv: {type: Invoice, id: $invoice}}
     criteria:
