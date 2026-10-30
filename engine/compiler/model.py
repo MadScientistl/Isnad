@@ -139,7 +139,8 @@ class TypeAccess:
 
 
 AGENT_TOOLS = ("query_objects", "traverse", "find_paths", "impact_analysis", "get_history", "as_of", "diff",
-               "run_function", "propose_action")
+               "run_function", "propose_action", "scenario_open", "scenario_apply", "scenario_simulate",
+               "scenario_compare")
 GENERIC_ACTIONS = ("create_object", "update_object", "delete_object", "create_link", "end_link")
 
 

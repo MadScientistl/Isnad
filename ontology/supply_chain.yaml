@@ -5,7 +5,7 @@ classes:
   Port: {extends: Facility}
   Warehouse: {extends: Facility}
 objectTypes:
-  Supplier:  {properties: {name: "string!", country: string}}
+  Supplier:  {properties: {name: "string!", country: string, price_index: float}}
   Port:      {properties: {name: "string!", lat: float, lon: float, location: point, status: {enum: [open, closed]}, region: {enum: [APAC, EMEA, AMER]}}}
   Warehouse: {properties: {name: "string!", lat: float, lon: float, location: point, region: {enum: [APAC, EMEA, AMER]}}}
   Shipment:
@@ -17,6 +17,7 @@ objectTypes:
       progress: float
       cargo_value: float
       delay_hours: float
+      extra_cost: float
   Carrier:   {properties: {name: "string!"}}
   Invoice:
     properties:
@@ -59,7 +60,7 @@ roles:
     actions: [create_object, update_object, delete_object, create_link, end_link, ship_depart, ship_position, ship_arrive, delay_shipment, reroute_shipment, close_port, reopen_port]
     agent:
       allowlist: [delay_shipment, reroute_shipment, close_port]
-      tools: [query_objects, traverse, find_paths, impact_analysis, get_history, as_of, diff, run_function, propose_action]
+      tools: [query_objects, traverse, find_paths, impact_analysis, get_history, as_of, diff, run_function, propose_action, scenario_open, scenario_apply, scenario_simulate, scenario_compare]
       instructions: "Focus on shipments, ports and rerouting. Use shipments_at_risk and risk_factors before proposing a delay or reroute; propose close_port only when an open Event justifies it. Invoices are not visible to you."
   finance_analyst:
     description: Finance analyst. Works with invoices and purchase orders; proposes payments for approval.
@@ -76,7 +77,7 @@ roles:
     actions: [create_object, update_object, create_link, end_link, issue_invoice, flag_invoice, pay_invoice]
     agent:
       allowlist: [flag_invoice, pay_invoice]
-      tools: [query_objects, traverse, find_paths, impact_analysis, get_history, as_of, diff, run_function, propose_action]
+      tools: [query_objects, traverse, find_paths, impact_analysis, get_history, as_of, diff, run_function, propose_action, scenario_open, scenario_compare]
       instructions: "Focus on invoices and anomalies. Use invoice_anomaly_score to find suspicious invoices and propose flag_invoice with the reasons. Never pay an invoice without approval: pay_invoice is only ever proposed, and only for open, unflagged invoices."
   regional_ops_lead:
     description: Regional operations lead (EMEA). Sees and operates only ports and warehouses of their region and the shipments heading to them.
@@ -92,7 +93,7 @@ roles:
     actions: [close_port, reopen_port]
     agent:
       allowlist: [close_port, reopen_port]
-      tools: [query_objects, traverse, find_paths, impact_analysis, get_history, as_of, diff, run_function, propose_action]
+      tools: [query_objects, traverse, find_paths, impact_analysis, get_history, as_of, diff, run_function, propose_action, scenario_open, scenario_apply, scenario_simulate, scenario_compare]
       instructions: "You serve the EMEA region only. Consider only ports, warehouses and shipments visible to you, and propose port closures or reopenings for EMEA ports."
   admin:
     description: Administrator. Full access, approves every approval-gated action.
@@ -102,13 +103,13 @@ roles:
     approves: all
     agent:
       allowlist: [flag_invoice, delay_shipment, close_port, reopen_port, reroute_shipment]
-      tools: [query_objects, traverse, find_paths, impact_analysis, get_history, as_of, diff, run_function, propose_action]
+      tools: [query_objects, traverse, find_paths, impact_analysis, get_history, as_of, diff, run_function, propose_action, scenario_open, scenario_apply, scenario_simulate, scenario_compare]
       instructions: "Administrator assistant with a deliberately small proposal allowlist. Prefer read-only analysis; propose only when evidence is clear. You cannot approve your own proposals."
   sim:
     description: System role used by the simulation. Never selectable from the UI.
     types: all
     links: all
-    actions: [create_object, create_link, ship_depart, ship_position, ship_arrive, delay_shipment, close_port, reopen_port, issue_invoice, flag_invoice, pay_invoice]
+    actions: [create_object, create_link, ship_depart, ship_position, ship_arrive, delay_shipment, close_port, reopen_port, issue_invoice, flag_invoice, pay_invoice, set_supplier_price_index]
 functions:
   shipments_at_risk:
     description: Non-arrived shipments that ship via a given port.
@@ -204,6 +205,16 @@ actions:
     roles: [planner, regional_ops_lead, admin, sim]
     bind: {port: {type: Port, id: $port}}
     function: reopen_port
+  set_supplier_price_index:
+    description: Set a supplier's price index (used by the simulation price shock; sim and admin only).
+    params: {supplier: "uuid(Supplier)!", price_index: "float!"}
+    roles: [sim, admin]
+    bind: {su: {type: Supplier, id: $supplier}}
+    criteria:
+      - {expr: "$price_index > 0", message: "Price index must be positive"}
+      - {expr: "$price_index < 1000", message: "Price index must be below 1000"}
+    rules:
+      - modify: {type: Supplier, id: $supplier, set: {price_index: $price_index}}
   issue_invoice:
     description: Issue an invoice for a shipment, billed by a supplier.
     params: {shipment: "uuid!", supplier: "uuid!", amount: "float!", currency: string, due: timestamp, invoice_id: uuid, ref: string}

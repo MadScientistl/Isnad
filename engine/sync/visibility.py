@@ -17,6 +17,13 @@ Design rules
   every asserted edge between consecutive support nodes visible (`inferred_visible`). An
   inferred edge without any recorded derivation is hidden for non-admin (fail closed).
 
+* Scenarios (Phase 5): every function takes an optional keyword `scenario: ScenarioCtx | None`.
+  None = main, behaviour unchanged (`cur_*` views). With a scenario the connection must be inside
+  `scoped(conn, principal, scenario=ctx)` (the `eff_*` views read the scenario GUCs); relations come from
+  the `eff_obj_*` / `eff_link_*` / `rd_eff_obj_*` family (RLS + masking + D4/D6 preserved) and inferred
+  support is read from `inferred_support WHERE scenario_id = ctx.id`. The GUCs on the connection must
+  match `scenario` (checked, fail closed). `as_of` is not supported inside a scenario (ValueError).
+
 Edge tuples everywhere are `(src: UUID, link: str, dst: UUID)` (same order as
 `SyncPipeline.inferred_edges`).
 """
@@ -32,6 +39,7 @@ from psycopg import sql
 
 from engine.db import bitemporal as bt
 from engine.reason.materialize import link_semantics
+from engine.db.principal import ScenarioCtx
 from .store import DEFAULT_YAML, SyncConfig, _yaml_defaults
 
 Edge = tuple  # (UUID src, str link, UUID dst)
@@ -54,8 +62,27 @@ def _uuids(ids: Iterable) -> list[UUID]:
     return [i if isinstance(i, UUID) else UUID(str(i)) for i in ids]
 
 
-def _rel(table: str, as_of, kind: str) -> tuple[sql.Composable, list]:
-    """Relation + params to read `table` (obj_*/link_*) now (cur_ view) or as of valid time."""
+def _check_scn(conn, scenario, as_of=None) -> int:
+    """Validate the optional scenario argument; returns the scenario id (0 = main).
+
+    Fails closed when the connection's scenario GUC does not match (a mismatch would silently read
+    main or another scenario through the `eff_*` views)."""
+    if scenario is None:
+        return 0
+    if not isinstance(scenario, ScenarioCtx):
+        raise TypeError("scenario must be a ScenarioCtx or None")
+    if as_of is not None:
+        raise ValueError("as_of is not supported inside a scenario")
+    got = conn.execute("SELECT current_setting('amarh.scenario', true)").fetchone()[0]
+    if str(got or "") != str(scenario.id):
+        raise PermissionError("connection is not scoped to this scenario")
+    return scenario.id
+
+
+def _rel(table: str, as_of, kind: str, scenario: ScenarioCtx | None = None) -> tuple[sql.Composable, list]:
+    """Relation + params to read `table` (obj_*/link_*) now (cur_ view), as of valid time, or in a scenario (eff_ view)."""
+    if scenario is not None:
+        return sql.Identifier("eff_" + table), []
     if as_of is None:
         return sql.Identifier("cur_" + table), []
     c, p = bt._asof_clause(as_of, None)
@@ -64,35 +91,41 @@ def _rel(table: str, as_of, kind: str) -> tuple[sql.Composable, list]:
 
 
 # --------------------------------------------------------------------------- objects
-def visible_ids(conn, ids: Iterable, *, as_of=None, cfg: SyncConfig | None = None) -> set[UUID]:
+def visible_ids(conn, ids: Iterable, *, as_of=None, cfg: SyncConfig | None = None,
+                scenario: ScenarioCtx | None = None) -> set[UUID]:
     """Subset of `ids` the current principal can see (one query over all object types)."""
     ids = list(dict.fromkeys(_uuids(ids)))
+    _check_scn(conn, scenario, as_of)
     if not ids:
         return set()
     parts, params = [], []
     for t in _cfg(cfg).object_types:
-        rel, p = _rel(bt.obj_table(t), as_of, "obj")
+        rel, p = _rel(bt.obj_table(t), as_of, "obj", scenario)
         parts.append(sql.SQL("SELECT id FROM {} x WHERE id = ANY(%s::uuid[])").format(rel))
         params += p + [ids]
     q = sql.SQL(" UNION ").join(parts)
     return {r[0] for r in conn.execute(q, params).fetchall()}
 
 
-def all_visible_ids(conn, *, cfg: SyncConfig | None = None) -> dict[str, list[UUID]]:
+def all_visible_ids(conn, *, cfg: SyncConfig | None = None,
+                    scenario: ScenarioCtx | None = None) -> dict[str, list[UUID]]:
     """type -> every currently visible id of that type (used to build the SPARQL view)."""
+    _check_scn(conn, scenario)
+    pre = "eff_" if scenario is not None else "cur_"
     out: dict[str, list[UUID]] = {}
     for t in _cfg(cfg).object_types:
         out[t] = [r[0] for r in conn.execute(
-            sql.SQL("SELECT DISTINCT id FROM {}").format(sql.Identifier("cur_" + bt.obj_table(t)))).fetchall()]
+            sql.SQL("SELECT DISTINCT id FROM {}").format(sql.Identifier(pre + bt.obj_table(t)))).fetchall()]
     return out
 
 
 def node_infos(conn, ids: Iterable, *, as_of=None, cfg: SyncConfig | None = None,
-               model=None) -> dict[str, dict]:
+               model=None, scenario: ScenarioCtx | None = None) -> dict[str, dict]:
     """{id: {id, type, label, status}} for visible ids, read through the masked `rd_*` views.
 
     Same shape as the existing /graph node (`label` = name|ref|kind else short id)."""
     ids = list(dict.fromkeys(_uuids(ids)))
+    _check_scn(conn, scenario, as_of)
     if not ids:
         return {}
     if model is None:
@@ -106,7 +139,11 @@ def node_infos(conn, ids: Iterable, *, as_of=None, cfg: SyncConfig | None = None
         pn = {p.name for p in ot.properties}
         lab = next((c for c in ("name", "ref", "kind") if c in pn), None)
         table = bt.obj_table(t)
-        if as_of is None:
+        if scenario is not None:
+            src = sql.Identifier(_rd_eff(conn, table))
+            where = sql.SQL("id = ANY(%s::uuid[])")
+            p = [ids]
+        elif as_of is None:
             src = sql.Identifier(_rd_cur(conn, table))
             where = sql.SQL("id = ANY(%s::uuid[])")
             p = [ids]
@@ -133,11 +170,20 @@ def _rd_cur(conn, table: str) -> str:
     return rd if ok else "cur_" + table
 
 
+def _rd_eff(conn, table: str) -> str:
+    """Masked scenario-effective view (falls back to the unmasked eff_ view when no mask views exist)."""
+    rd = f"rd_eff_{table}"
+    ok = conn.execute("SELECT to_regclass(%s) IS NOT NULL", [rd]).fetchone()[0]
+    return rd if ok else "eff_" + table
+
+
 # --------------------------------------------------------------------------- edges
 def visible_edges(conn, ids: Iterable, *, as_of=None, link_types: Sequence[str] | None = None,
-                  direction: str = "both", cfg: SyncConfig | None = None) -> list[Edge]:
+                  direction: str = "both", cfg: SyncConfig | None = None,
+                  scenario: ScenarioCtx | None = None) -> list[Edge]:
     """Asserted edges touching `ids` that survive link RLS AND whose endpoints are both visible."""
     ids = list(dict.fromkeys(_uuids(ids)))
+    _check_scn(conn, scenario, as_of)
     if not ids:
         return []
     cfg = _cfg(cfg)
@@ -147,7 +193,7 @@ def visible_edges(conn, ids: Iterable, *, as_of=None, link_types: Sequence[str] 
     for l in cfg.link_types:
         if link_types is not None and l not in link_types:
             continue
-        rel, p = _rel(bt.link_table(l), as_of, "link")
+        rel, p = _rel(bt.link_table(l), as_of, "link", scenario)
         parts.append(sql.SQL("SELECT DISTINCT src, {l}::text AS link, dst FROM {r} x WHERE {c}").format(
             l=sql.Literal(l), r=rel, c=sql.SQL(cond)))
         params += p + [ids] * cond.count("%s")
@@ -155,26 +201,29 @@ def visible_edges(conn, ids: Iterable, *, as_of=None, link_types: Sequence[str] 
         return []
     rows = conn.execute(sql.SQL(" UNION ALL ").join(parts), params).fetchall()
     nodes = {r[0] for r in rows} | {r[2] for r in rows}
-    ok = visible_ids(conn, nodes, as_of=as_of, cfg=cfg)
+    ok = visible_ids(conn, nodes, as_of=as_of, cfg=cfg, scenario=scenario)
     return sorted({(s, l, d) for s, l, d in rows if s in ok and d in ok}, key=lambda e: (str(e[0]), e[1], str(e[2])))
 
 
-def edges_exist(conn, link: str, pairs: Iterable[tuple[UUID, UUID]]) -> set[tuple[UUID, UUID]]:
-    """Current asserted (src,dst) pairs of `link` visible under link RLS."""
+def edges_exist(conn, link: str, pairs: Iterable[tuple[UUID, UUID]], *,
+                scenario: ScenarioCtx | None = None) -> set[tuple[UUID, UUID]]:
+    """Current asserted (src,dst) pairs of `link` visible under link RLS (scenario: scenario-effective)."""
     pairs = list(set(pairs))
+    _check_scn(conn, scenario)
     if not pairs:
         return set()
     srcs, dsts = [p[0] for p in pairs], [p[1] for p in pairs]
     rows = conn.execute(
         sql.SQL("SELECT k.src, k.dst FROM {} k JOIN unnest(%s::uuid[], %s::uuid[]) u(s, d) "
-                "ON k.src = u.s AND k.dst = u.d").format(sql.Identifier("cur_" + bt.link_table(link))),
+                "ON k.src = u.s AND k.dst = u.d").format(
+            sql.Identifier(("eff_" if scenario is not None else "cur_") + bt.link_table(link))),
         [srcs, dsts]).fetchall()
     return {(r[0], r[1]) for r in rows}
 
 
 # --------------------------------------------------------------------------- inferred (D6)
 def inferred_visible(conn, edges: Iterable[Edge], *, is_admin: bool = False,
-                     cfg: SyncConfig | None = None) -> set[Edge]:
+                     cfg: SyncConfig | None = None, scenario: ScenarioCtx | None = None) -> set[Edge]:
     """Subset of inferred `edges` the principal may see.
 
     An edge is visible iff >= 1 derivation in `inferred_support` exists such that
@@ -184,27 +233,30 @@ def inferred_visible(conn, edges: Iterable[Edge], *, is_admin: bool = False,
     the path runs dst -> src; see engine.reason.materialize.link_semantics). Edges without any
     recorded derivation are hidden unless `is_admin` (admins see everything).
     Only current state: callers must not ask for inferred edges when `as_of` is in the past.
+    With `scenario`, derivations are those recorded for that scenario (`scenario_id = ctx.id`) and
+    node/edge visibility is judged on the scenario-effective state.
     """
     edges = list(dict.fromkeys(edges))
+    sid = _check_scn(conn, scenario)
     if not edges:
         return set()
     sem = link_semantics()
     rows = conn.execute(
         "SELECT s.link, s.src, s.dst, s.derivation_no, s.support FROM inferred_support s "
         "JOIN unnest(%s::text[], %s::uuid[], %s::uuid[]) e(l, a, b) "
-        "ON s.link = e.l AND s.src = e.a AND s.dst = e.b",
-        [[e[1] for e in edges], [e[0] for e in edges], [e[2] for e in edges]]).fetchall()
+        "ON s.link = e.l AND s.src = e.a AND s.dst = e.b WHERE s.scenario_id = %s",
+        [[e[1] for e in edges], [e[0] for e in edges], [e[2] for e in edges], sid]).fetchall()
     support_nodes: set[UUID] = set()
     for _, _, _, _, sup in rows:
         support_nodes.update(sup)
-    vis = visible_ids(conn, support_nodes, cfg=cfg)
+    vis = visible_ids(conn, support_nodes, cfg=cfg, scenario=scenario)
     # consecutive pairs per base link, checked once, in bulk
     need: dict[str, set] = {}
     for link, _, _, _, sup in rows:
         base = sem.get(link, (link, False))[0]
         if all(n in vis for n in sup):
             need.setdefault(base, set()).update(zip(sup, sup[1:]))
-    ok_pairs = {b: edges_exist(conn, b, ps) for b, ps in need.items()}
+    ok_pairs = {b: edges_exist(conn, b, ps, scenario=scenario) for b, ps in need.items()}
     out: set[Edge] = set()
     for link, src, dst, _, sup in rows:
         if (src, link, dst) in out or len(sup) < 2:
@@ -215,6 +267,18 @@ def inferred_visible(conn, edges: Iterable[Edge], *, is_admin: bool = False,
     if is_admin:  # admin: everything, including edges without recorded support
         out |= set(edges)
     return out
+
+
+def _scn_pipeline(pipeline, scenario):
+    """The object providing `cfg` / `inferred_edges` for this read. In a scenario it must be that scenario's
+    ScenarioGraph; anything else (notably the main SyncPipeline) is dropped so main inferences never leak in."""
+    if scenario is None:
+        if pipeline is not None and getattr(pipeline, "scenario_id", 0):
+            raise ValueError("a ScenarioGraph needs scenario=<its ScenarioCtx>")
+        return pipeline
+    if pipeline is not None and getattr(pipeline, "scenario_id", 0) == scenario.id:
+        return pipeline
+    return None
 
 
 # --------------------------------------------------------------------------- traversal
@@ -231,7 +295,8 @@ class GraphResult:
 
 def bfs(conn, center, depth: int = 1, *, pipeline=None, as_of=None, include_inferred: bool = True,
         link_types: Sequence[str] | None = None, max_nodes: int = 300, max_fanout: int | None = None,
-        is_admin: bool = False, deadline: float | None = None, cfg: SyncConfig | None = None) -> GraphResult:
+        is_admin: bool = False, deadline: float | None = None, cfg: SyncConfig | None = None,
+        scenario: ScenarioCtx | None = None) -> GraphResult:
     """Breadth-first expansion from `center` through VISIBLE nodes and VISIBLE edges only.
 
     Raises `NotVisible` when the center itself is hidden/missing (API: 404). `truncated` is set
@@ -239,10 +304,13 @@ def bfs(conn, center, depth: int = 1, *, pipeline=None, as_of=None, include_infe
     for the live state (as_of None) between nodes already in the result; they never extend the
     frontier (same behaviour as the pre-Phase-3 /graph).
     `deadline` = time.monotonic() value; TimeoutError when exceeded.
+    `scenario`: read the scenario-effective graph; `pipeline` must then be the scenario's
+    `ScenarioGraph` (a main `SyncPipeline` is ignored: no inferred edges, never main's).
     """
     center = _uuids([center])[0]
     cfg = cfg or (pipeline.cfg if pipeline is not None else SyncConfig())
-    if center not in visible_ids(conn, [center], as_of=as_of, cfg=cfg):
+    pipeline = _scn_pipeline(pipeline, scenario)
+    if center not in visible_ids(conn, [center], as_of=as_of, cfg=cfg, scenario=scenario):
         raise NotVisible(str(center))
     nodes = {center: None}
     seen_edges: dict[Edge, None] = {}
@@ -251,7 +319,7 @@ def bfs(conn, center, depth: int = 1, *, pipeline=None, as_of=None, include_infe
         _check_deadline(deadline)
         if not frontier or truncated:
             break
-        edges = visible_edges(conn, frontier, as_of=as_of, link_types=link_types, cfg=cfg)
+        edges = visible_edges(conn, frontier, as_of=as_of, link_types=link_types, cfg=cfg, scenario=scenario)
         if max_fanout is not None:
             per: dict[UUID, int] = {}
             kept = []
@@ -285,7 +353,7 @@ def bfs(conn, center, depth: int = 1, *, pipeline=None, as_of=None, include_infe
             have = {(e[0], e[2], e[1]) for e in res.edges}
             cand_inf = [e for e in pipeline.inferred_edges(order)
                         if e[0] in nodes and e[2] in nodes and (e[0], e[2], e[1]) not in have]
-            vis = inferred_visible(conn, cand_inf, is_admin=is_admin, cfg=cfg)
+            vis = inferred_visible(conn, cand_inf, is_admin=is_admin, cfg=cfg, scenario=scenario)
             res.inferred = sorted(vis, key=lambda e: (str(e[0]), e[1], str(e[2])))
         except Exception:  # noqa: BLE001 - mirror old behaviour: inferred layer is optional
             res.inferred_available = False
@@ -296,7 +364,7 @@ def bfs(conn, center, depth: int = 1, *, pipeline=None, as_of=None, include_infe
 def find_paths(conn, a, b, *, max_hops: int = 4, pipeline=None, as_of=None, include_inferred: bool = False,
                link_types: Sequence[str] | None = None, max_paths: int = 20, max_nodes: int = 2000,
                is_admin: bool = False, deadline: float | None = None,
-               cfg: SyncConfig | None = None) -> list[list[tuple[UUID, str | None, str | None]]]:
+               cfg: SyncConfig | None = None, scenario: ScenarioCtx | None = None) -> list[list[tuple[UUID, str | None, str | None]]]:
     """Shortest-first simple paths a -> b, treating links as undirected, checking EVERY hop.
 
     Each hop is an edge returned by `visible_edges` between two visible nodes (hidden middle
@@ -307,7 +375,8 @@ def find_paths(conn, a, b, *, max_hops: int = 4, pipeline=None, as_of=None, incl
     """
     a, b = _uuids([a, b])
     cfg = cfg or (pipeline.cfg if pipeline is not None else SyncConfig())
-    if {a, b} - visible_ids(conn, [a, b], as_of=as_of, cfg=cfg):
+    pipeline = _scn_pipeline(pipeline, scenario)
+    if {a, b} - visible_ids(conn, [a, b], as_of=as_of, cfg=cfg, scenario=scenario):
         raise NotVisible("endpoint not visible")
     parents: dict[UUID, list[tuple[UUID, str, str]]] = {a: []}
     level, dist = [a], {a: 0}
@@ -316,10 +385,10 @@ def find_paths(conn, a, b, *, max_hops: int = 4, pipeline=None, as_of=None, incl
         if found or not level or len(dist) > max_nodes:
             break
         _check_deadline(deadline)
-        edges = visible_edges(conn, level, as_of=as_of, link_types=link_types, cfg=cfg)
+        edges = visible_edges(conn, level, as_of=as_of, link_types=link_types, cfg=cfg, scenario=scenario)
         if include_inferred and as_of is None and pipeline is not None:
             ie = pipeline.inferred_edges(level)
-            edges = edges + sorted(inferred_visible(conn, ie, is_admin=is_admin, cfg=cfg),
+            edges = edges + sorted(inferred_visible(conn, ie, is_admin=is_admin, cfg=cfg, scenario=scenario),
                                    key=lambda e: (str(e[0]), e[1], str(e[2])))
         nxt = []
         for s, l, d in edges:

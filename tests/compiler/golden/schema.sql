@@ -2,6 +2,232 @@
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 CREATE EXTENSION IF NOT EXISTS postgis;
 
+-- BEGIN scenario_core
+-- Everything the compiler's generated DDL (eff_* views, scenario policies) depends on. The compiler splices this
+-- section verbatim into build/schema.sql so a schema built from the compiler output alone is self-sufficient;
+-- keep it idempotent and free of references to anything outside the section.
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'amarh_app') THEN
+    CREATE ROLE amarh_app NOLOGIN NOBYPASSRLS;
+  END IF;
+EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL;
+END $$;
+DO $$ BEGIN EXECUTE format('GRANT USAGE ON SCHEMA %I TO amarh_app', current_schema()); END $$;
+-- amarh_app may not create temp tables (a temp table could shadow an unqualified relation); the loader
+-- (connection user) keeps the privilege.
+DO $$
+DECLARE n int := 0;
+BEGIN
+  LOOP
+    BEGIN
+      EXECUTE format('REVOKE TEMPORARY ON DATABASE %I FROM PUBLIC', current_database());
+      EXECUTE format('REVOKE TEMPORARY ON DATABASE %I FROM amarh_app', current_database());
+      EXECUTE format('GRANT TEMPORARY ON DATABASE %I TO %I', current_database(), current_user);
+      EXIT;
+    EXCEPTION WHEN internal_error THEN
+      -- "tuple concurrently updated": another session is applying the same grants; retry briefly
+      n := n + 1;
+      IF n >= 20 THEN RAISE; END IF;
+      PERFORM pg_sleep(0.05 * n);
+    END;
+  END LOOP;
+END $$;
+
+CREATE OR REPLACE FUNCTION amarh_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION 'table % is append-only (% rejected)', TG_TABLE_NAME, TG_OP
+    USING ERRCODE = 'integrity_constraint_violation';
+END $$;
+
+
+-- helpers: GUC readers (invoker, inlinable)
+CREATE OR REPLACE FUNCTION amarh_scn() RETURNS int LANGUAGE sql STABLE AS $fn$
+  SELECT coalesce(nullif(current_setting('amarh.scenario', true), '')::int, 0) $fn$;
+CREATE OR REPLACE FUNCTION amarh_scn_base() RETURNS timestamptz LANGUAGE sql STABLE AS $fn$
+  SELECT nullif(current_setting('amarh.scenario_base', true), '')::timestamptz $fn$;
+CREATE OR REPLACE FUNCTION amarh_now() RETURNS timestamptz LANGUAGE sql STABLE AS $fn$
+  SELECT coalesce(nullif(current_setting('amarh.now', true), '')::timestamptz, now()) $fn$;
+
+-- main-only tables (graph_outbox, webhook_outbox/delivery): inserts are refused while a scenario is active
+CREATE OR REPLACE FUNCTION amarh_no_scenario_write() RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+  IF coalesce(nullif(current_setting('amarh.scenario', true), ''), '0') <> '0' THEN
+    RAISE EXCEPTION '% is main-only: no writes while a scenario is active', TG_TABLE_NAME
+      USING ERRCODE = 'integrity_constraint_violation';
+  END IF;
+  RETURN NEW;
+END $fn$;
+
+-- scenario tables (scenario, scenario_event: append-only; scenario_state, scenario_override: engine-mutable)
+CREATE TABLE IF NOT EXISTS scenario (
+    id serial PRIMARY KEY CHECK (id > 0),
+    name text NOT NULL,
+    owner_user text NOT NULL,
+    owner_role text NOT NULL,
+    parent_id int NULL,
+    base_recorded timestamptz NOT NULL,
+    base_sim_time timestamptz NULL,
+    shared_roles text[] NOT NULL DEFAULT '{}',
+    run_id text NULL,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    expires_at timestamptz NULL
+);
+-- 'user' | 'agent' (opened by a runtime-agent run: counted in a separate quota)
+ALTER TABLE scenario ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'user';
+CREATE INDEX IF NOT EXISTS scenario_owner_idx ON scenario (owner_user);
+CREATE TABLE IF NOT EXISTS scenario_event (
+    seq bigserial PRIMARY KEY,
+    scenario_id int NOT NULL,
+    kind text NOT NULL CHECK (kind IN ('created','merged','discarded','expired','simulated','proposal')),
+    actor text NOT NULL,
+    payload jsonb,
+    at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE INDEX IF NOT EXISTS scenario_event_scn_idx ON scenario_event (scenario_id, seq);
+CREATE TABLE IF NOT EXISTS scenario_state (
+    scenario_id int PRIMARY KEY,
+    clock timestamptz NULL,
+    data_version bigint NOT NULL DEFAULT 0,
+    override_rows int NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS scenario_override (
+    scenario_id int NOT NULL,
+    kind text NOT NULL CHECK (kind IN ('obj','link')),
+    type text NOT NULL,
+    key_a uuid NOT NULL,
+    key_b uuid NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000',
+    deleted boolean NOT NULL DEFAULT false,
+    base jsonb,
+    PRIMARY KEY (scenario_id, kind, type, key_a, key_b)
+);
+CREATE INDEX IF NOT EXISTS scenario_override_scn_idx ON scenario_override (scenario_id);
+
+-- access / visibility / writability. SECURITY DEFINER (they read scenario tables whatever the caller may see).
+-- `current_setting('role') = 'none'` is the loader/owner connection (never SET ROLE amarh_app): owner code is
+-- not subject to RLS anyway. A scoped request has role = amarh_app and needs an identified amarh.role.
+-- Phase 5 review (H1): a runtime-agent identity (amarh.user = 'agent:<role>') owns the scenarios of the human it
+-- acts for (amarh.on_behalf_of, set only by principal.scoped()); it never gets the admin shortcut.
+CREATE OR REPLACE FUNCTION amarh_is_agent() RETURNS boolean LANGUAGE sql STABLE AS $fn$
+  SELECT coalesce(current_setting('amarh.user', true), '') LIKE 'agent:%' $fn$;
+CREATE OR REPLACE FUNCTION amarh_owner_match(p_owner text) RETURNS boolean LANGUAGE sql STABLE AS $fn$
+  SELECT p_owner = current_setting('amarh.user', true)
+      OR (amarh_is_agent() AND coalesce(current_setting('amarh.on_behalf_of', true), '') <> ''
+          AND p_owner = current_setting('amarh.on_behalf_of', true)) $fn$;
+CREATE OR REPLACE FUNCTION amarh_scenario_access(p_id int) RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER AS $fn$
+SELECT p_id = 0 OR current_setting('role') = 'none' OR (
+  coalesce(current_setting('amarh.role', true), '') <> '' AND EXISTS (
+    SELECT 1 FROM scenario s WHERE s.id = p_id AND (
+         (current_setting('amarh.role', true) = 'admin' AND NOT amarh_is_agent())
+      OR amarh_owner_match(s.owner_user)
+      OR current_setting('amarh.role', true) = ANY (s.shared_roles)))) $fn$;
+-- visible = access AND open (no terminal event) AND not past its expiry (an expired scenario is closed for data
+-- access even before the janitor has marked it; its governance history stays readable through _access)
+CREATE OR REPLACE FUNCTION amarh_scenario_visible(p_id int) RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER AS $fn$
+SELECT p_id = 0 OR (amarh_scenario_access(p_id) AND NOT EXISTS (
+    SELECT 1 FROM scenario_event e WHERE e.scenario_id = p_id AND e.kind IN ('merged','discarded','expired'))
+    AND EXISTS (SELECT 1 FROM scenario s WHERE s.id = p_id AND (s.expires_at IS NULL OR s.expires_at > now()))) $fn$;
+CREATE OR REPLACE FUNCTION amarh_scenario_owns(p_id int) RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER AS $fn$
+SELECT p_id = 0 OR current_setting('role') = 'none' OR (
+  coalesce(current_setting('amarh.role', true), '') <> '' AND EXISTS (
+    SELECT 1 FROM scenario s WHERE s.id = p_id AND (
+         (current_setting('amarh.role', true) = 'admin' AND NOT amarh_is_agent())
+      OR amarh_owner_match(s.owner_user)))) $fn$;
+CREATE OR REPLACE FUNCTION amarh_scenario_writable(p_id int) RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER AS $fn$
+SELECT p_id = 0 OR (amarh_scenario_owns(p_id) AND amarh_scenario_visible(p_id)) $fn$;
+CREATE OR REPLACE FUNCTION amarh_scenario_overrides(p_id int)
+RETURNS TABLE (scenario_id int, kind text, type text, key_a uuid, key_b uuid, deleted boolean, base jsonb)
+LANGUAGE sql STABLE SECURITY DEFINER AS $fn$
+SELECT o.scenario_id, o.kind, o.type, o.key_a, o.key_b, o.deleted,
+       CASE WHEN amarh_scenario_owns(p_id) THEN o.base END
+  FROM scenario_override o WHERE o.scenario_id = p_id AND p_id > 0 AND amarh_scenario_visible(p_id)
+ ORDER BY o.kind, o.type, o.key_a, o.key_b $fn$;
+DO $do$ DECLARE f text; BEGIN
+  FOREACH f IN ARRAY ARRAY['amarh_scenario_access(int)','amarh_scenario_visible(int)','amarh_scenario_overrides(int)',
+                           'amarh_scenario_owns(int)','amarh_scenario_writable(int)'] LOOP
+    EXECUTE format('ALTER FUNCTION %s SET search_path = pg_catalog, %I, public, pg_temp', f, current_schema());
+    EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', f);
+    EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO amarh_app', f);
+  END LOOP;
+  FOREACH f IN ARRAY ARRAY['amarh_scn()','amarh_scn_base()','amarh_now()','amarh_is_agent()','amarh_owner_match(text)'] LOOP
+    EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO amarh_app', f);
+  END LOOP;
+END $do$;
+
+-- row-level overlay rule as one function call (see compiler exprs.eff_pred_fn). INVOKER: reads scenario_override
+-- under the caller's RLS. Fails closed when the scenario in the GUC is not visible to the caller.
+CREATE OR REPLACE FUNCTION amarh_eff_row(p_kind text, p_type text, p_sid int, p_valid tstzrange,
+                                        p_rec tstzrange, p_a uuid, p_b uuid) RETURNS boolean
+LANGUAGE plpgsql STABLE AS $fn$
+DECLARE scn int := amarh_scn(); nw timestamptz;
+BEGIN
+  IF scn = 0 THEN
+    RETURN p_sid = 0 AND (upper_inf(p_rec) OR upper(p_rec) = 'infinity') AND p_valid @> now();
+  END IF;
+  IF NOT coalesce(amarh_scenario_visible(scn), false) THEN RETURN false; END IF;
+  nw := amarh_now();
+  -- fail closed: a NULL/empty fork base or clock must never make a superseded version appear
+  IF NOT coalesce(p_valid @> nw, false) THEN RETURN false; END IF;
+  IF p_sid = scn THEN RETURN upper_inf(p_rec) OR upper(p_rec) = 'infinity'; END IF;
+  IF p_sid <> 0 OR NOT coalesce(p_rec @> amarh_scn_base(), false) THEN RETURN false; END IF;
+  RETURN NOT EXISTS (SELECT 1 FROM scenario_override o WHERE o.scenario_id = scn AND o.kind = p_kind
+                     AND o.type = p_type AND o.key_a = p_a AND (p_kind = 'obj' OR o.key_b = p_b));
+END $fn$;
+GRANT EXECUTE ON FUNCTION amarh_eff_row(text, text, int, tstzrange, tstzrange, uuid, uuid) TO amarh_app;
+
+-- append-only: scenario, scenario_event
+DO $$
+DECLARE t text; p record; owner_role text := current_user;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['scenario','scenario_event'] LOOP
+    EXECUTE format('DROP TRIGGER IF EXISTS amarh_no_update ON %I', t);
+    EXECUTE format('CREATE TRIGGER amarh_no_update BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION amarh_append_only()', t);
+    EXECUTE format('DROP TRIGGER IF EXISTS amarh_no_truncate ON %I', t);
+    EXECUTE format('CREATE TRIGGER amarh_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION amarh_append_only()', t);
+  END LOOP;
+  FOREACH t IN ARRAY ARRAY['scenario','scenario_event','scenario_state','scenario_override'] LOOP
+    EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
+    EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
+    FOR p IN SELECT policyname FROM pg_policies WHERE schemaname = current_schema() AND tablename = t LOOP
+      EXECUTE format('DROP POLICY %I ON %I', p.policyname, t);
+    END LOOP;
+    EXECUTE format('CREATE POLICY owner_all ON %I AS PERMISSIVE FOR ALL TO %I USING (true) WITH CHECK (true)', t, owner_role);
+  END LOOP;
+  GRANT SELECT, INSERT ON scenario, scenario_event TO amarh_app;
+  GRANT SELECT, INSERT, UPDATE ON scenario_state TO amarh_app;
+  -- `base` (fork-time property snapshot, written from the writer's view) is NOT column-readable: shared roles
+  -- must not read an admin's unmasked values. It is read through amarh_scenario_overrides() (owner/admin only).
+  REVOKE SELECT, UPDATE ON scenario_override FROM amarh_app;
+  GRANT INSERT ON scenario_override TO amarh_app;
+  GRANT SELECT (scenario_id, kind, type, key_a, key_b, deleted) ON scenario_override TO amarh_app;
+  GRANT UPDATE (deleted) ON scenario_override TO amarh_app;
+  REVOKE DELETE, TRUNCATE ON scenario, scenario_event, scenario_state, scenario_override FROM amarh_app;
+  EXECUTE format('GRANT USAGE, SELECT ON SEQUENCE %s TO amarh_app', pg_get_serial_sequence('scenario', 'id'));
+  EXECUTE format('GRANT USAGE, SELECT ON SEQUENCE %s TO amarh_app', pg_get_serial_sequence('scenario_event', 'seq'));
+END $$;
+CREATE POLICY sel ON scenario FOR SELECT TO amarh_app USING (amarh_scenario_access(id));
+CREATE POLICY ins ON scenario FOR INSERT TO amarh_app WITH CHECK (
+    coalesce(current_setting('amarh.role', true), '') <> ''
+    AND amarh_owner_match(owner_user) AND owner_role = current_setting('amarh.role', true));
+CREATE POLICY sel ON scenario_event FOR SELECT TO amarh_app USING (amarh_scenario_access(scenario_id));
+CREATE POLICY ins ON scenario_event FOR INSERT TO amarh_app WITH CHECK (
+    coalesce(current_setting('amarh.role', true), '') <> '' AND actor = current_setting('amarh.user', true)
+    AND amarh_scenario_owns(scenario_id));
+CREATE POLICY sel ON scenario_state FOR SELECT TO amarh_app USING (amarh_scenario_access(scenario_id));
+CREATE POLICY ins ON scenario_state FOR INSERT TO amarh_app WITH CHECK (amarh_scenario_owns(scenario_id));
+CREATE POLICY upd ON scenario_state FOR UPDATE TO amarh_app USING (amarh_scenario_writable(scenario_id))
+    WITH CHECK (amarh_scenario_writable(scenario_id));
+CREATE POLICY sel ON scenario_override FOR SELECT TO amarh_app USING (amarh_scenario_visible(scenario_id));
+CREATE POLICY ins ON scenario_override FOR INSERT TO amarh_app WITH CHECK (
+    scenario_id > 0 AND scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id));
+CREATE POLICY upd ON scenario_override FOR UPDATE TO amarh_app USING (
+    scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))
+    WITH CHECK (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id));
+-- END scenario_core
+
 CREATE TABLE IF NOT EXISTS graph_outbox (
     seq bigserial PRIMARY KEY,
     kind text,
@@ -12,6 +238,9 @@ CREATE TABLE IF NOT EXISTS graph_outbox (
     op text,
     at timestamptz DEFAULT now()
 );
+
+DROP TRIGGER IF EXISTS amarh_no_scn ON graph_outbox;
+CREATE TRIGGER amarh_no_scn BEFORE INSERT ON graph_outbox FOR EACH ROW EXECUTE FUNCTION amarh_no_scenario_write();
 
 CREATE TABLE IF NOT EXISTS ontology_registry (
     hash text PRIMARY KEY,
@@ -30,7 +259,9 @@ CREATE TABLE IF NOT EXISTS obj_carrier (
     CONSTRAINT "obj_carrier_no_overlap" EXCLUDE USING gist (scenario_id WITH =, id WITH =, valid_during WITH &&, recorded_during WITH &&)
 );
 CREATE INDEX IF NOT EXISTS "obj_carrier_id_idx" ON obj_carrier (id);
+CREATE INDEX IF NOT EXISTS "obj_carrier_scn_id_idx" ON obj_carrier (scenario_id, id);
 CREATE OR REPLACE VIEW cur_obj_carrier WITH (security_invoker = true) AS SELECT * FROM obj_carrier WHERE (upper_inf(recorded_during) OR upper(recorded_during) = 'infinity') AND valid_during @> now() AND scenario_id = 0;
+CREATE OR REPLACE VIEW eff_obj_carrier WITH (security_invoker = true) AS SELECT * FROM obj_carrier a WHERE CASE WHEN coalesce(current_setting('amarh.scenario', true), '') IN ('', '0') THEN ((upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> now() AND a.scenario_id = 0) ELSE (SELECT amarh_scenario_visible(amarh_scn())) AND ((a.scenario_id = (SELECT amarh_scn()) AND (upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> (SELECT amarh_now())) OR (a.scenario_id = 0 AND a.recorded_during @> (SELECT amarh_scn_base()) AND a.valid_during @> (SELECT amarh_now()) AND NOT EXISTS (SELECT 1 FROM scenario_override xs_a WHERE xs_a.scenario_id = (SELECT amarh_scn()) AND xs_a.kind = 'obj' AND xs_a.type = 'Carrier' AND xs_a.key_a = a.id))) END;
 
 CREATE TABLE IF NOT EXISTS obj_event (
     id uuid NOT NULL,
@@ -48,7 +279,9 @@ CREATE TABLE IF NOT EXISTS obj_event (
     CONSTRAINT "obj_event_no_overlap" EXCLUDE USING gist (scenario_id WITH =, id WITH =, valid_during WITH &&, recorded_during WITH &&)
 );
 CREATE INDEX IF NOT EXISTS "obj_event_id_idx" ON obj_event (id);
+CREATE INDEX IF NOT EXISTS "obj_event_scn_id_idx" ON obj_event (scenario_id, id);
 CREATE OR REPLACE VIEW cur_obj_event WITH (security_invoker = true) AS SELECT * FROM obj_event WHERE (upper_inf(recorded_during) OR upper(recorded_during) = 'infinity') AND valid_during @> now() AND scenario_id = 0;
+CREATE OR REPLACE VIEW eff_obj_event WITH (security_invoker = true) AS SELECT * FROM obj_event a WHERE CASE WHEN coalesce(current_setting('amarh.scenario', true), '') IN ('', '0') THEN ((upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> now() AND a.scenario_id = 0) ELSE (SELECT amarh_scenario_visible(amarh_scn())) AND ((a.scenario_id = (SELECT amarh_scn()) AND (upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> (SELECT amarh_now())) OR (a.scenario_id = 0 AND a.recorded_during @> (SELECT amarh_scn_base()) AND a.valid_during @> (SELECT amarh_now()) AND NOT EXISTS (SELECT 1 FROM scenario_override xs_a WHERE xs_a.scenario_id = (SELECT amarh_scn()) AND xs_a.kind = 'obj' AND xs_a.type = 'Event' AND xs_a.key_a = a.id))) END;
 
 CREATE TABLE IF NOT EXISTS obj_invoice (
     id uuid NOT NULL,
@@ -67,7 +300,9 @@ CREATE TABLE IF NOT EXISTS obj_invoice (
     CONSTRAINT "obj_invoice_no_overlap" EXCLUDE USING gist (scenario_id WITH =, id WITH =, valid_during WITH &&, recorded_during WITH &&)
 );
 CREATE INDEX IF NOT EXISTS "obj_invoice_id_idx" ON obj_invoice (id);
+CREATE INDEX IF NOT EXISTS "obj_invoice_scn_id_idx" ON obj_invoice (scenario_id, id);
 CREATE OR REPLACE VIEW cur_obj_invoice WITH (security_invoker = true) AS SELECT * FROM obj_invoice WHERE (upper_inf(recorded_during) OR upper(recorded_during) = 'infinity') AND valid_during @> now() AND scenario_id = 0;
+CREATE OR REPLACE VIEW eff_obj_invoice WITH (security_invoker = true) AS SELECT * FROM obj_invoice a WHERE CASE WHEN coalesce(current_setting('amarh.scenario', true), '') IN ('', '0') THEN ((upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> now() AND a.scenario_id = 0) ELSE (SELECT amarh_scenario_visible(amarh_scn())) AND ((a.scenario_id = (SELECT amarh_scn()) AND (upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> (SELECT amarh_now())) OR (a.scenario_id = 0 AND a.recorded_during @> (SELECT amarh_scn_base()) AND a.valid_during @> (SELECT amarh_now()) AND NOT EXISTS (SELECT 1 FROM scenario_override xs_a WHERE xs_a.scenario_id = (SELECT amarh_scn()) AND xs_a.kind = 'obj' AND xs_a.type = 'Invoice' AND xs_a.key_a = a.id))) END;
 
 CREATE TABLE IF NOT EXISTS obj_port (
     id uuid NOT NULL,
@@ -87,8 +322,10 @@ CREATE TABLE IF NOT EXISTS obj_port (
     CONSTRAINT "obj_port_no_overlap" EXCLUDE USING gist (scenario_id WITH =, id WITH =, valid_during WITH &&, recorded_during WITH &&)
 );
 CREATE INDEX IF NOT EXISTS "obj_port_id_idx" ON obj_port (id);
+CREATE INDEX IF NOT EXISTS "obj_port_scn_id_idx" ON obj_port (scenario_id, id);
 CREATE INDEX IF NOT EXISTS "obj_port_location_gist" ON obj_port USING gist ("location");
 CREATE OR REPLACE VIEW cur_obj_port WITH (security_invoker = true) AS SELECT * FROM obj_port WHERE (upper_inf(recorded_during) OR upper(recorded_during) = 'infinity') AND valid_during @> now() AND scenario_id = 0;
+CREATE OR REPLACE VIEW eff_obj_port WITH (security_invoker = true) AS SELECT * FROM obj_port a WHERE CASE WHEN coalesce(current_setting('amarh.scenario', true), '') IN ('', '0') THEN ((upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> now() AND a.scenario_id = 0) ELSE (SELECT amarh_scenario_visible(amarh_scn())) AND ((a.scenario_id = (SELECT amarh_scn()) AND (upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> (SELECT amarh_now())) OR (a.scenario_id = 0 AND a.recorded_during @> (SELECT amarh_scn_base()) AND a.valid_during @> (SELECT amarh_now()) AND NOT EXISTS (SELECT 1 FROM scenario_override xs_a WHERE xs_a.scenario_id = (SELECT amarh_scn()) AND xs_a.kind = 'obj' AND xs_a.type = 'Port' AND xs_a.key_a = a.id))) END;
 
 CREATE TABLE IF NOT EXISTS obj_purchase_order (
     id uuid NOT NULL,
@@ -103,7 +340,9 @@ CREATE TABLE IF NOT EXISTS obj_purchase_order (
     CONSTRAINT "obj_purchase_order_no_overlap" EXCLUDE USING gist (scenario_id WITH =, id WITH =, valid_during WITH &&, recorded_during WITH &&)
 );
 CREATE INDEX IF NOT EXISTS "obj_purchase_order_id_idx" ON obj_purchase_order (id);
+CREATE INDEX IF NOT EXISTS "obj_purchase_order_scn_id_idx" ON obj_purchase_order (scenario_id, id);
 CREATE OR REPLACE VIEW cur_obj_purchase_order WITH (security_invoker = true) AS SELECT * FROM obj_purchase_order WHERE (upper_inf(recorded_during) OR upper(recorded_during) = 'infinity') AND valid_during @> now() AND scenario_id = 0;
+CREATE OR REPLACE VIEW eff_obj_purchase_order WITH (security_invoker = true) AS SELECT * FROM obj_purchase_order a WHERE CASE WHEN coalesce(current_setting('amarh.scenario', true), '') IN ('', '0') THEN ((upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> now() AND a.scenario_id = 0) ELSE (SELECT amarh_scenario_visible(amarh_scn())) AND ((a.scenario_id = (SELECT amarh_scn()) AND (upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> (SELECT amarh_now())) OR (a.scenario_id = 0 AND a.recorded_during @> (SELECT amarh_scn_base()) AND a.valid_during @> (SELECT amarh_now()) AND NOT EXISTS (SELECT 1 FROM scenario_override xs_a WHERE xs_a.scenario_id = (SELECT amarh_scn()) AND xs_a.kind = 'obj' AND xs_a.type = 'PurchaseOrder' AND xs_a.key_a = a.id))) END;
 
 CREATE TABLE IF NOT EXISTS obj_shipment (
     id uuid NOT NULL,
@@ -114,6 +353,7 @@ CREATE TABLE IF NOT EXISTS obj_shipment (
     "progress" double precision,
     "cargo_value" double precision,
     "delay_hours" double precision,
+    "extra_cost" double precision,
     valid_during tstzrange NOT NULL,
     recorded_during tstzrange NOT NULL,
     changed_by text NOT NULL,
@@ -123,13 +363,16 @@ CREATE TABLE IF NOT EXISTS obj_shipment (
     CONSTRAINT "obj_shipment_no_overlap" EXCLUDE USING gist (scenario_id WITH =, id WITH =, valid_during WITH &&, recorded_during WITH &&)
 );
 CREATE INDEX IF NOT EXISTS "obj_shipment_id_idx" ON obj_shipment (id);
+CREATE INDEX IF NOT EXISTS "obj_shipment_scn_id_idx" ON obj_shipment (scenario_id, id);
 CREATE INDEX IF NOT EXISTS "obj_shipment_position_gist" ON obj_shipment USING gist ("position");
 CREATE OR REPLACE VIEW cur_obj_shipment WITH (security_invoker = true) AS SELECT * FROM obj_shipment WHERE (upper_inf(recorded_during) OR upper(recorded_during) = 'infinity') AND valid_during @> now() AND scenario_id = 0;
+CREATE OR REPLACE VIEW eff_obj_shipment WITH (security_invoker = true) AS SELECT * FROM obj_shipment a WHERE CASE WHEN coalesce(current_setting('amarh.scenario', true), '') IN ('', '0') THEN ((upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> now() AND a.scenario_id = 0) ELSE (SELECT amarh_scenario_visible(amarh_scn())) AND ((a.scenario_id = (SELECT amarh_scn()) AND (upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> (SELECT amarh_now())) OR (a.scenario_id = 0 AND a.recorded_during @> (SELECT amarh_scn_base()) AND a.valid_during @> (SELECT amarh_now()) AND NOT EXISTS (SELECT 1 FROM scenario_override xs_a WHERE xs_a.scenario_id = (SELECT amarh_scn()) AND xs_a.kind = 'obj' AND xs_a.type = 'Shipment' AND xs_a.key_a = a.id))) END;
 
 CREATE TABLE IF NOT EXISTS obj_supplier (
     id uuid NOT NULL,
     "name" text NOT NULL,
     "country" text,
+    "price_index" double precision,
     valid_during tstzrange NOT NULL,
     recorded_during tstzrange NOT NULL,
     changed_by text NOT NULL,
@@ -138,7 +381,9 @@ CREATE TABLE IF NOT EXISTS obj_supplier (
     CONSTRAINT "obj_supplier_no_overlap" EXCLUDE USING gist (scenario_id WITH =, id WITH =, valid_during WITH &&, recorded_during WITH &&)
 );
 CREATE INDEX IF NOT EXISTS "obj_supplier_id_idx" ON obj_supplier (id);
+CREATE INDEX IF NOT EXISTS "obj_supplier_scn_id_idx" ON obj_supplier (scenario_id, id);
 CREATE OR REPLACE VIEW cur_obj_supplier WITH (security_invoker = true) AS SELECT * FROM obj_supplier WHERE (upper_inf(recorded_during) OR upper(recorded_during) = 'infinity') AND valid_during @> now() AND scenario_id = 0;
+CREATE OR REPLACE VIEW eff_obj_supplier WITH (security_invoker = true) AS SELECT * FROM obj_supplier a WHERE CASE WHEN coalesce(current_setting('amarh.scenario', true), '') IN ('', '0') THEN ((upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> now() AND a.scenario_id = 0) ELSE (SELECT amarh_scenario_visible(amarh_scn())) AND ((a.scenario_id = (SELECT amarh_scn()) AND (upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> (SELECT amarh_now())) OR (a.scenario_id = 0 AND a.recorded_during @> (SELECT amarh_scn_base()) AND a.valid_during @> (SELECT amarh_now()) AND NOT EXISTS (SELECT 1 FROM scenario_override xs_a WHERE xs_a.scenario_id = (SELECT amarh_scn()) AND xs_a.kind = 'obj' AND xs_a.type = 'Supplier' AND xs_a.key_a = a.id))) END;
 
 CREATE TABLE IF NOT EXISTS obj_warehouse (
     id uuid NOT NULL,
@@ -156,8 +401,10 @@ CREATE TABLE IF NOT EXISTS obj_warehouse (
     CONSTRAINT "obj_warehouse_no_overlap" EXCLUDE USING gist (scenario_id WITH =, id WITH =, valid_during WITH &&, recorded_during WITH &&)
 );
 CREATE INDEX IF NOT EXISTS "obj_warehouse_id_idx" ON obj_warehouse (id);
+CREATE INDEX IF NOT EXISTS "obj_warehouse_scn_id_idx" ON obj_warehouse (scenario_id, id);
 CREATE INDEX IF NOT EXISTS "obj_warehouse_location_gist" ON obj_warehouse USING gist ("location");
 CREATE OR REPLACE VIEW cur_obj_warehouse WITH (security_invoker = true) AS SELECT * FROM obj_warehouse WHERE (upper_inf(recorded_during) OR upper(recorded_during) = 'infinity') AND valid_during @> now() AND scenario_id = 0;
+CREATE OR REPLACE VIEW eff_obj_warehouse WITH (security_invoker = true) AS SELECT * FROM obj_warehouse a WHERE CASE WHEN coalesce(current_setting('amarh.scenario', true), '') IN ('', '0') THEN ((upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> now() AND a.scenario_id = 0) ELSE (SELECT amarh_scenario_visible(amarh_scn())) AND ((a.scenario_id = (SELECT amarh_scn()) AND (upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> (SELECT amarh_now())) OR (a.scenario_id = 0 AND a.recorded_during @> (SELECT amarh_scn_base()) AND a.valid_during @> (SELECT amarh_now()) AND NOT EXISTS (SELECT 1 FROM scenario_override xs_a WHERE xs_a.scenario_id = (SELECT amarh_scn()) AND xs_a.kind = 'obj' AND xs_a.type = 'Warehouse' AND xs_a.key_a = a.id))) END;
 
 CREATE TABLE IF NOT EXISTS link_affects (
     src uuid NOT NULL,
@@ -171,7 +418,10 @@ CREATE TABLE IF NOT EXISTS link_affects (
 );
 CREATE INDEX IF NOT EXISTS "link_affects_src_idx" ON link_affects (src);
 CREATE INDEX IF NOT EXISTS "link_affects_dst_idx" ON link_affects (dst);
+CREATE INDEX IF NOT EXISTS "link_affects_scn_src_idx" ON link_affects (scenario_id, src);
+CREATE INDEX IF NOT EXISTS "link_affects_scn_dst_idx" ON link_affects (scenario_id, dst);
 CREATE OR REPLACE VIEW cur_link_affects WITH (security_invoker = true) AS SELECT * FROM link_affects WHERE (upper_inf(recorded_during) OR upper(recorded_during) = 'infinity') AND valid_during @> now() AND scenario_id = 0;
+CREATE OR REPLACE VIEW eff_link_affects WITH (security_invoker = true) AS SELECT * FROM link_affects a WHERE CASE WHEN coalesce(current_setting('amarh.scenario', true), '') IN ('', '0') THEN ((upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> now() AND a.scenario_id = 0) ELSE (SELECT amarh_scenario_visible(amarh_scn())) AND ((a.scenario_id = (SELECT amarh_scn()) AND (upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> (SELECT amarh_now())) OR (a.scenario_id = 0 AND a.recorded_during @> (SELECT amarh_scn_base()) AND a.valid_during @> (SELECT amarh_now()) AND NOT EXISTS (SELECT 1 FROM scenario_override xs_a WHERE xs_a.scenario_id = (SELECT amarh_scn()) AND xs_a.kind = 'link' AND xs_a.type = 'affects' AND xs_a.key_a = a.src AND xs_a.key_b = a.dst))) END;
 
 CREATE TABLE IF NOT EXISTS link_billed_by (
     src uuid NOT NULL,
@@ -185,7 +435,10 @@ CREATE TABLE IF NOT EXISTS link_billed_by (
 );
 CREATE INDEX IF NOT EXISTS "link_billed_by_src_idx" ON link_billed_by (src);
 CREATE INDEX IF NOT EXISTS "link_billed_by_dst_idx" ON link_billed_by (dst);
+CREATE INDEX IF NOT EXISTS "link_billed_by_scn_src_idx" ON link_billed_by (scenario_id, src);
+CREATE INDEX IF NOT EXISTS "link_billed_by_scn_dst_idx" ON link_billed_by (scenario_id, dst);
 CREATE OR REPLACE VIEW cur_link_billed_by WITH (security_invoker = true) AS SELECT * FROM link_billed_by WHERE (upper_inf(recorded_during) OR upper(recorded_during) = 'infinity') AND valid_during @> now() AND scenario_id = 0;
+CREATE OR REPLACE VIEW eff_link_billed_by WITH (security_invoker = true) AS SELECT * FROM link_billed_by a WHERE CASE WHEN coalesce(current_setting('amarh.scenario', true), '') IN ('', '0') THEN ((upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> now() AND a.scenario_id = 0) ELSE (SELECT amarh_scenario_visible(amarh_scn())) AND ((a.scenario_id = (SELECT amarh_scn()) AND (upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> (SELECT amarh_now())) OR (a.scenario_id = 0 AND a.recorded_during @> (SELECT amarh_scn_base()) AND a.valid_during @> (SELECT amarh_now()) AND NOT EXISTS (SELECT 1 FROM scenario_override xs_a WHERE xs_a.scenario_id = (SELECT amarh_scn()) AND xs_a.kind = 'link' AND xs_a.type = 'billed_by' AND xs_a.key_a = a.src AND xs_a.key_b = a.dst))) END;
 
 CREATE TABLE IF NOT EXISTS link_invoices_for (
     src uuid NOT NULL,
@@ -199,7 +452,10 @@ CREATE TABLE IF NOT EXISTS link_invoices_for (
 );
 CREATE INDEX IF NOT EXISTS "link_invoices_for_src_idx" ON link_invoices_for (src);
 CREATE INDEX IF NOT EXISTS "link_invoices_for_dst_idx" ON link_invoices_for (dst);
+CREATE INDEX IF NOT EXISTS "link_invoices_for_scn_src_idx" ON link_invoices_for (scenario_id, src);
+CREATE INDEX IF NOT EXISTS "link_invoices_for_scn_dst_idx" ON link_invoices_for (scenario_id, dst);
 CREATE OR REPLACE VIEW cur_link_invoices_for WITH (security_invoker = true) AS SELECT * FROM link_invoices_for WHERE (upper_inf(recorded_during) OR upper(recorded_during) = 'infinity') AND valid_during @> now() AND scenario_id = 0;
+CREATE OR REPLACE VIEW eff_link_invoices_for WITH (security_invoker = true) AS SELECT * FROM link_invoices_for a WHERE CASE WHEN coalesce(current_setting('amarh.scenario', true), '') IN ('', '0') THEN ((upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> now() AND a.scenario_id = 0) ELSE (SELECT amarh_scenario_visible(amarh_scn())) AND ((a.scenario_id = (SELECT amarh_scn()) AND (upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> (SELECT amarh_now())) OR (a.scenario_id = 0 AND a.recorded_during @> (SELECT amarh_scn_base()) AND a.valid_during @> (SELECT amarh_now()) AND NOT EXISTS (SELECT 1 FROM scenario_override xs_a WHERE xs_a.scenario_id = (SELECT amarh_scn()) AND xs_a.kind = 'link' AND xs_a.type = 'invoices_for' AND xs_a.key_a = a.src AND xs_a.key_b = a.dst))) END;
 
 CREATE TABLE IF NOT EXISTS link_operated_by (
     src uuid NOT NULL,
@@ -213,7 +469,10 @@ CREATE TABLE IF NOT EXISTS link_operated_by (
 );
 CREATE INDEX IF NOT EXISTS "link_operated_by_src_idx" ON link_operated_by (src);
 CREATE INDEX IF NOT EXISTS "link_operated_by_dst_idx" ON link_operated_by (dst);
+CREATE INDEX IF NOT EXISTS "link_operated_by_scn_src_idx" ON link_operated_by (scenario_id, src);
+CREATE INDEX IF NOT EXISTS "link_operated_by_scn_dst_idx" ON link_operated_by (scenario_id, dst);
 CREATE OR REPLACE VIEW cur_link_operated_by WITH (security_invoker = true) AS SELECT * FROM link_operated_by WHERE (upper_inf(recorded_during) OR upper(recorded_during) = 'infinity') AND valid_during @> now() AND scenario_id = 0;
+CREATE OR REPLACE VIEW eff_link_operated_by WITH (security_invoker = true) AS SELECT * FROM link_operated_by a WHERE CASE WHEN coalesce(current_setting('amarh.scenario', true), '') IN ('', '0') THEN ((upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> now() AND a.scenario_id = 0) ELSE (SELECT amarh_scenario_visible(amarh_scn())) AND ((a.scenario_id = (SELECT amarh_scn()) AND (upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> (SELECT amarh_now())) OR (a.scenario_id = 0 AND a.recorded_during @> (SELECT amarh_scn_base()) AND a.valid_during @> (SELECT amarh_now()) AND NOT EXISTS (SELECT 1 FROM scenario_override xs_a WHERE xs_a.scenario_id = (SELECT amarh_scn()) AND xs_a.kind = 'link' AND xs_a.type = 'operated_by' AND xs_a.key_a = a.src AND xs_a.key_b = a.dst))) END;
 
 CREATE TABLE IF NOT EXISTS link_ships_from (
     src uuid NOT NULL,
@@ -227,7 +486,10 @@ CREATE TABLE IF NOT EXISTS link_ships_from (
 );
 CREATE INDEX IF NOT EXISTS "link_ships_from_src_idx" ON link_ships_from (src);
 CREATE INDEX IF NOT EXISTS "link_ships_from_dst_idx" ON link_ships_from (dst);
+CREATE INDEX IF NOT EXISTS "link_ships_from_scn_src_idx" ON link_ships_from (scenario_id, src);
+CREATE INDEX IF NOT EXISTS "link_ships_from_scn_dst_idx" ON link_ships_from (scenario_id, dst);
 CREATE OR REPLACE VIEW cur_link_ships_from WITH (security_invoker = true) AS SELECT * FROM link_ships_from WHERE (upper_inf(recorded_during) OR upper(recorded_during) = 'infinity') AND valid_during @> now() AND scenario_id = 0;
+CREATE OR REPLACE VIEW eff_link_ships_from WITH (security_invoker = true) AS SELECT * FROM link_ships_from a WHERE CASE WHEN coalesce(current_setting('amarh.scenario', true), '') IN ('', '0') THEN ((upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> now() AND a.scenario_id = 0) ELSE (SELECT amarh_scenario_visible(amarh_scn())) AND ((a.scenario_id = (SELECT amarh_scn()) AND (upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> (SELECT amarh_now())) OR (a.scenario_id = 0 AND a.recorded_during @> (SELECT amarh_scn_base()) AND a.valid_during @> (SELECT amarh_now()) AND NOT EXISTS (SELECT 1 FROM scenario_override xs_a WHERE xs_a.scenario_id = (SELECT amarh_scn()) AND xs_a.kind = 'link' AND xs_a.type = 'ships_from' AND xs_a.key_a = a.src AND xs_a.key_b = a.dst))) END;
 
 CREATE TABLE IF NOT EXISTS link_ships_to (
     src uuid NOT NULL,
@@ -241,7 +503,10 @@ CREATE TABLE IF NOT EXISTS link_ships_to (
 );
 CREATE INDEX IF NOT EXISTS "link_ships_to_src_idx" ON link_ships_to (src);
 CREATE INDEX IF NOT EXISTS "link_ships_to_dst_idx" ON link_ships_to (dst);
+CREATE INDEX IF NOT EXISTS "link_ships_to_scn_src_idx" ON link_ships_to (scenario_id, src);
+CREATE INDEX IF NOT EXISTS "link_ships_to_scn_dst_idx" ON link_ships_to (scenario_id, dst);
 CREATE OR REPLACE VIEW cur_link_ships_to WITH (security_invoker = true) AS SELECT * FROM link_ships_to WHERE (upper_inf(recorded_during) OR upper(recorded_during) = 'infinity') AND valid_during @> now() AND scenario_id = 0;
+CREATE OR REPLACE VIEW eff_link_ships_to WITH (security_invoker = true) AS SELECT * FROM link_ships_to a WHERE CASE WHEN coalesce(current_setting('amarh.scenario', true), '') IN ('', '0') THEN ((upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> now() AND a.scenario_id = 0) ELSE (SELECT amarh_scenario_visible(amarh_scn())) AND ((a.scenario_id = (SELECT amarh_scn()) AND (upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> (SELECT amarh_now())) OR (a.scenario_id = 0 AND a.recorded_during @> (SELECT amarh_scn_base()) AND a.valid_during @> (SELECT amarh_now()) AND NOT EXISTS (SELECT 1 FROM scenario_override xs_a WHERE xs_a.scenario_id = (SELECT amarh_scn()) AND xs_a.kind = 'link' AND xs_a.type = 'ships_to' AND xs_a.key_a = a.src AND xs_a.key_b = a.dst))) END;
 
 CREATE TABLE IF NOT EXISTS link_ships_via (
     src uuid NOT NULL,
@@ -255,7 +520,10 @@ CREATE TABLE IF NOT EXISTS link_ships_via (
 );
 CREATE INDEX IF NOT EXISTS "link_ships_via_src_idx" ON link_ships_via (src);
 CREATE INDEX IF NOT EXISTS "link_ships_via_dst_idx" ON link_ships_via (dst);
+CREATE INDEX IF NOT EXISTS "link_ships_via_scn_src_idx" ON link_ships_via (scenario_id, src);
+CREATE INDEX IF NOT EXISTS "link_ships_via_scn_dst_idx" ON link_ships_via (scenario_id, dst);
 CREATE OR REPLACE VIEW cur_link_ships_via WITH (security_invoker = true) AS SELECT * FROM link_ships_via WHERE (upper_inf(recorded_during) OR upper(recorded_during) = 'infinity') AND valid_during @> now() AND scenario_id = 0;
+CREATE OR REPLACE VIEW eff_link_ships_via WITH (security_invoker = true) AS SELECT * FROM link_ships_via a WHERE CASE WHEN coalesce(current_setting('amarh.scenario', true), '') IN ('', '0') THEN ((upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> now() AND a.scenario_id = 0) ELSE (SELECT amarh_scenario_visible(amarh_scn())) AND ((a.scenario_id = (SELECT amarh_scn()) AND (upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> (SELECT amarh_now())) OR (a.scenario_id = 0 AND a.recorded_during @> (SELECT amarh_scn_base()) AND a.valid_during @> (SELECT amarh_now()) AND NOT EXISTS (SELECT 1 FROM scenario_override xs_a WHERE xs_a.scenario_id = (SELECT amarh_scn()) AND xs_a.kind = 'link' AND xs_a.type = 'ships_via' AND xs_a.key_a = a.src AND xs_a.key_b = a.dst))) END;
 
 CREATE TABLE IF NOT EXISTS link_supplies (
     src uuid NOT NULL,
@@ -269,7 +537,10 @@ CREATE TABLE IF NOT EXISTS link_supplies (
 );
 CREATE INDEX IF NOT EXISTS "link_supplies_src_idx" ON link_supplies (src);
 CREATE INDEX IF NOT EXISTS "link_supplies_dst_idx" ON link_supplies (dst);
+CREATE INDEX IF NOT EXISTS "link_supplies_scn_src_idx" ON link_supplies (scenario_id, src);
+CREATE INDEX IF NOT EXISTS "link_supplies_scn_dst_idx" ON link_supplies (scenario_id, dst);
 CREATE OR REPLACE VIEW cur_link_supplies WITH (security_invoker = true) AS SELECT * FROM link_supplies WHERE (upper_inf(recorded_during) OR upper(recorded_during) = 'infinity') AND valid_during @> now() AND scenario_id = 0;
+CREATE OR REPLACE VIEW eff_link_supplies WITH (security_invoker = true) AS SELECT * FROM link_supplies a WHERE CASE WHEN coalesce(current_setting('amarh.scenario', true), '') IN ('', '0') THEN ((upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> now() AND a.scenario_id = 0) ELSE (SELECT amarh_scenario_visible(amarh_scn())) AND ((a.scenario_id = (SELECT amarh_scn()) AND (upper_inf(a.recorded_during) OR upper(a.recorded_during) = 'infinity') AND a.valid_during @> (SELECT amarh_now())) OR (a.scenario_id = 0 AND a.recorded_during @> (SELECT amarh_scn_base()) AND a.valid_during @> (SELECT amarh_now()) AND NOT EXISTS (SELECT 1 FROM scenario_override xs_a WHERE xs_a.scenario_id = (SELECT amarh_scn()) AND xs_a.kind = 'link' AND xs_a.type = 'supplies' AND xs_a.key_a = a.src AND xs_a.key_b = a.dst))) END;
 
 -- ---- policy layer (roles, row-level security, masking views, grants) ----
 DO $$ BEGIN
@@ -309,7 +580,7 @@ GRANT EXECUTE ON FUNCTION amarh_visible_invoice(uuid) TO amarh_app;
 
 CREATE OR REPLACE FUNCTION amarh_visible_port(p_id uuid) RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER AS $fn$
-SELECT CASE current_setting('amarh.role', true) WHEN 'admin' THEN p_id IS NOT NULL WHEN 'finance_analyst' THEN p_id IS NOT NULL WHEN 'planner' THEN p_id IS NOT NULL WHEN 'regional_ops_lead' THEN EXISTS (SELECT 1 FROM obj_port t WHERE t.id = p_id AND (upper_inf(t.recorded_during) OR upper(t.recorded_during) = 'infinity') AND t.valid_during @> now() AND t.scenario_id = 0 AND (t."region" = NULLIF(current_setting('amarh.region', true), ''))) WHEN 'sim' THEN p_id IS NOT NULL ELSE false END
+SELECT CASE current_setting('amarh.role', true) WHEN 'admin' THEN p_id IS NOT NULL WHEN 'finance_analyst' THEN p_id IS NOT NULL WHEN 'planner' THEN p_id IS NOT NULL WHEN 'regional_ops_lead' THEN EXISTS (SELECT 1 FROM obj_port t WHERE t.id = p_id AND CASE WHEN coalesce(current_setting('amarh.scenario', true), '') IN ('', '0') THEN ((upper_inf(t.recorded_during) OR upper(t.recorded_during) = 'infinity') AND t.valid_during @> now() AND t.scenario_id = 0) ELSE amarh_eff_row('obj', 'Port', t.scenario_id, t.valid_during, t.recorded_during, t.id, NULL::uuid) END AND (t."region" = NULLIF(current_setting('amarh.region', true), ''))) WHEN 'sim' THEN p_id IS NOT NULL ELSE false END
 $fn$;
 DO $do$ BEGIN EXECUTE format('ALTER FUNCTION amarh_visible_port(uuid) SET search_path = pg_catalog, %I, public, pg_temp', current_schema()); END $do$;
 REVOKE ALL ON FUNCTION amarh_visible_port(uuid) FROM PUBLIC;
@@ -325,7 +596,7 @@ GRANT EXECUTE ON FUNCTION amarh_visible_purchase_order(uuid) TO amarh_app;
 
 CREATE OR REPLACE FUNCTION amarh_visible_shipment(p_id uuid) RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER AS $fn$
-SELECT CASE current_setting('amarh.role', true) WHEN 'admin' THEN p_id IS NOT NULL WHEN 'finance_analyst' THEN p_id IS NOT NULL WHEN 'planner' THEN p_id IS NOT NULL WHEN 'regional_ops_lead' THEN EXISTS (SELECT 1 FROM obj_shipment t WHERE t.id = p_id AND (upper_inf(t.recorded_during) OR upper(t.recorded_during) = 'infinity') AND t.valid_during @> now() AND t.scenario_id = 0 AND EXISTS (SELECT 1 FROM link_ships_to xl1 JOIN obj_warehouse xo1 ON xo1.id = xl1.dst WHERE xl1.src = t.id AND (upper_inf(xl1.recorded_during) OR upper(xl1.recorded_during) = 'infinity') AND xl1.valid_during @> now() AND xl1.scenario_id = 0 AND (upper_inf(xo1.recorded_during) OR upper(xo1.recorded_during) = 'infinity') AND xo1.valid_during @> now() AND xo1.scenario_id = 0 AND (xo1."region" = NULLIF(current_setting('amarh.region', true), '')))) WHEN 'sim' THEN p_id IS NOT NULL ELSE false END
+SELECT CASE current_setting('amarh.role', true) WHEN 'admin' THEN p_id IS NOT NULL WHEN 'finance_analyst' THEN p_id IS NOT NULL WHEN 'planner' THEN p_id IS NOT NULL WHEN 'regional_ops_lead' THEN EXISTS (SELECT 1 FROM obj_shipment t WHERE t.id = p_id AND CASE WHEN coalesce(current_setting('amarh.scenario', true), '') IN ('', '0') THEN ((upper_inf(t.recorded_during) OR upper(t.recorded_during) = 'infinity') AND t.valid_during @> now() AND t.scenario_id = 0) ELSE amarh_eff_row('obj', 'Shipment', t.scenario_id, t.valid_during, t.recorded_during, t.id, NULL::uuid) END AND EXISTS (SELECT 1 FROM link_ships_to xl1 JOIN obj_warehouse xo1 ON xo1.id = xl1.dst WHERE xl1.src = t.id AND CASE WHEN coalesce(current_setting('amarh.scenario', true), '') IN ('', '0') THEN ((upper_inf(xl1.recorded_during) OR upper(xl1.recorded_during) = 'infinity') AND xl1.valid_during @> now() AND xl1.scenario_id = 0) ELSE amarh_eff_row('link', 'ships_to', xl1.scenario_id, xl1.valid_during, xl1.recorded_during, xl1.src, xl1.dst) END AND CASE WHEN coalesce(current_setting('amarh.scenario', true), '') IN ('', '0') THEN ((upper_inf(xo1.recorded_during) OR upper(xo1.recorded_during) = 'infinity') AND xo1.valid_during @> now() AND xo1.scenario_id = 0) ELSE amarh_eff_row('obj', 'Warehouse', xo1.scenario_id, xo1.valid_during, xo1.recorded_during, xo1.id, NULL::uuid) END AND (xo1."region" = NULLIF(current_setting('amarh.region', true), '')))) WHEN 'sim' THEN p_id IS NOT NULL ELSE false END
 $fn$;
 DO $do$ BEGIN EXECUTE format('ALTER FUNCTION amarh_visible_shipment(uuid) SET search_path = pg_catalog, %I, public, pg_temp', current_schema()); END $do$;
 REVOKE ALL ON FUNCTION amarh_visible_shipment(uuid) FROM PUBLIC;
@@ -341,7 +612,7 @@ GRANT EXECUTE ON FUNCTION amarh_visible_supplier(uuid) TO amarh_app;
 
 CREATE OR REPLACE FUNCTION amarh_visible_warehouse(p_id uuid) RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER AS $fn$
-SELECT CASE current_setting('amarh.role', true) WHEN 'admin' THEN p_id IS NOT NULL WHEN 'finance_analyst' THEN p_id IS NOT NULL WHEN 'planner' THEN p_id IS NOT NULL WHEN 'regional_ops_lead' THEN EXISTS (SELECT 1 FROM obj_warehouse t WHERE t.id = p_id AND (upper_inf(t.recorded_during) OR upper(t.recorded_during) = 'infinity') AND t.valid_during @> now() AND t.scenario_id = 0 AND (t."region" = NULLIF(current_setting('amarh.region', true), ''))) WHEN 'sim' THEN p_id IS NOT NULL ELSE false END
+SELECT CASE current_setting('amarh.role', true) WHEN 'admin' THEN p_id IS NOT NULL WHEN 'finance_analyst' THEN p_id IS NOT NULL WHEN 'planner' THEN p_id IS NOT NULL WHEN 'regional_ops_lead' THEN EXISTS (SELECT 1 FROM obj_warehouse t WHERE t.id = p_id AND CASE WHEN coalesce(current_setting('amarh.scenario', true), '') IN ('', '0') THEN ((upper_inf(t.recorded_during) OR upper(t.recorded_during) = 'infinity') AND t.valid_during @> now() AND t.scenario_id = 0) ELSE amarh_eff_row('obj', 'Warehouse', t.scenario_id, t.valid_during, t.recorded_during, t.id, NULL::uuid) END AND (t."region" = NULLIF(current_setting('amarh.region', true), ''))) WHEN 'sim' THEN p_id IS NOT NULL ELSE false END
 $fn$;
 DO $do$ BEGIN EXECUTE format('ALTER FUNCTION amarh_visible_warehouse(uuid) SET search_path = pg_catalog, %I, public, pg_temp', current_schema()); END $do$;
 REVOKE ALL ON FUNCTION amarh_visible_warehouse(uuid) FROM PUBLIC;
@@ -354,9 +625,9 @@ CREATE POLICY amarh_owner ON obj_carrier FOR ALL TO CURRENT_USER USING (true) WI
 DROP POLICY IF EXISTS amarh_select ON obj_carrier;
 DROP POLICY IF EXISTS amarh_insert ON obj_carrier;
 DROP POLICY IF EXISTS amarh_update ON obj_carrier;
-CREATE POLICY amarh_select ON obj_carrier FOR SELECT TO amarh_app USING (amarh_visible_carrier(id) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END);
-CREATE POLICY amarh_insert ON obj_carrier FOR INSERT TO amarh_app WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'sim' THEN true ELSE false END);
-CREATE POLICY amarh_update ON obj_carrier FOR UPDATE TO amarh_app USING (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'sim' THEN true ELSE false END AND amarh_visible_carrier(id)) WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_select ON obj_carrier FOR SELECT TO amarh_app USING ((scenario_id = 0 OR (scenario_id = amarh_scn() AND amarh_scenario_visible(scenario_id))) AND amarh_visible_carrier(id) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_insert ON obj_carrier FOR INSERT TO amarh_app WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_update ON obj_carrier FOR UPDATE TO amarh_app USING (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'sim' THEN true ELSE false END AND amarh_visible_carrier(id)) WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'sim' THEN true ELSE false END);
 
 ALTER TABLE obj_event ENABLE ROW LEVEL SECURITY;
 ALTER TABLE obj_event FORCE ROW LEVEL SECURITY;
@@ -365,9 +636,9 @@ CREATE POLICY amarh_owner ON obj_event FOR ALL TO CURRENT_USER USING (true) WITH
 DROP POLICY IF EXISTS amarh_select ON obj_event;
 DROP POLICY IF EXISTS amarh_insert ON obj_event;
 DROP POLICY IF EXISTS amarh_update ON obj_event;
-CREATE POLICY amarh_select ON obj_event FOR SELECT TO amarh_app USING (amarh_visible_event(id) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END);
-CREATE POLICY amarh_insert ON obj_event FOR INSERT TO amarh_app WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END);
-CREATE POLICY amarh_update ON obj_event FOR UPDATE TO amarh_app USING (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END AND amarh_visible_event(id)) WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_select ON obj_event FOR SELECT TO amarh_app USING ((scenario_id = 0 OR (scenario_id = amarh_scn() AND amarh_scenario_visible(scenario_id))) AND amarh_visible_event(id) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_insert ON obj_event FOR INSERT TO amarh_app WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_update ON obj_event FOR UPDATE TO amarh_app USING (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END AND amarh_visible_event(id)) WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END);
 
 ALTER TABLE obj_invoice ENABLE ROW LEVEL SECURITY;
 ALTER TABLE obj_invoice FORCE ROW LEVEL SECURITY;
@@ -376,9 +647,9 @@ CREATE POLICY amarh_owner ON obj_invoice FOR ALL TO CURRENT_USER USING (true) WI
 DROP POLICY IF EXISTS amarh_select ON obj_invoice;
 DROP POLICY IF EXISTS amarh_insert ON obj_invoice;
 DROP POLICY IF EXISTS amarh_update ON obj_invoice;
-CREATE POLICY amarh_select ON obj_invoice FOR SELECT TO amarh_app USING (amarh_visible_invoice(id) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END);
-CREATE POLICY amarh_insert ON obj_invoice FOR INSERT TO amarh_app WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END);
-CREATE POLICY amarh_update ON obj_invoice FOR UPDATE TO amarh_app USING (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END AND amarh_visible_invoice(id)) WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_select ON obj_invoice FOR SELECT TO amarh_app USING ((scenario_id = 0 OR (scenario_id = amarh_scn() AND amarh_scenario_visible(scenario_id))) AND amarh_visible_invoice(id) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_insert ON obj_invoice FOR INSERT TO amarh_app WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_update ON obj_invoice FOR UPDATE TO amarh_app USING (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END AND amarh_visible_invoice(id)) WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END);
 
 ALTER TABLE obj_port ENABLE ROW LEVEL SECURITY;
 ALTER TABLE obj_port FORCE ROW LEVEL SECURITY;
@@ -387,9 +658,9 @@ CREATE POLICY amarh_owner ON obj_port FOR ALL TO CURRENT_USER USING (true) WITH 
 DROP POLICY IF EXISTS amarh_select ON obj_port;
 DROP POLICY IF EXISTS amarh_insert ON obj_port;
 DROP POLICY IF EXISTS amarh_update ON obj_port;
-CREATE POLICY amarh_select ON obj_port FOR SELECT TO amarh_app USING (amarh_visible_port(id) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN (obj_port."region" = NULLIF(current_setting('amarh.region', true), '')) WHEN 'sim' THEN true ELSE false END);
-CREATE POLICY amarh_insert ON obj_port FOR INSERT TO amarh_app WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN (obj_port."region" = NULLIF(current_setting('amarh.region', true), '')) WHEN 'sim' THEN true ELSE false END);
-CREATE POLICY amarh_update ON obj_port FOR UPDATE TO amarh_app USING (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END AND amarh_visible_port(id)) WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN (obj_port."region" = NULLIF(current_setting('amarh.region', true), '')) WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_select ON obj_port FOR SELECT TO amarh_app USING ((scenario_id = 0 OR (scenario_id = amarh_scn() AND amarh_scenario_visible(scenario_id))) AND amarh_visible_port(id) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN (obj_port."region" = NULLIF(current_setting('amarh.region', true), '')) WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_insert ON obj_port FOR INSERT TO amarh_app WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN (obj_port."region" = NULLIF(current_setting('amarh.region', true), '')) WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_update ON obj_port FOR UPDATE TO amarh_app USING (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END AND amarh_visible_port(id)) WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN (obj_port."region" = NULLIF(current_setting('amarh.region', true), '')) WHEN 'sim' THEN true ELSE false END);
 
 ALTER TABLE obj_purchase_order ENABLE ROW LEVEL SECURITY;
 ALTER TABLE obj_purchase_order FORCE ROW LEVEL SECURITY;
@@ -398,9 +669,9 @@ CREATE POLICY amarh_owner ON obj_purchase_order FOR ALL TO CURRENT_USER USING (t
 DROP POLICY IF EXISTS amarh_select ON obj_purchase_order;
 DROP POLICY IF EXISTS amarh_insert ON obj_purchase_order;
 DROP POLICY IF EXISTS amarh_update ON obj_purchase_order;
-CREATE POLICY amarh_select ON obj_purchase_order FOR SELECT TO amarh_app USING (amarh_visible_purchase_order(id) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END);
-CREATE POLICY amarh_insert ON obj_purchase_order FOR INSERT TO amarh_app WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END);
-CREATE POLICY amarh_update ON obj_purchase_order FOR UPDATE TO amarh_app USING (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END AND amarh_visible_purchase_order(id)) WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_select ON obj_purchase_order FOR SELECT TO amarh_app USING ((scenario_id = 0 OR (scenario_id = amarh_scn() AND amarh_scenario_visible(scenario_id))) AND amarh_visible_purchase_order(id) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_insert ON obj_purchase_order FOR INSERT TO amarh_app WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_update ON obj_purchase_order FOR UPDATE TO amarh_app USING (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END AND amarh_visible_purchase_order(id)) WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END);
 
 ALTER TABLE obj_shipment ENABLE ROW LEVEL SECURITY;
 ALTER TABLE obj_shipment FORCE ROW LEVEL SECURITY;
@@ -409,9 +680,9 @@ CREATE POLICY amarh_owner ON obj_shipment FOR ALL TO CURRENT_USER USING (true) W
 DROP POLICY IF EXISTS amarh_select ON obj_shipment;
 DROP POLICY IF EXISTS amarh_insert ON obj_shipment;
 DROP POLICY IF EXISTS amarh_update ON obj_shipment;
-CREATE POLICY amarh_select ON obj_shipment FOR SELECT TO amarh_app USING (amarh_visible_shipment(id) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN EXISTS (SELECT 1 FROM link_ships_to xl1 JOIN obj_warehouse xo1 ON xo1.id = xl1.dst WHERE xl1.src = obj_shipment.id AND (upper_inf(xl1.recorded_during) OR upper(xl1.recorded_during) = 'infinity') AND xl1.valid_during @> now() AND xl1.scenario_id = 0 AND (upper_inf(xo1.recorded_during) OR upper(xo1.recorded_during) = 'infinity') AND xo1.valid_during @> now() AND xo1.scenario_id = 0 AND (xo1."region" = NULLIF(current_setting('amarh.region', true), ''))) WHEN 'sim' THEN true ELSE false END);
-CREATE POLICY amarh_insert ON obj_shipment FOR INSERT TO amarh_app WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END);
-CREATE POLICY amarh_update ON obj_shipment FOR UPDATE TO amarh_app USING (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END AND amarh_visible_shipment(id)) WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_select ON obj_shipment FOR SELECT TO amarh_app USING ((scenario_id = 0 OR (scenario_id = amarh_scn() AND amarh_scenario_visible(scenario_id))) AND amarh_visible_shipment(id) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN EXISTS (SELECT 1 FROM link_ships_to xl1 JOIN obj_warehouse xo1 ON xo1.id = xl1.dst WHERE xl1.src = obj_shipment.id AND CASE WHEN coalesce(current_setting('amarh.scenario', true), '') IN ('', '0') THEN ((upper_inf(xl1.recorded_during) OR upper(xl1.recorded_during) = 'infinity') AND xl1.valid_during @> now() AND xl1.scenario_id = 0) ELSE amarh_eff_row('link', 'ships_to', xl1.scenario_id, xl1.valid_during, xl1.recorded_during, xl1.src, xl1.dst) END AND CASE WHEN coalesce(current_setting('amarh.scenario', true), '') IN ('', '0') THEN ((upper_inf(xo1.recorded_during) OR upper(xo1.recorded_during) = 'infinity') AND xo1.valid_during @> now() AND xo1.scenario_id = 0) ELSE amarh_eff_row('obj', 'Warehouse', xo1.scenario_id, xo1.valid_during, xo1.recorded_during, xo1.id, NULL::uuid) END AND (xo1."region" = NULLIF(current_setting('amarh.region', true), ''))) WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_insert ON obj_shipment FOR INSERT TO amarh_app WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_update ON obj_shipment FOR UPDATE TO amarh_app USING (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END AND amarh_visible_shipment(id)) WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END);
 
 ALTER TABLE obj_supplier ENABLE ROW LEVEL SECURITY;
 ALTER TABLE obj_supplier FORCE ROW LEVEL SECURITY;
@@ -420,9 +691,9 @@ CREATE POLICY amarh_owner ON obj_supplier FOR ALL TO CURRENT_USER USING (true) W
 DROP POLICY IF EXISTS amarh_select ON obj_supplier;
 DROP POLICY IF EXISTS amarh_insert ON obj_supplier;
 DROP POLICY IF EXISTS amarh_update ON obj_supplier;
-CREATE POLICY amarh_select ON obj_supplier FOR SELECT TO amarh_app USING (amarh_visible_supplier(id) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END);
-CREATE POLICY amarh_insert ON obj_supplier FOR INSERT TO amarh_app WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'sim' THEN true ELSE false END);
-CREATE POLICY amarh_update ON obj_supplier FOR UPDATE TO amarh_app USING (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'sim' THEN true ELSE false END AND amarh_visible_supplier(id)) WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_select ON obj_supplier FOR SELECT TO amarh_app USING ((scenario_id = 0 OR (scenario_id = amarh_scn() AND amarh_scenario_visible(scenario_id))) AND amarh_visible_supplier(id) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_insert ON obj_supplier FOR INSERT TO amarh_app WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_update ON obj_supplier FOR UPDATE TO amarh_app USING (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'sim' THEN true ELSE false END AND amarh_visible_supplier(id)) WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'sim' THEN true ELSE false END);
 
 ALTER TABLE obj_warehouse ENABLE ROW LEVEL SECURITY;
 ALTER TABLE obj_warehouse FORCE ROW LEVEL SECURITY;
@@ -431,9 +702,9 @@ CREATE POLICY amarh_owner ON obj_warehouse FOR ALL TO CURRENT_USER USING (true) 
 DROP POLICY IF EXISTS amarh_select ON obj_warehouse;
 DROP POLICY IF EXISTS amarh_insert ON obj_warehouse;
 DROP POLICY IF EXISTS amarh_update ON obj_warehouse;
-CREATE POLICY amarh_select ON obj_warehouse FOR SELECT TO amarh_app USING (amarh_visible_warehouse(id) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN (obj_warehouse."region" = NULLIF(current_setting('amarh.region', true), '')) WHEN 'sim' THEN true ELSE false END);
-CREATE POLICY amarh_insert ON obj_warehouse FOR INSERT TO amarh_app WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'sim' THEN true ELSE false END);
-CREATE POLICY amarh_update ON obj_warehouse FOR UPDATE TO amarh_app USING (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'sim' THEN true ELSE false END AND amarh_visible_warehouse(id)) WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_select ON obj_warehouse FOR SELECT TO amarh_app USING ((scenario_id = 0 OR (scenario_id = amarh_scn() AND amarh_scenario_visible(scenario_id))) AND amarh_visible_warehouse(id) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN (obj_warehouse."region" = NULLIF(current_setting('amarh.region', true), '')) WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_insert ON obj_warehouse FOR INSERT TO amarh_app WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_update ON obj_warehouse FOR UPDATE TO amarh_app USING (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'sim' THEN true ELSE false END AND amarh_visible_warehouse(id)) WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'sim' THEN true ELSE false END);
 
 ALTER TABLE link_affects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE link_affects FORCE ROW LEVEL SECURITY;
@@ -442,9 +713,9 @@ CREATE POLICY amarh_owner ON link_affects FOR ALL TO CURRENT_USER USING (true) W
 DROP POLICY IF EXISTS amarh_select ON link_affects;
 DROP POLICY IF EXISTS amarh_insert ON link_affects;
 DROP POLICY IF EXISTS amarh_update ON link_affects;
-CREATE POLICY amarh_select ON link_affects FOR SELECT TO amarh_app USING (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_event(src)) AND (amarh_visible_port(dst)));
-CREATE POLICY amarh_insert ON link_affects FOR INSERT TO amarh_app WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_event(src)) AND (amarh_visible_port(dst)));
-CREATE POLICY amarh_update ON link_affects FOR UPDATE TO amarh_app USING (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_event(src)) AND (amarh_visible_port(dst))) WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_select ON link_affects FOR SELECT TO amarh_app USING ((scenario_id = 0 OR (scenario_id = amarh_scn() AND amarh_scenario_visible(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_event(src)) AND (amarh_visible_port(dst)));
+CREATE POLICY amarh_insert ON link_affects FOR INSERT TO amarh_app WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_event(src)) AND (amarh_visible_port(dst)));
+CREATE POLICY amarh_update ON link_affects FOR UPDATE TO amarh_app USING (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_event(src)) AND (amarh_visible_port(dst))) WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END);
 
 ALTER TABLE link_billed_by ENABLE ROW LEVEL SECURITY;
 ALTER TABLE link_billed_by FORCE ROW LEVEL SECURITY;
@@ -453,9 +724,9 @@ CREATE POLICY amarh_owner ON link_billed_by FOR ALL TO CURRENT_USER USING (true)
 DROP POLICY IF EXISTS amarh_select ON link_billed_by;
 DROP POLICY IF EXISTS amarh_insert ON link_billed_by;
 DROP POLICY IF EXISTS amarh_update ON link_billed_by;
-CREATE POLICY amarh_select ON link_billed_by FOR SELECT TO amarh_app USING (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_invoice(src)) AND (amarh_visible_supplier(dst)));
-CREATE POLICY amarh_insert ON link_billed_by FOR INSERT TO amarh_app WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_invoice(src)) AND (amarh_visible_supplier(dst)));
-CREATE POLICY amarh_update ON link_billed_by FOR UPDATE TO amarh_app USING (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_invoice(src)) AND (amarh_visible_supplier(dst))) WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_select ON link_billed_by FOR SELECT TO amarh_app USING ((scenario_id = 0 OR (scenario_id = amarh_scn() AND amarh_scenario_visible(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_invoice(src)) AND (amarh_visible_supplier(dst)));
+CREATE POLICY amarh_insert ON link_billed_by FOR INSERT TO amarh_app WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_invoice(src)) AND (amarh_visible_supplier(dst)));
+CREATE POLICY amarh_update ON link_billed_by FOR UPDATE TO amarh_app USING (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_invoice(src)) AND (amarh_visible_supplier(dst))) WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END);
 
 ALTER TABLE link_invoices_for ENABLE ROW LEVEL SECURITY;
 ALTER TABLE link_invoices_for FORCE ROW LEVEL SECURITY;
@@ -464,9 +735,9 @@ CREATE POLICY amarh_owner ON link_invoices_for FOR ALL TO CURRENT_USER USING (tr
 DROP POLICY IF EXISTS amarh_select ON link_invoices_for;
 DROP POLICY IF EXISTS amarh_insert ON link_invoices_for;
 DROP POLICY IF EXISTS amarh_update ON link_invoices_for;
-CREATE POLICY amarh_select ON link_invoices_for FOR SELECT TO amarh_app USING (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_invoice(src)) AND (amarh_visible_shipment(dst)));
-CREATE POLICY amarh_insert ON link_invoices_for FOR INSERT TO amarh_app WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_invoice(src)) AND (amarh_visible_shipment(dst)));
-CREATE POLICY amarh_update ON link_invoices_for FOR UPDATE TO amarh_app USING (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_invoice(src)) AND (amarh_visible_shipment(dst))) WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_select ON link_invoices_for FOR SELECT TO amarh_app USING ((scenario_id = 0 OR (scenario_id = amarh_scn() AND amarh_scenario_visible(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_invoice(src)) AND (amarh_visible_shipment(dst)));
+CREATE POLICY amarh_insert ON link_invoices_for FOR INSERT TO amarh_app WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_invoice(src)) AND (amarh_visible_shipment(dst)));
+CREATE POLICY amarh_update ON link_invoices_for FOR UPDATE TO amarh_app USING (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_invoice(src)) AND (amarh_visible_shipment(dst))) WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'sim' THEN true ELSE false END);
 
 ALTER TABLE link_operated_by ENABLE ROW LEVEL SECURITY;
 ALTER TABLE link_operated_by FORCE ROW LEVEL SECURITY;
@@ -475,9 +746,9 @@ CREATE POLICY amarh_owner ON link_operated_by FOR ALL TO CURRENT_USER USING (tru
 DROP POLICY IF EXISTS amarh_select ON link_operated_by;
 DROP POLICY IF EXISTS amarh_insert ON link_operated_by;
 DROP POLICY IF EXISTS amarh_update ON link_operated_by;
-CREATE POLICY amarh_select ON link_operated_by FOR SELECT TO amarh_app USING (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_shipment(src)) AND (amarh_visible_carrier(dst)));
-CREATE POLICY amarh_insert ON link_operated_by FOR INSERT TO amarh_app WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_shipment(src)) AND (amarh_visible_carrier(dst)));
-CREATE POLICY amarh_update ON link_operated_by FOR UPDATE TO amarh_app USING (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_shipment(src)) AND (amarh_visible_carrier(dst))) WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_select ON link_operated_by FOR SELECT TO amarh_app USING ((scenario_id = 0 OR (scenario_id = amarh_scn() AND amarh_scenario_visible(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_shipment(src)) AND (amarh_visible_carrier(dst)));
+CREATE POLICY amarh_insert ON link_operated_by FOR INSERT TO amarh_app WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_shipment(src)) AND (amarh_visible_carrier(dst)));
+CREATE POLICY amarh_update ON link_operated_by FOR UPDATE TO amarh_app USING (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_shipment(src)) AND (amarh_visible_carrier(dst))) WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END);
 
 ALTER TABLE link_ships_from ENABLE ROW LEVEL SECURITY;
 ALTER TABLE link_ships_from FORCE ROW LEVEL SECURITY;
@@ -486,9 +757,9 @@ CREATE POLICY amarh_owner ON link_ships_from FOR ALL TO CURRENT_USER USING (true
 DROP POLICY IF EXISTS amarh_select ON link_ships_from;
 DROP POLICY IF EXISTS amarh_insert ON link_ships_from;
 DROP POLICY IF EXISTS amarh_update ON link_ships_from;
-CREATE POLICY amarh_select ON link_ships_from FOR SELECT TO amarh_app USING (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_shipment(src)) AND (amarh_visible_port(dst) OR amarh_visible_warehouse(dst)));
-CREATE POLICY amarh_insert ON link_ships_from FOR INSERT TO amarh_app WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_shipment(src)) AND (amarh_visible_port(dst) OR amarh_visible_warehouse(dst)));
-CREATE POLICY amarh_update ON link_ships_from FOR UPDATE TO amarh_app USING (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_shipment(src)) AND (amarh_visible_port(dst) OR amarh_visible_warehouse(dst))) WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_select ON link_ships_from FOR SELECT TO amarh_app USING ((scenario_id = 0 OR (scenario_id = amarh_scn() AND amarh_scenario_visible(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_shipment(src)) AND (amarh_visible_port(dst) OR amarh_visible_warehouse(dst)));
+CREATE POLICY amarh_insert ON link_ships_from FOR INSERT TO amarh_app WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_shipment(src)) AND (amarh_visible_port(dst) OR amarh_visible_warehouse(dst)));
+CREATE POLICY amarh_update ON link_ships_from FOR UPDATE TO amarh_app USING (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_shipment(src)) AND (amarh_visible_port(dst) OR amarh_visible_warehouse(dst))) WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END);
 
 ALTER TABLE link_ships_to ENABLE ROW LEVEL SECURITY;
 ALTER TABLE link_ships_to FORCE ROW LEVEL SECURITY;
@@ -497,9 +768,9 @@ CREATE POLICY amarh_owner ON link_ships_to FOR ALL TO CURRENT_USER USING (true) 
 DROP POLICY IF EXISTS amarh_select ON link_ships_to;
 DROP POLICY IF EXISTS amarh_insert ON link_ships_to;
 DROP POLICY IF EXISTS amarh_update ON link_ships_to;
-CREATE POLICY amarh_select ON link_ships_to FOR SELECT TO amarh_app USING (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_shipment(src)) AND (amarh_visible_warehouse(dst)));
-CREATE POLICY amarh_insert ON link_ships_to FOR INSERT TO amarh_app WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_shipment(src)) AND (amarh_visible_warehouse(dst)));
-CREATE POLICY amarh_update ON link_ships_to FOR UPDATE TO amarh_app USING (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_shipment(src)) AND (amarh_visible_warehouse(dst))) WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_select ON link_ships_to FOR SELECT TO amarh_app USING ((scenario_id = 0 OR (scenario_id = amarh_scn() AND amarh_scenario_visible(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_shipment(src)) AND (amarh_visible_warehouse(dst)));
+CREATE POLICY amarh_insert ON link_ships_to FOR INSERT TO amarh_app WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_shipment(src)) AND (amarh_visible_warehouse(dst)));
+CREATE POLICY amarh_update ON link_ships_to FOR UPDATE TO amarh_app USING (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_shipment(src)) AND (amarh_visible_warehouse(dst))) WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END);
 
 ALTER TABLE link_ships_via ENABLE ROW LEVEL SECURITY;
 ALTER TABLE link_ships_via FORCE ROW LEVEL SECURITY;
@@ -508,9 +779,9 @@ CREATE POLICY amarh_owner ON link_ships_via FOR ALL TO CURRENT_USER USING (true)
 DROP POLICY IF EXISTS amarh_select ON link_ships_via;
 DROP POLICY IF EXISTS amarh_insert ON link_ships_via;
 DROP POLICY IF EXISTS amarh_update ON link_ships_via;
-CREATE POLICY amarh_select ON link_ships_via FOR SELECT TO amarh_app USING (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_shipment(src)) AND (amarh_visible_port(dst)));
-CREATE POLICY amarh_insert ON link_ships_via FOR INSERT TO amarh_app WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_shipment(src)) AND (amarh_visible_port(dst)));
-CREATE POLICY amarh_update ON link_ships_via FOR UPDATE TO amarh_app USING (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_shipment(src)) AND (amarh_visible_port(dst))) WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_select ON link_ships_via FOR SELECT TO amarh_app USING ((scenario_id = 0 OR (scenario_id = amarh_scn() AND amarh_scenario_visible(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_shipment(src)) AND (amarh_visible_port(dst)));
+CREATE POLICY amarh_insert ON link_ships_via FOR INSERT TO amarh_app WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_shipment(src)) AND (amarh_visible_port(dst)));
+CREATE POLICY amarh_update ON link_ships_via FOR UPDATE TO amarh_app USING (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_shipment(src)) AND (amarh_visible_port(dst))) WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'planner' THEN true WHEN 'sim' THEN true ELSE false END);
 
 ALTER TABLE link_supplies ENABLE ROW LEVEL SECURITY;
 ALTER TABLE link_supplies FORCE ROW LEVEL SECURITY;
@@ -519,9 +790,9 @@ CREATE POLICY amarh_owner ON link_supplies FOR ALL TO CURRENT_USER USING (true) 
 DROP POLICY IF EXISTS amarh_select ON link_supplies;
 DROP POLICY IF EXISTS amarh_insert ON link_supplies;
 DROP POLICY IF EXISTS amarh_update ON link_supplies;
-CREATE POLICY amarh_select ON link_supplies FOR SELECT TO amarh_app USING (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_supplier(src)) AND (amarh_visible_supplier(dst)));
-CREATE POLICY amarh_insert ON link_supplies FOR INSERT TO amarh_app WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_supplier(src)) AND (amarh_visible_supplier(dst)));
-CREATE POLICY amarh_update ON link_supplies FOR UPDATE TO amarh_app USING (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_supplier(src)) AND (amarh_visible_supplier(dst))) WITH CHECK (CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'sim' THEN true ELSE false END);
+CREATE POLICY amarh_select ON link_supplies FOR SELECT TO amarh_app USING ((scenario_id = 0 OR (scenario_id = amarh_scn() AND amarh_scenario_visible(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'finance_analyst' THEN true WHEN 'planner' THEN true WHEN 'regional_ops_lead' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_supplier(src)) AND (amarh_visible_supplier(dst)));
+CREATE POLICY amarh_insert ON link_supplies FOR INSERT TO amarh_app WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_supplier(src)) AND (amarh_visible_supplier(dst)));
+CREATE POLICY amarh_update ON link_supplies FOR UPDATE TO amarh_app USING (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'sim' THEN true ELSE false END AND (amarh_visible_supplier(src)) AND (amarh_visible_supplier(dst))) WITH CHECK (((scenario_id = 0 AND amarh_scn() = 0) OR (scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id))) AND CASE current_setting('amarh.role', true) WHEN 'admin' THEN true WHEN 'sim' THEN true ELSE false END);
 
 CREATE OR REPLACE VIEW rd_obj_carrier WITH (security_invoker = true) AS
 SELECT id,
@@ -541,6 +812,15 @@ SELECT id,
   action_id,
   scenario_id
 FROM cur_obj_carrier;
+CREATE OR REPLACE VIEW rd_eff_obj_carrier WITH (security_invoker = true) AS
+SELECT id,
+  "name",
+  valid_during,
+  recorded_during,
+  changed_by,
+  action_id,
+  scenario_id
+FROM eff_obj_carrier;
 
 CREATE OR REPLACE VIEW rd_obj_event WITH (security_invoker = true) AS
 SELECT id,
@@ -568,6 +848,19 @@ SELECT id,
   action_id,
   scenario_id
 FROM cur_obj_event;
+CREATE OR REPLACE VIEW rd_eff_obj_event WITH (security_invoker = true) AS
+SELECT id,
+  "kind",
+  "severity",
+  "started",
+  "ended",
+  "note",
+  valid_during,
+  recorded_during,
+  changed_by,
+  action_id,
+  scenario_id
+FROM eff_obj_event;
 
 CREATE OR REPLACE VIEW rd_obj_invoice WITH (security_invoker = true) AS
 SELECT id,
@@ -597,6 +890,20 @@ SELECT id,
   action_id,
   scenario_id
 FROM cur_obj_invoice;
+CREATE OR REPLACE VIEW rd_eff_obj_invoice WITH (security_invoker = true) AS
+SELECT id,
+  "ref",
+  "amount",
+  "currency",
+  "status",
+  "due",
+  "anomaly",
+  valid_during,
+  recorded_during,
+  changed_by,
+  action_id,
+  scenario_id
+FROM eff_obj_invoice;
 
 CREATE OR REPLACE VIEW rd_obj_port WITH (security_invoker = true) AS
 SELECT id,
@@ -626,6 +933,20 @@ SELECT id,
   action_id,
   scenario_id
 FROM cur_obj_port;
+CREATE OR REPLACE VIEW rd_eff_obj_port WITH (security_invoker = true) AS
+SELECT id,
+  "name",
+  "lat",
+  "lon",
+  "location",
+  "status",
+  "region",
+  valid_during,
+  recorded_during,
+  changed_by,
+  action_id,
+  scenario_id
+FROM eff_obj_port;
 
 CREATE OR REPLACE VIEW rd_obj_purchase_order WITH (security_invoker = true) AS
 SELECT id,
@@ -649,6 +970,17 @@ SELECT id,
   action_id,
   scenario_id
 FROM cur_obj_purchase_order;
+CREATE OR REPLACE VIEW rd_eff_obj_purchase_order WITH (security_invoker = true) AS
+SELECT id,
+  "ref",
+  "amount",
+  "status",
+  valid_during,
+  recorded_during,
+  changed_by,
+  action_id,
+  scenario_id
+FROM eff_obj_purchase_order;
 
 CREATE OR REPLACE VIEW rd_obj_shipment WITH (security_invoker = true) AS
 SELECT id,
@@ -659,6 +991,7 @@ SELECT id,
   "progress",
   "cargo_value",
   "delay_hours",
+  "extra_cost",
   valid_during,
   recorded_during,
   changed_by,
@@ -674,17 +1007,35 @@ SELECT id,
   "progress",
   "cargo_value",
   "delay_hours",
+  "extra_cost",
   valid_during,
   recorded_during,
   changed_by,
   action_id,
   scenario_id
 FROM cur_obj_shipment;
+CREATE OR REPLACE VIEW rd_eff_obj_shipment WITH (security_invoker = true) AS
+SELECT id,
+  "ref",
+  "eta",
+  "status",
+  "position",
+  "progress",
+  "cargo_value",
+  "delay_hours",
+  "extra_cost",
+  valid_during,
+  recorded_during,
+  changed_by,
+  action_id,
+  scenario_id
+FROM eff_obj_shipment;
 
 CREATE OR REPLACE VIEW rd_obj_supplier WITH (security_invoker = true) AS
 SELECT id,
   "name",
   CASE WHEN current_setting('amarh.role', true) IN ('planner', 'regional_ops_lead') THEN NULL ELSE "country" END AS "country",
+  "price_index",
   valid_during,
   recorded_during,
   changed_by,
@@ -695,12 +1046,24 @@ CREATE OR REPLACE VIEW rd_cur_obj_supplier WITH (security_invoker = true) AS
 SELECT id,
   "name",
   CASE WHEN current_setting('amarh.role', true) IN ('planner', 'regional_ops_lead') THEN NULL ELSE "country" END AS "country",
+  "price_index",
   valid_during,
   recorded_during,
   changed_by,
   action_id,
   scenario_id
 FROM cur_obj_supplier;
+CREATE OR REPLACE VIEW rd_eff_obj_supplier WITH (security_invoker = true) AS
+SELECT id,
+  "name",
+  CASE WHEN current_setting('amarh.role', true) IN ('planner', 'regional_ops_lead') THEN NULL ELSE "country" END AS "country",
+  "price_index",
+  valid_during,
+  recorded_during,
+  changed_by,
+  action_id,
+  scenario_id
+FROM eff_obj_supplier;
 
 CREATE OR REPLACE VIEW rd_obj_warehouse WITH (security_invoker = true) AS
 SELECT id,
@@ -728,9 +1091,22 @@ SELECT id,
   action_id,
   scenario_id
 FROM cur_obj_warehouse;
+CREATE OR REPLACE VIEW rd_eff_obj_warehouse WITH (security_invoker = true) AS
+SELECT id,
+  "name",
+  "lat",
+  "lon",
+  "location",
+  "region",
+  valid_during,
+  recorded_during,
+  changed_by,
+  action_id,
+  scenario_id
+FROM eff_obj_warehouse;
 
 -- grants for amarh_app
-GRANT SELECT ON obj_carrier, obj_event, obj_invoice, obj_port, obj_purchase_order, obj_shipment, obj_supplier, obj_warehouse, link_affects, link_billed_by, link_invoices_for, link_operated_by, link_ships_from, link_ships_to, link_ships_via, link_supplies, cur_obj_carrier, cur_obj_event, cur_obj_invoice, cur_obj_port, cur_obj_purchase_order, cur_obj_shipment, cur_obj_supplier, cur_obj_warehouse, cur_link_affects, cur_link_billed_by, cur_link_invoices_for, cur_link_operated_by, cur_link_ships_from, cur_link_ships_to, cur_link_ships_via, cur_link_supplies, rd_obj_carrier, rd_obj_event, rd_obj_invoice, rd_obj_port, rd_obj_purchase_order, rd_obj_shipment, rd_obj_supplier, rd_obj_warehouse, rd_cur_obj_carrier, rd_cur_obj_event, rd_cur_obj_invoice, rd_cur_obj_port, rd_cur_obj_purchase_order, rd_cur_obj_shipment, rd_cur_obj_supplier, rd_cur_obj_warehouse TO amarh_app;
+GRANT SELECT ON obj_carrier, obj_event, obj_invoice, obj_port, obj_purchase_order, obj_shipment, obj_supplier, obj_warehouse, link_affects, link_billed_by, link_invoices_for, link_operated_by, link_ships_from, link_ships_to, link_ships_via, link_supplies, cur_obj_carrier, cur_obj_event, cur_obj_invoice, cur_obj_port, cur_obj_purchase_order, cur_obj_shipment, cur_obj_supplier, cur_obj_warehouse, cur_link_affects, cur_link_billed_by, cur_link_invoices_for, cur_link_operated_by, cur_link_ships_from, cur_link_ships_to, cur_link_ships_via, cur_link_supplies, eff_obj_carrier, eff_obj_event, eff_obj_invoice, eff_obj_port, eff_obj_purchase_order, eff_obj_shipment, eff_obj_supplier, eff_obj_warehouse, eff_link_affects, eff_link_billed_by, eff_link_invoices_for, eff_link_operated_by, eff_link_ships_from, eff_link_ships_to, eff_link_ships_via, eff_link_supplies, rd_obj_carrier, rd_obj_event, rd_obj_invoice, rd_obj_port, rd_obj_purchase_order, rd_obj_shipment, rd_obj_supplier, rd_obj_warehouse, rd_cur_obj_carrier, rd_cur_obj_event, rd_cur_obj_invoice, rd_cur_obj_port, rd_cur_obj_purchase_order, rd_cur_obj_shipment, rd_cur_obj_supplier, rd_cur_obj_warehouse, rd_eff_obj_carrier, rd_eff_obj_event, rd_eff_obj_invoice, rd_eff_obj_port, rd_eff_obj_purchase_order, rd_eff_obj_shipment, rd_eff_obj_supplier, rd_eff_obj_warehouse TO amarh_app;
 GRANT INSERT, UPDATE ON obj_carrier, obj_event, obj_invoice, obj_port, obj_purchase_order, obj_shipment, obj_supplier, obj_warehouse, link_affects, link_billed_by, link_invoices_for, link_operated_by, link_ships_from, link_ships_to, link_ships_via, link_supplies TO amarh_app;
 REVOKE DELETE, TRUNCATE ON obj_carrier, obj_event, obj_invoice, obj_port, obj_purchase_order, obj_shipment, obj_supplier, obj_warehouse, link_affects, link_billed_by, link_invoices_for, link_operated_by, link_ships_from, link_ships_to, link_ships_via, link_supplies FROM amarh_app;
 GRANT INSERT ON graph_outbox TO amarh_app;

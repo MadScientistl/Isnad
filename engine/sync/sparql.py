@@ -23,6 +23,11 @@ Model
 * SERVICE: pyoxigraph 0.5 has no switch to disable federation (verified: a SERVICE query hits the
   remote endpoint), so SERVICE is blocked only by validation (rdflib algebra names + lexical scan
   after a real lexer). Network egress filtering is the recommended second layer.
+* SCENARIOS (Phase 5): `run_query(graph, conn, is_admin, q, scenario=ctx)` where `graph` is the scenario's
+  `ScenarioGraph` (NOT the main pipeline; a mismatch raises ValueError, so a scenario query can never
+  read main's live store). Admin queries run on the scenario store; non-admin gets the usual per-query
+  visible store built from `eff_*` relations, `inferred_support WHERE scenario_id = ctx.id` and the
+  scenario's inferred graph. Aggregate rejection, timeout and row caps are unchanged.
 * Limits: wall-clock `timeout_s` (the query runs in a worker thread; on timeout the caller gets
   `SparqlError('timeout')`; Oxigraph offers no cancellation, so a runaway query keeps burning a
   CPU in the abandoned daemon thread on its throw-away store until it ends. Known limitation)
@@ -39,7 +44,9 @@ from uuid import UUID
 from pyoxigraph import (BlankNode, Literal, NamedNode, Quad, QueryBoolean, QuerySolutions, Store)
 
 from . import iri
+from engine.db.principal import ScenarioCtx
 from .visibility import all_visible_ids, edges_exist, inferred_visible, visible_edges  # noqa: F401
+from .visibility import _check_scn
 
 
 class SparqlError(ValueError):
@@ -144,15 +151,30 @@ def _has_key(node, key: str) -> bool:
 
 
 # --------------------------------------------------------------------------- the principal's view
-def build_visible_store(pipeline, conn, *, is_admin: bool = False) -> tuple[Store, set[str]]:
-    """In-memory store with only what `conn`'s principal may see. Returns (store, visible object IRIs)."""
+def _require_graph(pipeline, scenario) -> None:
+    """In a scenario `pipeline` must be that scenario's ScenarioGraph; outside, never a ScenarioGraph."""
+    sid = getattr(pipeline, "scenario_id", 0)
+    if scenario is None:
+        if sid:
+            raise ValueError("a ScenarioGraph needs scenario=<its ScenarioCtx>")
+    elif sid != scenario.id:
+        raise ValueError("scenario queries need the ScenarioGraph of that scenario (engine.sync.scenario_graph.get_store)")
+
+
+def build_visible_store(pipeline, conn, *, is_admin: bool = False,
+                        scenario: ScenarioCtx | None = None) -> tuple[Store, set[str]]:
+    """In-memory store with only what `conn`'s principal may see. Returns (store, visible object IRIs).
+
+    With `scenario`, `pipeline` is the scenario's ScenarioGraph and every relation is scenario-effective."""
+    _require_graph(pipeline, scenario)
+    _check_scn(conn, scenario)
     cfg = pipeline.cfg
     ns = cfg.namespace
     pre = f"{ns}obj/"
     out = Store()
     quads: list[Quad] = []
     vis_ids: set[UUID] = set()
-    for typ, ids in all_visible_ids(conn, cfg=cfg).items():
+    for typ, ids in all_visible_ids(conn, cfg=cfg, scenario=scenario).items():
         cls = iri.class_iri(ns, typ)
         for i in ids:
             vis_ids.add(i)
@@ -162,7 +184,7 @@ def build_visible_store(pipeline, conn, *, is_admin: bool = False) -> tuple[Stor
     for l in cfg.link_types:
         p = iri.link_iri(ns, l)
         for s, d in conn.execute(sql.SQL("SELECT DISTINCT src, dst FROM {}").format(
-                sql.Identifier("cur_" + bt.link_table(l)))).fetchall():
+                sql.Identifier(("eff_" if scenario is not None else "cur_") + bt.link_table(l)))).fetchall():
             if s in vis_ids and d in vis_ids:
                 quads.append(Quad(iri.obj_iri(ns, s), p, iri.obj_iri(ns, d)))
     # inferred graph: instance edges via D6, instance rdf:type of visible subjects as-is
@@ -183,7 +205,7 @@ def build_visible_store(pipeline, conn, *, is_admin: bool = False) -> tuple[Stor
                 and q.predicate.value.startswith(ns):
             cand.append((sid, q.predicate.value[nsl:], UUID(q.object.value[len(pre):])))
     quads += type_quads
-    ok = inferred_visible(conn, [c for c in cand if c[2] in vis_ids], is_admin=is_admin, cfg=cfg)
+    ok = inferred_visible(conn, [c for c in cand if c[2] in vis_ids], is_admin=is_admin, cfg=cfg, scenario=scenario)
     for s, l, d in ok:
         quads.append(Quad(iri.obj_iri(ns, s), iri.link_iri(ns, l), iri.obj_iri(ns, d)))
     quads += [Quad(q.subject, q.predicate, q.object) for q in onto]
@@ -210,21 +232,24 @@ def _term_json(t) -> dict | None:
 
 
 def run_query(pipeline, conn, principal_is_admin: bool, query: str, *, timeout_s: float = 5.0,
-              max_rows: int = 1000) -> dict:
+              max_rows: int = 1000, scenario: ScenarioCtx | None = None) -> dict:
     """Run a validated SELECT/ASK. `conn` must be inside `scoped(...)` for the acting principal.
+    With `scenario`, `pipeline` is the scenario's ScenarioGraph and `conn` is scoped with that scenario.
 
     Returns `{"vars": [...], "rows": [{var: {type, value[, datatype|lang]}}], "truncated": bool}`
     (unbound variables are omitted from a row, as in SPARQL JSON results); ASK returns
     `{"vars": [], "rows": [], "boolean": bool, "truncated": False}`. Raises SparqlError.
     """
     kind = validate(query, is_admin=principal_is_admin)
+    _require_graph(pipeline, scenario)
+    _check_scn(conn, scenario)
     deadline = time.monotonic() + timeout_s
     if principal_is_admin:
         store, pre = pipeline.store, None
         graphs = [iri.G_ONTOLOGY, iri.G_ASSERTED, iri.G_INFERRED]
         kw = {"default_graph": graphs, "named_graphs": []}
     else:
-        store, vis = build_visible_store(pipeline, conn, is_admin=False)
+        store, vis = build_visible_store(pipeline, conn, is_admin=False, scenario=scenario)
         kw = {}
         pre = (pipeline.cfg.namespace + "obj/", vis)
     remaining = max(0.05, deadline - time.monotonic())

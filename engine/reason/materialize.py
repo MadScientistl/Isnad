@@ -191,7 +191,7 @@ def enumerate_paths(adj: dict, radj_reach: set, s, d, cap: int = MAX_DERIVATIONS
 
 
 def write_support(conn, st: Store, ns: str, yaml_path=None, max_derivations: int = MAX_DERIVATIONS,
-                  data_version: int | None = None) -> dict:
+                  data_version: int | None = None, scenario_id: int = 0) -> dict:
     """(Re)populate `inferred_support` from the ASSERTED graph for every inferred instance edge.
 
     Runs as OWNER (loader connection; `amarh_app` has SELECT only). For each inferred edge
@@ -201,7 +201,12 @@ def write_support(conn, st: Store, ns: str, yaml_path=None, max_derivations: int
     Derivations beyond the cap are dropped, which can only HIDE an edge that is visible
     through a dropped derivation (fail closed), never reveal one. The table is replaced in
     one transaction. Returns {edges, derivations, no_derivation}.
+
+    `scenario_id` (Phase 5): 0 = main. Only rows of that scenario are deleted/inserted, so a scenario
+    build never touches main's rows and vice versa.
     """
+    if type(scenario_id) is not int or scenario_id < 0:
+        raise ValueError("scenario_id must be a non-negative int")
     sem = link_semantics(yaml_path)
     pre = f"{ns}obj/"
     n = len(pre)
@@ -252,9 +257,10 @@ def write_support(conn, st: Store, ns: str, yaml_path=None, max_derivations: int
             for i, p in enumerate(paths):
                 rows.append((link, s, d, i, list(p), data_version))
     with conn.transaction():
-        conn.execute("DELETE FROM inferred_support")
+        conn.execute("DELETE FROM inferred_support WHERE scenario_id = %s", [scenario_id])
         if rows:
             with conn.cursor() as cur:
-                cur.executemany("INSERT INTO inferred_support (link, src, dst, derivation_no, support, data_version) "
-                                "VALUES (%s, %s::uuid, %s::uuid, %s, %s::uuid[], %s)", rows)
+                cur.executemany("INSERT INTO inferred_support (link, src, dst, derivation_no, support, data_version, "
+                                "scenario_id) VALUES (%s, %s::uuid, %s::uuid, %s, %s::uuid[], %s, " + str(scenario_id) + ")",
+                                rows)
     return {"edges": edges, "derivations": len(rows), "no_derivation": none}

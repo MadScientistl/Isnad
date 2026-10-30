@@ -590,9 +590,60 @@ def _sql_lit(v) -> str:
     return "'" + str(v).replace("'", "''") + "'"
 
 
-def current_pred(alias: str) -> str:
-    return (f"(upper_inf({alias}.recorded_during) OR upper({alias}.recorded_during) = 'infinity') "
-            f"AND {alias}.valid_during @> now() AND {alias}.scenario_id = 0")
+_OPEN = "(upper_inf({a}.recorded_during) OR upper({a}.recorded_during) = 'infinity')"
+
+
+def main_current_pred(alias: str) -> str:
+    """Current version on main (scenario 0). Exactly the predicate of the `cur_*` views."""
+    return f"{_OPEN.format(a=alias)} AND {alias}.valid_during @> now() AND {alias}.scenario_id = 0"
+
+
+def eff_pred(alias: str, kind: str, name: str) -> str:
+    """Scenario-aware 'current version' predicate (Phase 5). Equals `main_current_pred` while
+    `amarh.scenario` is unset; inside a scenario it is the overlay rule: a row of the scenario that is
+    current knowledge and valid at the scenario clock, OR a main row as believed at `base_recorded`, valid at
+    the scenario clock, whose key has no `scenario_override` row (overridden keys, tombstones included,
+    come only from the scenario's own rows). `kind` is 'obj' (key = id) or 'link' (key = src,dst); `name`
+    is the ontology type / link name. The GUC readers are wrapped in scalar sub-selects so Postgres
+    evaluates them once per statement (InitPlan) instead of once per row. Used in point-lookup contexts
+    (visibility helpers, exists() filters) and by the eff_* views; never by the cur_* views."""
+    if kind not in ("obj", "link"):
+        raise ValueError(kind)
+    scn, base, now = "(SELECT amarh_scn())", "(SELECT amarh_scn_base())", "(SELECT amarh_now())"
+    o = f"xs_{alias}"
+    key = (f"{o}.key_a = {alias}.id" if kind == "obj"
+           else f"{o}.key_a = {alias}.src AND {o}.key_b = {alias}.dst")
+    ov = (f"NOT EXISTS (SELECT 1 FROM scenario_override {o} WHERE {o}.scenario_id = {scn} "
+          f"AND {o}.kind = '{kind}' AND {o}.type = {_sql_lit(name)} AND {key})")
+    # cheap per-row switch (no sub-select): the main path pays one current_setting() call per evaluation
+    unset = "coalesce(current_setting('amarh.scenario', true), '') IN ('', '0')"
+    return (f"CASE WHEN {unset} THEN ({main_current_pred(alias)}) "
+            f"ELSE (SELECT amarh_scenario_visible(amarh_scn())) AND ("
+            f"({alias}.scenario_id = {scn} AND {_OPEN.format(a=alias)} AND {alias}.valid_during @> {now}) "
+            f"OR ({alias}.scenario_id = 0 AND {alias}.recorded_during @> {base} AND {alias}.valid_during @> {now} "
+            f"AND {ov})) END")
+
+
+def eff_pred_fn(alias: str, kind: str, name: str) -> str:
+    """Same rule as `eff_pred`, but the scenario branch is one call to the plpgsql function
+    `amarh_eff_row` instead of an inline sub-select. Used where the predicate is embedded in policy /
+    visibility-helper plans: a large inline branch makes Postgres initialise its sub-plans on every call of
+    the helper (measured ~4x slowdown on the main path); a function call node is tiny and never executes
+    on the main path."""
+    if kind not in ("obj", "link"):
+        raise ValueError(kind)
+    unset = "coalesce(current_setting('amarh.scenario', true), '') IN ('', '0')"
+    keys = f"{alias}.id, NULL::uuid" if kind == "obj" else f"{alias}.src, {alias}.dst"
+    return (f"CASE WHEN {unset} THEN ({main_current_pred(alias)}) ELSE amarh_eff_row('{kind}', {_sql_lit(name)}, "
+            f"{alias}.scenario_id, {alias}.valid_during, {alias}.recorded_during, {keys}) END")
+
+
+def current_pred(alias: str, kind: str | None = None, name: str | None = None) -> str:
+    """'Current version' predicate used by the visibility helpers and exists() filters. With `kind`/`name`
+    it is the GUC-aware `eff_pred_fn`; without them the legacy main-only predicate."""
+    if name is None:
+        return main_current_pred(alias)
+    return eff_pred_fn(alias, kind or "obj", name)
 
 
 def _qi(s: str) -> str:
@@ -635,7 +686,7 @@ def filter_to_sql(node: Node, onto, type_name: str, alias: str, *, region_sql: s
             k = counter[0]
             la, oa = f"xl{k}", f"xo{k}"
             return (f"EXISTS (SELECT 1 FROM link_{n.link} {la} JOIN obj_{_snake(n.type)} {oa} ON {oa}.id = {la}.dst "
-                    f"WHERE {la}.src = {tbl_alias}.id AND {current_pred(la)} AND {current_pred(oa)} "
+                    f"WHERE {la}.src = {tbl_alias}.id AND {current_pred(la, 'link', n.link)} AND {current_pred(oa, 'obj', n.type)} "
                     f"AND {render(n.cond, oa)})")
         raise ExprError(f"cannot render {n!r}")
 
@@ -650,4 +701,4 @@ def _snake(name: str) -> str:
 
 __all__ = ["ExprError", "Node", "Lit", "Param", "Ref", "Bin", "Not", "Neg", "In", "IsNull", "Exists",
            "parse_expr", "parse_filter", "walk", "params_used", "evaluate", "validate_expr", "validate_filter",
-           "filter_to_sql", "current_pred", "subtype_names", "REGION_SQL"]
+           "filter_to_sql", "current_pred", "eff_pred", "eff_pred_fn", "main_current_pred", "subtype_names", "REGION_SQL"]

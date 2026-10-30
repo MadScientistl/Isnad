@@ -5,6 +5,7 @@ import { GridComponent, TooltipComponent, MarkLineComponent } from "echarts/comp
 import { CanvasRenderer } from "echarts/renderers";
 import { api, type Metric, type EventRow } from "../api";
 import { useAsOf, usePolled, fmtT } from "../store";
+import { ScnChip } from "../ScnUi";
 
 echarts.use([LineChart, GridComponent, TooltipComponent, MarkLineComponent, CanvasRenderer]);
 
@@ -62,7 +63,7 @@ function EventItem({ e }: { e: EventRow }) {
   const open = () => { if (ok) location.hash = `/${type}/${id}`; };
   return (
     <li className={ok ? "click" : ""} onClick={open} tabIndex={ok ? 0 : undefined} role={ok ? "link" : undefined} onKeyDown={(k) => k.key === "Enter" && open()}>
-      <div><span className="t">{fmtT(e.sim_time)}</span> <span className="n">{e.name}</span></div><div>{e.summary}</div>
+      <div><span className="t">{fmtT(e.sim_time)}</span> <span className="n">{e.name}</span> <ScnChip id={e.scenario_id} /></div><div>{e.summary}</div>
     </li>
   );
 }

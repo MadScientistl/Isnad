@@ -1,4 +1,4 @@
-"""The nine agent tools: pydantic input model + implementation + result envelope.
+"""The agent tools (nine read/propose tools plus four Phase 5 scenario tools): pydantic input model + implementation + result envelope.
 
 Rules (see docs/contracts.md, Phase 4):
 * every tool runs in its own `with conn.transaction(): with scoped(conn, human_principal):` (propose_action
@@ -24,12 +24,17 @@ from uuid import UUID
 import psycopg
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+import os
+
 from engine import functions as fx
-from engine.actions import CriteriaFailed, NotFound, PermissionDenied, propose
+from engine import kpis as kpis_mod
+from engine import scenarios as scn_svc
+from engine.actions import CriteriaFailed, NotFound, PermissionDenied, execute, propose
 from engine.api.masking import mask_out
 from engine.db import bitemporal as bt
 from engine.db.principal import scoped
 from engine.reason.materialize import link_semantics
+from engine.sync import scenario_graph
 from engine.sync import visibility as V
 
 from .injection import scan
@@ -148,6 +153,35 @@ class ProposeIn(_In):
     evidence: list[Evidence] = Field(min_length=1, max_length=20)
 
 
+INJECTION_KINDS = ("port_closure", "shipment_delay", "supplier_delay", "price_shock", "invoice_anomaly")
+
+
+class ScenarioOpenIn(_In):
+    name: str = Field(min_length=1, max_length=200, description="short human-readable name of the what-if")
+
+
+class ScenarioApplyIn(_In):
+    action: str = Field(description="an action you may propose; it is executed ONLY inside your active scenario")
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class InjectionIn(_In):
+    kind: Literal["port_closure", "shipment_delay", "supplier_delay", "price_shock", "invoice_anomaly"]
+    target: str | None = Field(default=None, description="uuid of an object you retrieved; omit to let the simulation pick")
+    at_h: float | None = Field(default=None, ge=0, le=24 * 14)
+    duration_h: float | None = Field(default=None, gt=0, le=24 * 30)
+    magnitude: float | None = Field(default=None, gt=0, le=100)
+
+
+class ScenarioSimulateIn(_In):
+    days: int = Field(ge=1, le=14, description="simulated days to run inside the active scenario (max 14)")
+    injections: list[InjectionIn] = Field(default_factory=list, max_length=5)
+
+
+class ScenarioCompareIn(_In):
+    pass
+
+
 # ------------------------------------------------------------------ small helpers
 def _j(v):
     if isinstance(v, datetime):
@@ -231,7 +265,7 @@ def _require_visible(conn, id_: UUID):
         raise ToolError("not found")
 
 
-def _inferred_info(conn, edges) -> dict:
+def _inferred_info(conn, edges, sid: int = 0) -> dict:
     """edge -> (rule, support) for inferred edges. Reads inferred_support under the caller's RLS, which only
     exposes derivations whose every node the caller can see (D6)."""
     edges = list(dict.fromkeys(edges))
@@ -240,7 +274,8 @@ def _inferred_info(conn, edges) -> dict:
     rows = conn.execute(
         "SELECT s.link, s.src, s.dst, s.derivation_no, s.support FROM inferred_support s "
         "JOIN unnest(%s::text[], %s::uuid[], %s::uuid[]) e(l, a, b) ON s.link = e.l AND s.src = e.a AND s.dst = e.b "
-        "ORDER BY s.derivation_no", [[e[1] for e in edges], [e[0] for e in edges], [e[2] for e in edges]]).fetchall()
+        "WHERE s.scenario_id = %s ORDER BY s.derivation_no",
+        [[e[1] for e in edges], [e[0] for e in edges], [e[2] for e in edges], sid]).fetchall()
     sup = {}
     for l, s, d, _n, support in rows:
         sup.setdefault((s, l, d), [str(x) for x in support])
@@ -253,8 +288,8 @@ def _inferred_info(conn, edges) -> dict:
     return out
 
 
-def _edge_dicts(conn, asserted, inferred):
-    info = _inferred_info(conn, inferred)
+def _edge_dicts(conn, asserted, inferred, sid: int = 0):
+    info = _inferred_info(conn, inferred, sid)
     out = [{"ref": _eref(l, s, d), "src": str(s), "link": l, "dst": str(d)} for s, l, d in asserted]
     for s, l, d in inferred:
         rule, support = info[(s, l, d)]
@@ -264,7 +299,7 @@ def _edge_dicts(conn, asserted, inferred):
 
 
 def _nodes(ctx, conn, ids, as_of=None):
-    infos = V.node_infos(conn, list(ids), as_of=as_of, model=ctx.model)
+    infos = V.node_infos(conn, list(ids), as_of=as_of, model=ctx.model, scenario=ctx.scn)
     return [{"ref": _oref(i["type"], i["id"]), **i} for i in (infos.get(str(x)) for x in ids) if i]
 
 
@@ -301,7 +336,7 @@ def query_objects(ctx, conn, a: QueryObjectsIn, call_id) -> Result:
     if ob not in (None, "id") and ob not in cols:
         raise ToolError(f"unknown order_by property {str(ob)[:60]!r}")
     rows = bt.list_objects(conn, a.type, where=" AND ".join(where) or None, params=params, limit=a.limit + 1,
-                           order_by=ob, desc=a.desc)
+                           order_by=ob, desc=a.desc, scenario_id=ctx.sid)
     more = len(rows) > a.limit
     return Result({"type": a.type, "objects": [_obj_dict(a.type, r) for r in rows[:a.limit]]}, truncated=more)
 
@@ -332,11 +367,23 @@ def _coerce(p, v):
     return v
 
 
+def _pipe(ctx, conn):
+    """Main: the run's pipeline. Scenario: that scenario's own cached graph (never the main store)."""
+    if ctx.scn is None:
+        return ctx.pipeline
+    try:
+        return scenario_graph.get_store(conn, ctx.scn, ctx.comp)
+    except scenario_graph.GraphTooLarge:
+        raise ToolError("the scenario is too large for graph reasoning") from None
+    except scenario_graph.ScenarioNotVisible:
+        raise ToolError("scenario not available") from None
+
+
 def _bfs(ctx, conn, center, depth, include_inferred, link_types, as_of=None):
     try:
-        return V.bfs(conn, center, depth, pipeline=ctx.pipeline, as_of=as_of, include_inferred=include_inferred,
+        return V.bfs(conn, center, depth, pipeline=_pipe(ctx, conn), as_of=as_of, include_inferred=include_inferred,
                      link_types=link_types, max_nodes=100, max_fanout=25, is_admin=_is_admin(ctx),
-                     deadline=_deadline(ctx))
+                     deadline=_deadline(ctx), scenario=ctx.scn)
     except V.NotVisible:
         raise ToolError("not found") from None
 
@@ -345,7 +392,7 @@ def traverse(ctx, conn, a: TraverseIn, call_id) -> Result:
     start = _uuid(a.start_id, "start_id")
     res = _bfs(ctx, conn, start, a.depth, a.include_inferred, _links(ctx, a.link_types))
     data = {"start": str(start), "nodes": _nodes(ctx, conn, res.order),
-            "edges": _edge_dicts(conn, [(s, l, d) for s, l, d in res.edges], res.inferred),
+            "edges": _edge_dicts(conn, [(s, l, d) for s, l, d in res.edges], res.inferred, ctx.sid),
             "inferred_available": res.inferred_available}
     return Result(data, truncated=res.truncated)
 
@@ -353,13 +400,14 @@ def traverse(ctx, conn, a: TraverseIn, call_id) -> Result:
 def find_paths(ctx, conn, a: FindPathsIn, call_id) -> Result:
     src, dst = _uuid(a.from_id, "from_id"), _uuid(a.to_id, "to_id")
     try:
-        paths = V.find_paths(conn, src, dst, max_hops=a.max_hops, pipeline=ctx.pipeline,
+        paths = V.find_paths(conn, src, dst, max_hops=a.max_hops, pipeline=_pipe(ctx, conn),
                              include_inferred=a.include_inferred, link_types=_links(ctx, a.link_types),
-                             max_paths=a.max_paths, is_admin=_is_admin(ctx), deadline=_deadline(ctx))
+                             max_paths=a.max_paths, is_admin=_is_admin(ctx), deadline=_deadline(ctx),
+                             scenario=ctx.scn)
     except V.NotVisible:
         raise ToolError("not found") from None
     ids = list(dict.fromkeys(n for p in paths for n, _l, _d in p))
-    asserted = set(V.visible_edges(conn, ids)) if ids else set()
+    asserted = set(V.visible_edges(conn, ids, scenario=ctx.scn)) if ids else set()
     edges, out = {}, []
     for p in paths:
         hops = []
@@ -371,7 +419,7 @@ def find_paths(ctx, conn, a: FindPathsIn, call_id) -> Result:
                          "link": link, "inferred": inf})
         out.append({"nodes": [str(n) for n, _l, _d in p], "hops": hops})
     data = {"paths": out, "nodes": _nodes(ctx, conn, ids),
-            "edges": _edge_dicts(conn, [e for e, i in edges.items() if not i], [e for e, i in edges.items() if i])}
+            "edges": _edge_dicts(conn, [e for e, i in edges.items() if not i], [e for e, i in edges.items() if i], ctx.sid)}
     return Result(data, truncated=len(paths) >= a.max_paths)
 
 
@@ -407,7 +455,7 @@ def impact_analysis(ctx, conn, a: ImpactIn, call_id) -> Result:
                  "basis": "inferred" if via[i][1] else "asserted"} for i in impacted_ids if str(i) in infos]
     used = list(dict.fromkeys(via[i] for i in impacted_ids))
     data = {"start": str(start), "direction": a.direction, "impacted": impacted,
-            "edges": _edge_dicts(conn, [e for e, inf in used if not inf], [e for e, inf in used if inf]),
+            "edges": _edge_dicts(conn, [e for e, inf in used if not inf], [e for e, inf in used if inf], ctx.sid),
             "note": "impact flows: affects src->dst, ships_via dst->src, supplies src->dst (inferred supplies is transitive)"}
     return Result(data, truncated=res.truncated)
 
@@ -415,7 +463,7 @@ def impact_analysis(ctx, conn, a: ImpactIn, call_id) -> Result:
 def get_history(ctx, conn, a: HistoryIn, call_id) -> Result:
     _readable_type(ctx, a.type)
     id_ = _uuid(a.id)
-    rows = bt.history(conn, a.type, id_)
+    rows = bt.history(conn, a.type, id_, scenario_id=ctx.sid)
     if not rows:
         raise ToolError("not found")
     vs = [{"valid_from": _j(r["valid_from"]), "valid_to": _j(r["valid_to"]),
@@ -426,11 +474,13 @@ def get_history(ctx, conn, a: HistoryIn, call_id) -> Result:
 
 
 def _snapshot(ctx, conn, type_, id_, at, neighbours):
-    row = bt.get_object(conn, type_, id_, as_of_valid=at)
+    row = bt.get_object(conn, type_, id_, as_of_valid=at, scenario_id=ctx.sid)
     if row is None:
         return None, [], [], False
     if not neighbours:
         return row, [], [], False
+    if ctx.scn is not None:
+        raise ToolError("include_neighbours is not available inside a scenario")
     try:
         res = V.bfs(conn, id_, 1, as_of=at, include_inferred=False, max_nodes=100, max_fanout=25,
                     is_admin=_is_admin(ctx), deadline=_deadline(ctx))
@@ -487,7 +537,7 @@ def run_function(ctx, conn, a: RunFunctionIn, call_id) -> Result:
         if s.base == "uuid" and a.params.get(k) is not None:
             _uuid(a.params[k], k)
     try:
-        out = _j(fx.run(conn, a.name, a.params))
+        out = _j(fx.run(conn, a.name, a.params, scenario_id=ctx.sid))
     except fx.FunctionError as e:
         raise ToolError(str(e)) from None
     ids = sorted(_collect_uuids(out))
@@ -534,16 +584,15 @@ def _check_evidence(ctx, items):
             raise ToolError(f"evidence ref {e.ref[:80]!r} is an inferred fact; mark it kind='inferred'")
 
 
-def propose_action(ctx, conn, a: ProposeIn, call_id) -> Result:
-    check_action(ctx, a.action)
-    _check_evidence(ctx, a.evidence)
-    action = ctx.model.actions[a.action]
+def _check_action_params(ctx, action_name: str, params: dict) -> None:
+    """Parameter names must be declared and every uuid parameter an id this run has retrieved."""
+    action = ctx.model.actions[action_name]
     specs = {s.name: s for s in action.param_specs()}
-    extra = set(a.params) - set(specs)
+    extra = set(params) - set(specs)
     if extra:
-        raise ToolError(f"unknown params for {a.action}: {sorted(map(str, extra))[:5]}")
+        raise ToolError(f"unknown params for {action_name}: {sorted(map(str, extra))[:5]}")
     for k, s in specs.items():
-        v = a.params.get(k)
+        v = params.get(k)
         if s.base == "uuid" and v is not None:
             try:
                 canon = str(UUID(str(v)))
@@ -552,20 +601,173 @@ def propose_action(ctx, conn, a: ProposeIn, call_id) -> Result:
             if canon not in ctx.seen_ids:
                 raise ToolError(f"param {k!r}: this id was not retrieved by this run; look the object up first "
                                 "(ids cannot be invented, and optional id params must be omitted)")
-    key = hashlib.sha256(json.dumps([ctx.run_id, a.action, _canon(a.params)], sort_keys=True,
+
+
+def propose_action(ctx, conn, a: ProposeIn, call_id) -> Result:
+    check_action(ctx, a.action)
+    _check_evidence(ctx, a.evidence)
+    _check_action_params(ctx, a.action, a.params)
+    key = hashlib.sha256(json.dumps([ctx.run_id, a.action, _canon(a.params), ctx.sid], sort_keys=True,
                                     separators=(",", ":")).encode()).hexdigest()
     ev = [e.model_dump() for e in a.evidence]
-    pid = propose(conn, a.action, dict(a.params), ctx.agent_principal, a.rationale, valid_at=ctx.now(),
+    sid = ctx.sid
+    # Proposer is always `agent:<role>` with on_behalf_of = launcher (also inside a scenario: the database lets
+    # the agent identity write its launcher's scenarios; the launcher cannot approve, see engine.decide).
+    who = ctx.agent_principal
+    pid = propose(conn, a.action, dict(a.params), who, a.rationale, valid_at=ctx.now(),
                   source="agent", run_id=ctx.run_id, tool_trace=list(ctx.trace), ontology=ctx.comp,
-                  on_behalf_of=ctx.principal.user, evidence=ev, idempotency_key=key)
+                  on_behalf_of=ctx.principal.user, evidence=ev, idempotency_key=key, scenario_id=sid)
     with conn.transaction():
-        with scoped(conn, ctx.principal):
+        with scoped(conn, ctx.principal, ctx.scn):
             row = conn.execute("SELECT dry_run, expires_at FROM proposal WHERE id=%s", [pid]).fetchone()
     dry, exp = (row or (None, None))
     info = {"proposal_id": str(pid), "action": a.action, "params": _j(a.params)}
     data = {**info, "status": "pending_approval", "dry_run": _j(dry), "expires_at": _j(exp),
             "note": "Nothing was executed. A human with approval rights must approve this proposal."}
+    if sid:
+        data["note"] += (" Its dry run is the real action inside your scenario plus the KPI impact "
+                         "(dry_run.impact: before = main, after = scenario); present both to the human.")
     return Result(data, proposal={**info, "expires_at": _j(exp)})
+
+
+# ------------------------------------------------------------------ scenario tools (Phase 5)
+def _per_run_cap() -> int:
+    return scn_svc.limits()["per_run"]
+
+
+def _need_scenario(ctx) -> None:
+    if ctx.scn is None:
+        raise ToolError("no active scenario: call scenario_open first")
+
+
+def _refresh_scn(ctx, conn) -> None:
+    """Re-read the active scenario (its clock moves after a what-if run). Same server-side resolver as the API."""
+    ctx.scn = scn_svc.resolve(conn, ctx.agent_principal, ctx.scn.id)
+
+
+def _scn_info(ctx) -> dict:
+    return {"id": ctx.sid, "name": ctx.scn_name,
+            "note": "all reads and proposals of this run use this scenario; main is unchanged"}
+
+
+def scenario_open(ctx, conn, a: ScenarioOpenIn, call_id) -> Result:
+    if len(ctx.scenario_ids) >= _per_run_cap():
+        raise ToolError(f"scenario limit reached: at most {_per_run_cap()} scenarios per run")
+    try:
+        d = scn_svc.create(conn, ctx.agent_principal, a.name, run_id=ctx.run_id, ontology=ctx.comp)
+    except scn_svc.ScenarioLimit as e:
+        raise ToolError(f"scenario limit reached: {e}"[:300]) from None
+    ctx.scn = scn_svc.resolve(conn, ctx.agent_principal, d["id"])
+    ctx.scn_name = d["name"]
+    ctx.scenario_ids.append(d["id"])
+    return Result({"scenario_id": d["id"], "name": d["name"], "owner": d["owner_user"],
+                   "status": "open", "forked_from": "main (snapshot now)",
+                   "note": "This scenario is now ACTIVE: every read, scenario_apply and propose_action in this run "
+                           "uses it. Main is not changed by anything you do inside it."})
+
+
+def _diff_view(diff: list, limit: int = 25) -> dict:
+    counts: dict = {}
+    for d in diff:
+        k = f"{d['kind']}:{d['type']}:{d['op']}"
+        counts[k] = counts.get(k, 0) + 1
+    items = []
+    for d in diff[:limit]:
+        b, a_ = d.get("before") or {}, d.get("after") or {}
+        item = {"kind": d["kind"], "type": d["type"], "op": d["op"], "key": d["key"]}
+        if d["kind"] == "object":
+            item["ref"] = _oref(d["type"], d["key"])
+            if isinstance(b, dict) and isinstance(a_, dict):
+                item["changed"] = {k: {"main": _j(b.get(k)), "scenario": _j(a_.get(k))}
+                                   for k in sorted(set(b) | set(a_))
+                                   if k not in COMMON_COLS and b.get(k) != a_.get(k)}
+        items.append(item)
+    return {"counts": counts, "total": len(diff), "items": items}
+
+
+def scenario_compare(ctx, conn, a: ScenarioCompareIn, call_id) -> Result:
+    _need_scenario(ctx)
+    try:
+        res = scn_svc.compare(conn, ctx.agent_principal, ctx.sid, 0, ontology=ctx.comp)
+    except scn_svc.ScenarioNotFound:
+        raise ToolError("scenario not available") from None
+    k = res["kpis"]
+    return Result({"kpis": {"main": _j(k["b"]), "scenario": _j(k["a"]), "delta": _j(k["delta"])},
+                   "diff_summary": _diff_view(_j(res["diff"])), "scenario_id": ctx.sid,
+                   "note": "delta = scenario - main; only what your role may see is compared"},
+                  truncated=bool(res.get("truncated")))
+
+
+def scenario_apply(ctx, conn, a: ScenarioApplyIn, call_id) -> Result:
+    _need_scenario(ctx)
+    check_action(ctx, a.action)
+    _check_action_params(ctx, a.action, a.params)
+    # Executed as `agent:<role>` on behalf of the launcher, source='agent', run id; the allowlist is enforced above
+    # and role.actions/RLS/criteria again by the engine with the agent principal.
+    res = execute(conn, a.action, dict(a.params), ctx.agent_principal, valid_at=ctx.now(), source="agent",
+                  run_id=ctx.run_id, tool_trace=list(ctx.trace), ontology=ctx.comp, scenario_id=ctx.sid)
+    for t, ids in (res.created or {}).items():
+        for i in ([ids] if not isinstance(ids, (list, tuple, set)) else ids):
+            ctx.see_id(str(i), t)
+    _refresh_scn(ctx, conn)
+    diff = _diff_view(_j(res.diff or []), 15)
+    return Result({"scenario_id": ctx.sid, "action": a.action, "status": "executed_in_scenario",
+                   "executed_on": "scenario only", "changed": _j(res.changed), "diff": diff,
+                   "note": "Executed inside your scenario only. Main is unchanged; propose_action is the only way "
+                           "to affect main and needs a human approval."})
+
+
+def scenario_simulate(ctx, conn, a: ScenarioSimulateIn, call_id) -> Result:
+    _need_scenario(ctx)
+    try:
+        import importlib
+        whatif = importlib.import_module("sim.whatif")   # lazy: the simulation package is optional here
+    except Exception:  # noqa: BLE001
+        raise ToolError("what-if simulation is not available in this deployment") from None
+    inj = []
+    for i in a.injections:
+        d = i.model_dump(exclude_none=True)
+        if "target" in d:
+            canon = str(_uuid(d["target"], "target"))
+            if canon not in ctx.seen_ids:
+                raise ToolError("injection target: this id was not retrieved by this run")
+            d["target"] = canon
+        inj.append(d)
+    seed = ctx.sid
+    spawned = []
+    from sim import limits as sim_limits       # one slot pool shared with the API job registry
+    if not sim_limits.acquire_sim_slot(0.0):
+        raise ToolError("too many simulations are running right now; try again later")
+
+    def factory():                      # every connection the simulation opens is closed when it returns
+        c = ctx.conn_factory()
+        spawned.append(c)
+        return c
+    # stop cleanly before the run's wall-clock cap (leave a little time to report)
+    left = ctx.remaining_s() - 2.0
+    if left <= 0:
+        sim_limits.release_sim_slot()
+        raise ToolError("not enough time left in this run for a simulation")
+    deadline = time.monotonic() + left
+    try:
+        r = whatif.run(factory, ctx.scn, days=a.days, seed=seed, injections=inj, ontology=ctx.comp,
+                       principal=ctx.principal, kpi_principal=ctx.principal, deadline=deadline)
+    except ValueError as e:
+        raise ToolError(f"simulation refused: {str(e)[:200]}") from None
+    finally:
+        for c in spawned:
+            try:
+                c.close()
+            except Exception:  # noqa: BLE001
+                pass
+        sim_limits.release_sim_slot()
+    _refresh_scn(ctx, conn)
+    kp = kpis_mod.compute(conn, ctx.principal, ctx.sid)    # always under the caller's RLS, not the sim's view
+    conn.rollback()                                       # read-only: leave no open transaction behind
+    return Result({"scenario_id": ctx.sid, "days": a.days, "injections": inj, "digest": r.digest,
+                   "actions_simulated": int(r.actions), "sim_now": _j(r.sim_now), "kpis": _j(kp),
+                   "partial": bool(getattr(r, "partial", False)), "last_error": getattr(r, "last_error", None),
+                   "note": "Simulated inside your scenario only; call scenario_compare for the before/after."})
 
 
 @dataclass(frozen=True)
@@ -598,8 +800,19 @@ TOOLS: dict[str, ToolSpec] = {t.name: t for t in [
     ToolSpec("run_function", "Run a registered read-only analysis function (see the system prompt for the list).",
              RunFunctionIn, run_function),
     ToolSpec("propose_action", "Propose an action for human approval. Needs a rationale and evidence items that "
-             "cite refs returned by your earlier tool calls. Executes nothing.", ProposeIn, propose_action,
+             "cite refs returned by your earlier tool calls. Executes nothing. With an active scenario the proposal "
+             "carries the scenario's tested result and KPI impact.", ProposeIn, propose_action, own_tx=True),
+    ToolSpec("scenario_open", "Fork a private what-if scenario from the current state (max 3 per run). It becomes "
+             "your active scenario: later reads and proposals use it. Main is never changed by a scenario.",
+             ScenarioOpenIn, scenario_open, own_tx=True),
+    ToolSpec("scenario_apply", "Execute one of your allowlisted actions INSIDE the active scenario (sandbox, no "
+             "approval, main unchanged) to test it before proposing it.", ScenarioApplyIn, scenario_apply,
              own_tx=True),
+    ToolSpec("scenario_simulate", "Run the simulation forward inside the active scenario (days<=14), optionally "
+             "with injected events (port_closure, shipment_delay, supplier_delay, price_shock, invoice_anomaly).",
+             ScenarioSimulateIn, scenario_simulate, own_tx=True),
+    ToolSpec("scenario_compare", "Compare the active scenario with main: KPIs (main, scenario, delta) and a summary "
+             "of changed objects, for what your role may see.", ScenarioCompareIn, scenario_compare, own_tx=True),
 ]}
 
 
@@ -706,11 +919,21 @@ def _err(call_id, msg, **kw) -> ToolOutcome:
 def safe_input(ctx, name, raw):
     """Tool input as stored in traces/audit: JSON-safe and masked (propose_action params)."""
     raw = _j(raw if isinstance(raw, dict) else {})
-    return mask_out(ctx.model, ctx.principal, raw) if name == "propose_action" else raw
+    return mask_out(ctx.model, ctx.principal, raw) if name in ("propose_action", "scenario_apply") else raw
 
 
 def run_tool(ctx, name: str, raw_input, call_id: str) -> ToolOutcome:
-    """Execute one tool call as the HUMAN principal. Never raises."""
+    """Execute one tool call as the HUMAN principal. Never raises. While a scenario is active the result envelope
+    carries `scenario` info and denials carry the scenario id (the id is never a tool parameter)."""
+    out = _run_tool(ctx, name, raw_input, call_id)
+    if ctx.scn is not None:
+        out.envelope["scenario"] = _scn_info(ctx)
+        if out.denied is not None:
+            out.denied["scenario_id"] = ctx.sid
+    return out
+
+
+def _run_tool(ctx, name: str, raw_input, call_id: str) -> ToolOutcome:
     entry = {"tool_call_id": call_id, "name": str(name)[:60], "input": None, "ok": None}
     ctx.trace.append(entry)
     try:
@@ -728,7 +951,7 @@ def run_tool(ctx, name: str, raw_input, call_id: str) -> ToolOutcome:
             res = spec.impl(ctx, conn, args, call_id)
         else:
             with conn.transaction():
-                with scoped(conn, ctx.principal):
+                with scoped(conn, ctx.principal, ctx.scn):
                     res = spec.impl(ctx, conn, args, call_id)
         data, prov, trunc, flags, facts = _finalise(ctx, res.data, res.truncated, call_id)
         entry.update(ok=True, truncated=trunc, flags=flags, refs=[f["ref"] for f in facts][:30])
@@ -740,11 +963,13 @@ def run_tool(ctx, name: str, raw_input, call_id: str) -> ToolOutcome:
         out = _err(call_id, e.reason, denied={"kind": e.kind, "name": e.name, "reason": e.reason})
     except ToolError as e:
         out = _err(call_id, str(e))
-    except (V.NotVisible, NotFound):
+    except (V.NotVisible, NotFound, scn_svc.ScenarioNotFound):
         out = _err(call_id, "not found")
     except PermissionDenied as e:
         out = _err(call_id, f"permission denied: {e.detail}"[:300],
                    denied={"kind": "engine", "name": str(name), "reason": e.detail[:300]})
+    except scn_svc.ScenarioLimit as e:
+        out = _err(call_id, f"scenario limit reached: {e}"[:300])
     except CriteriaFailed as e:
         out = _err(call_id, "criteria failed: " + "; ".join(f["message"] for f in e.failures)[:300])
     except TimeoutError:

@@ -70,7 +70,7 @@ def test_every_action_has_logic_and_roles():
     assert {r for a in M.actions.values() for r in a.roles} <= set(M.roles)
     sim = set(M.roles["sim"].actions)
     assert {"ship_depart", "ship_position", "ship_arrive", "delay_shipment", "close_port", "reopen_port", "issue_invoice",
-            "flag_invoice", "pay_invoice", "create_object", "create_link"} == sim
+            "flag_invoice", "pay_invoice", "create_object", "create_link", "set_supplier_price_index"} == sim
 
 
 def test_action_details_parsed():

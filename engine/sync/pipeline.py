@@ -79,23 +79,34 @@ class SyncPipeline:
                 c.close()
             self._dirty = True
 
-    def inferred_edges(self, ids) -> list[tuple[UUID, str, UUID]]:
-        """Instance-to-instance inferred edges touching any id (excl. rdf:type, owl:sameAs)."""
-        pre = f"{self.cfg.namespace}obj/"
-        nsl = len(self.cfg.namespace)
-        out: set = set()
+    def inferred_edges(self, ids, scenario=None) -> list[tuple[UUID, str, UUID]]:
+        """Instance-to-instance inferred edges touching any id (excl. rdf:type, owl:sameAs).
+
+        The main pipeline only knows main. `scenario` is accepted for contract symmetry and REFUSED:
+        scenario inferences live in `engine.sync.scenario_graph.ScenarioGraph.inferred_edges`.
+        """
+        if scenario is not None:
+            raise ValueError("the main pipeline has no scenario graph; use engine.sync.scenario_graph.get_store")
         with self._lock:
-            for i in ids:
-                n = iri.obj_iri(self.cfg.namespace, i)
-                for role in (0, 1):
-                    pat = (n, None, None) if role == 0 else (None, None, n)
-                    for q in self.store.quads_for_pattern(*pat, iri.G_INFERRED):
-                        p = q.predicate.value
-                        if p in _SKIP_PREDS or not isinstance(q.object, NamedNode) \
-                                or not isinstance(q.subject, NamedNode):
-                            continue
-                        s, o = q.subject.value, q.object.value
-                        if s.startswith(pre) and o.startswith(pre):
-                            out.add((UUID(s[len(pre):]), p[nsl:] if p.startswith(self.cfg.namespace) else p,
-                                     UUID(o[len(pre):])))
-        return sorted(out, key=lambda t: (str(t[0]), t[1], str(t[2])))
+            return store_inferred_edges(self.store, self.cfg.namespace, ids)
+
+
+def store_inferred_edges(store, namespace: str, ids) -> list[tuple[UUID, str, UUID]]:
+    """Instance-to-instance edges of the inferred graph of `store` touching any id (sorted)."""
+    pre = f"{namespace}obj/"
+    nsl = len(namespace)
+    out: set = set()
+    for i in ids:
+        n = iri.obj_iri(namespace, i)
+        for role in (0, 1):
+            pat = (n, None, None) if role == 0 else (None, None, n)
+            for q in store.quads_for_pattern(*pat, iri.G_INFERRED):
+                p = q.predicate.value
+                if p in _SKIP_PREDS or not isinstance(q.object, NamedNode) \
+                        or not isinstance(q.subject, NamedNode):
+                    continue
+                s, o = q.subject.value, q.object.value
+                if s.startswith(pre) and o.startswith(pre):
+                    out.add((UUID(s[len(pre):]), p[nsl:] if p.startswith(namespace) else p,
+                             UUID(o[len(pre):])))
+    return sorted(out, key=lambda t: (str(t[0]), t[1], str(t[2])))

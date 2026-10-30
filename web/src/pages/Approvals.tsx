@@ -1,16 +1,18 @@
 import { useEffect, useState } from "react";
-import { api, ApiError, dryDiff, type Proposal } from "../api";
+import { api, ApiError, dryDiff, dryImpact, type Proposal } from "../api";
+import { ImpactTable, ScnChip } from "../ScnUi";
 import { fmtT, toast, usePolled, useApp } from "../store";
 import { DiffView } from "./Audit";
 import { fmtCountdown, secsUntil } from "../agent";
 
 export default function ApprovalsPage() {
-  const { role, me } = useApp();
+  const { role, me, scenario } = useApp();
   const q = usePolled(() => api.proposals("pending"), [role], 5000);
   return (
     <div className="page">
       <h2>Approval inbox</h2>
       <p className="muted">Signed in as {me?.user ?? role}. A proposal cannot be approved by the user who proposed it.</p>
+      {scenario !== null && <div className="warnbox">A scenario is active: you are seeing proposals recorded inside it. Approving and rejecting only work on main (exit the scenario first).</div>}
       {q.error && <div className="err">{q.error}</div>}
       {q.data?.map((p) => <Card key={p.id} p={p} onDone={q.reload} />)}
       {q.data && !q.data.length && <p className="muted">No pending proposals.</p>}
@@ -19,6 +21,10 @@ export default function ApprovalsPage() {
 }
 
 function Card({ p, onDone }: { p: Proposal; onDone: () => void }) {
+  const { scenario, setScenario } = useApp();
+  const lock = scenario !== null;
+  const { scenario_id: evScn, impact } = dryImpact(p.dry_run);
+  const evidenceScn = evScn ?? (p.scenario_id || undefined);
   const [comment, setComment] = useState("");
   const [err, setErr] = useState<string>();
   const [busy, setBusy] = useState(false);
@@ -49,18 +55,22 @@ function Card({ p, onDone }: { p: Proposal; onDone: () => void }) {
       <p className="badges">
         {agent && <span className="chip info">agent proposal</span>}
         {expired ? <span className="chip bad">expired</span> : left !== null && <span className={`chip ${left < 300 ? "warn" : ""}`}>expires in {fmtCountdown(left)}</span>}
+        <ScnChip id={p.scenario_id} />
         {p.run_id && <a className="lnk small" href={`#/agent/${p.run_id}`}>originating agent run</a>}
       </p>
       {p.rationale && <p><b>Rationale:</b> {p.rationale}</p>}
       {p.evidence && p.evidence.length > 0 && <div className="evidence"><h4>Evidence</h4><ul className="plain">{p.evidence.map((ev, i) => (
         <li key={i}><span className={`chip ev-${ev.kind}`}>{ev.kind}</span> <code className="ref">{ev.ref}</code> <span>{ev.claim}</span></li>))}</ul></div>}
       <pre>{JSON.stringify(p.params, null, 2)}</pre>
+      {evidenceScn && <div className="evscn"><b>Evidence scenario {evidenceScn}.</b> This proposal was prepared in a what-if scenario; it still executes on main only after approval.{" "}
+        <button onClick={() => { setScenario(evidenceScn); location.hash = "/scenarios"; }}>Open scenario</button> <a className="lnk" href={`#/scenarios/${evidenceScn}/compare?with=main`}>Compare with main</a></div>}
+      {impact && <><h4>Impact (dry run)</h4><ImpactTable impact={impact} /></>}
       <h4>Dry run</h4><DiffView diff={dryDiff(p.dry_run)} />
       {stale && <div className="warnbox" role="alert"><b>This proposal is stale.</b> The data it was based on changed ({stale.length ? stale.join(", ") : "unknown fields"}) after it was proposed, so approving it could act on outdated facts. Reject it, or ask the agent to look again and propose a fresh one.</div>}
       {expired && <div className="warnbox" role="alert">This proposal expired and can no longer be approved. Reject it, or ask the agent to propose again.</div>}
       {err && <div className="err" role="alert">{err}</div>}
       <p className="form"><label><span>Comment</span><input value={comment} onChange={(e) => setComment(e.target.value)} /></label>
-        <button className="primary" disabled={busy || expired} title={expired ? "Expired" : undefined} onClick={() => decide(true)}>Approve</button> <button className="danger" disabled={busy} onClick={() => decide(false)}>Reject</button></p>
+        <button className="primary" disabled={busy || expired || lock} title={lock ? "Not available inside a scenario" : expired ? "Expired" : undefined} onClick={() => decide(true)}>Approve</button> <button className="danger" disabled={busy || lock} title={lock ? "Not available inside a scenario" : undefined} onClick={() => decide(false)}>Reject</button></p>
     </div>
   );
 }

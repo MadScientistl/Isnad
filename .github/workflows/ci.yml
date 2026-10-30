@@ -1,0 +1,40 @@
+name: ci
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Postgres 18 + PostGIS built from the repo's docker/postgres/Dockerfile (published as amarh-postgres below).
+      # No secrets: live tests (marker "live") are excluded and ANTHROPIC_API_KEY is never set.
+      AMARH_OUTBOX_WORKER: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and start Postgres 18 + PostGIS
+        run: |
+          docker build -t amarh-postgres docker/postgres
+          docker run -d --name pg -p 55441:5432 \
+            -e POSTGRES_USER=amarh -e POSTGRES_PASSWORD=amarh -e POSTGRES_DB=amarh amarh-postgres
+          for i in $(seq 1 40); do
+            docker exec pg pg_isready -U amarh -d amarh && break
+            sleep 2
+          done
+          docker exec pg psql -U amarh -d amarh -c "CREATE EXTENSION IF NOT EXISTS btree_gist; CREATE EXTENSION IF NOT EXISTS postgis;"
+      - uses: astral-sh/setup-uv@v5
+      - name: Install dependencies
+        run: uv sync
+      - name: Tests (no live model calls)
+        run: uv run pytest -q -m "not live"
+      - name: Mock evals, three seeds (hard guardrails gate the build)
+        run: uv run python -m evals --mode mock --seeds 1,2,3 --md
+      - name: Upload eval reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results
+          path: evals/results/
+          if-no-files-found: warn

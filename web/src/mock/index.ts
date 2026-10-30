@@ -14,6 +14,7 @@
  */
 import * as gov from "./gov";
 import { agentRoute } from "./agent";
+import * as scn from "./scenarios";
 const H = 3600000;
 const EPOCH = Date.parse("2026-01-01T00:00:00Z");
 const iso = (h: number) => new Date(EPOCH + h * H).toISOString();
@@ -26,7 +27,7 @@ const NSHIP = 14;
 const pt = (c: [number, number]) => ({ type: "Point", coordinates: c });
 
 interface Win { target: string; start: number; end: number; kind: "port" | "ship" | "inv" }
-const base: Win[] = [
+let base: Win[] = [
   { target: uid("port", 3), start: 300, end: 420, kind: "port" }, { target: uid("port", 5), start: 100, end: 160, kind: "port" },
   { target: uid("inv", 0), start: 200, end: 280, kind: "inv" }, { target: uid("inv", 2), start: 280, end: 360, kind: "inv" }, { target: uid("inv", 4), start: 360, end: 440, kind: "inv" },
 ];
@@ -36,8 +37,21 @@ function dur(i: number) { return 96 + ((i * 37) % 120); }
 
 const paid = new Set<string>();
 let curRole = "admin";
-const st = { simH: 480, speed: "paused" as "paused" | "1" | "6" | "24", tick: 0, injected: [] as Win[] };
+const st = { simH: 480, speed: "paused" as "paused" | "1" | "6" | "24", tick: 0, injected: [] as Win[], priceMult: 1 };
 const wins = () => [...base, ...st.injected];
+/* ---- scenario overlay: the mutable world (windows, paid set, clock) can be swapped for a scenario's private copy ---- */
+export interface Snap { base: Win[]; injected: Win[]; paid: string[]; simH: number; priceMult: number }
+const cp = (w: Win[]) => w.map((x) => ({ ...x }));
+const getSnap = (): Snap => ({ base: cp(base), injected: cp(st.injected), paid: [...paid], simH: st.simH, priceMult: st.priceMult });
+const setSnap = (s: Snap) => { base = s.base; st.injected = s.injected; paid.clear(); s.paid.forEach((x) => paid.add(x)); st.simH = s.simH; st.priceMult = s.priceMult; };
+let savedMain: Snap | null = null;
+function withSnap<T>(s: Snap, fn: () => T): T {
+  const prevBase = base, prevInj = st.injected, prevPaid = [...paid], prevH = st.simH, prevPm = st.priceMult, prevSaved = savedMain;
+  savedMain = savedMain ?? { base: prevBase, injected: prevInj, paid: prevPaid, simH: prevH, priceMult: prevPm };
+  setSnap(s);
+  try { return fn(); }
+  finally { s.base = base; s.injected = st.injected; s.paid = [...paid]; s.simH = st.simH; s.priceMult = st.priceMult; savedMain = prevSaved; setSnap({ base: prevBase, injected: prevInj, paid: prevPaid, simH: prevH, priceMult: prevPm }); }
+}
 const inWin = (target: string, kind: Win["kind"], h: number) => wins().some((w) => w.target === target && w.kind === kind && h >= w.start && h < w.end);
 
 const portStatus = (i: number, h: number) => (inWin(uid("port", i), "port", h) ? "closed" : "open");
@@ -162,6 +176,28 @@ function metric(m: string, h: number) {
   const s = summary(h);
   return ({ shipments_in_transit: s.shipments.in_transit, shipments_delayed: s.shipments.delayed, ports_closed: s.ports.closed, invoices_flagged: s.invoices.flagged, value_at_risk: s.value_at_risk } as Record<string, number>)[m] ?? 0;
 }
+function kpisNow() {
+  const h = st.simH, s = summary(h), sh = objects("Shipment", h);
+  const exposed = sh.map((x, i) => ({ x, i })).filter(({ x, i }) => x.status !== "arrived" && portStatus(via(i), h) === "closed");
+  const expSup = new Set(exposed.filter(({ i }) => i < 6).map(({ i }) => i));
+  return { value_at_risk: s.value_at_risk, delay_hours_total: s.delay_hours_total, shipments_delayed: s.shipments.delayed, shipments_in_transit: s.shipments.in_transit, ports_closed: s.ports.closed,
+    invoices_flagged: s.invoices.flagged, extra_cost: Math.round(s.delay_hours_total * 85 * st.priceMult + (st.priceMult - 1) * 20000), exposure_shipments: exposed.length, exposure_suppliers: expSup.size };
+}
+const keyProps = () => {
+  const out: Record<string, { type: string; props: Record<string, any> }> = {};
+  for (const t of ["Port", "Shipment", "Invoice"]) for (const o of vobjs(t, st.simH)) out[o.id] = { type: t, props: { status: o.status, ...(t === "Invoice" ? { anomaly: o.anomaly } : {}) } };
+  return out;
+};
+scn.setHost({
+  snap: getSnap, withSnap, kpis: kpisNow, keyProps, metric, nowH: () => st.simH, iso, EPOCH_H: H,
+  asRole: <T,>(r: string, fn: () => T): T => { const prev = curRole; curRole = r; try { return fn(); } finally { curRole = prev; } },
+  uid, portCount: PORTS.length, shipCount: NSHIP, arrived: () => objects("Shipment", st.simH).filter((x) => x.status === "arrived").length,
+  addWindow: (w) => { st.injected.push(w); },
+  mainKpisAligned: () => (savedMain ? withSnap({ ...savedMain, base: cp(savedMain.base), injected: cp(savedMain.injected), paid: [...savedMain.paid], simH: st.simH }, kpisNow) : kpisNow()),
+  currentRole: () => curRole,
+});
+gov.setScenarioKpis(() => ({ before: scn.mainKpisNow(), after: kpisNow() }));
+
 function feed(h: number) {
   const out: { t: number; name: string; id: string; type: string; summary: string }[] = [];
   for (let i = 0; i < NSHIP; i++) { out.push({ t: dep(i), name: "ship_depart", id: uid("ship", i), type: "Shipment", summary: `SHP-${String(i + 1).padStart(3, "0")} departed ${PORTS[origin(i)][0]}` }); out.push({ t: dep(i) + dur(i), name: "ship_arrive", id: uid("ship", i), type: "Shipment", summary: `SHP-${String(i + 1).padStart(3, "0")} arrived at ${WHS[dest(i)][0]}` }); }
@@ -256,9 +292,16 @@ export function installMock(base: string) {
     w.__mockLog.push({ method, path: u.pathname, query: Object.fromEntries(u.searchParams), role, body });
     if (w.__mockLog.length > 500) w.__mockLog.splice(0, 250);
     curRole = role ?? "admin";
-    const ar = agentRoute(method, u.pathname, u.searchParams, body, curRole);
-    if (ar instanceof Response) return ar;
-    const [status, data] = ar ?? route(method, u.pathname, u.searchParams, body);
+    const scnHdr = (init?.headers as Record<string, string> | undefined)?.["x-scenario"];
+    const dispatch = (): Response | [number, unknown] => {
+      const ar = agentRoute(method, u.pathname, u.searchParams, body, curRole);
+      if (ar) return ar;
+      const sr = scn.route(method, u.pathname, u.searchParams, body, curRole);
+      return sr ?? route(method, u.pathname, u.searchParams, body);
+    };
+    const out = scnHdr && !u.pathname.startsWith("/scenarios") && !u.pathname.startsWith("/agent") ? scn.overlay(scnHdr, u.pathname, method, curRole, dispatch) : dispatch();
+    if (out instanceof Response) return out;
+    const [status, data] = out;
     return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
   };
 }

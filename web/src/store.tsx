@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { SELECTABLE_ROLES } from "@sdk/client";
-import { api, setRole as applyRole, type Me, type SimState } from "./api";
+import { api, setRole as applyRole, setScenarioHeader, type Me, type SimState } from "./api";
+import { scnApi, type Scenario } from "./scenarios";
 
 const ls = (k: string, d = "") => { try { return localStorage.getItem(k) ?? d; } catch { return d; } };
 
@@ -9,6 +10,7 @@ interface Ctx {
   asOf: Date | null; setAsOf: (d: Date | null) => void;
   asOfQ: string | undefined; // debounced iso string for queries; undefined = live
   sim: SimState | null; simError: string | null; setSim: (s: SimState) => void;
+  scenario: number | null; scenarioInfo: Scenario | null; setScenario: (id: number | null) => void; refreshScenario: () => void;
 }
 const C = createContext<Ctx | null>(null);
 
@@ -17,6 +19,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [me, setMe] = useState<Me | null>(null);
   const [meError, setMeError] = useState<string | null>(null);
   applyRole(role);
+  const [scenario, setScenarioS] = useState<number | null>(() => { const n = Number(ls("scenario", "")); return Number.isInteger(n) && n > 0 ? n : null; });
+  const [scenarioInfo, setScenarioInfo] = useState<Scenario | null>(null);
+  setScenarioHeader(scenario);
   const [asOf, setAsOf] = useState<Date | null>(null);
   const [asOfQ, setAsOfQ] = useState<string | undefined>(undefined);
   const [sim, setSim] = useState<SimState | null>(null);
@@ -33,8 +38,26 @@ export function AppProvider({ children }: { children: ReactNode }) {
     api.me().then((m) => live && setMe(m), (e) => live && setMeError(String(e.message ?? e)));
     return () => { live = false; };
   }, [role]);
-  const setRole = useCallback((r: string) => { applyRole(r); try { localStorage.setItem("role", r); } catch { /* ignore */ } setRoleS(r); }, []);
-  const v = useMemo(() => ({ role, setRole, me, meError, asOf, setAsOf, asOfQ, sim, simError, setSim }), [role, setRole, me, meError, asOf, asOfQ, sim, simError]);
+  const setScenario = useCallback((id: number | null) => {
+    setScenarioHeader(id); try { if (id) localStorage.setItem("scenario", String(id)); else localStorage.removeItem("scenario"); } catch { /* ignore */ }
+    setScenarioS(id); if (!id) setScenarioInfo(null);
+  }, []);
+  // A scenario belongs to one role's view: switching role leaves it.
+  const setRole = useCallback((r: string) => { applyRole(r); try { localStorage.setItem("role", r); } catch { /* ignore */ } setRoleS(r); setScenario(null); }, [setScenario]);
+  const [scnTick, setScnTick] = useState(0);
+  useEffect(() => {
+    if (!scenario) { setScenarioInfo(null); return; }
+    let live = true;
+    const tick = () => scnApi.get(scenario).then((s) => { if (live) { if (s.status !== "open") { setScenario(null); toast(`Scenario "${s.name}" is ${s.status}; back on main`, undefined, "warn"); } else setScenarioInfo(s); } }, (e) => { if (live && /API 404/.test(String(e?.message))) { setScenario(null); toast("The active scenario no longer exists or is not visible to you; back on main", undefined, "warn"); } });
+    tick(); const h = setInterval(tick, 4000);
+    return () => { live = false; clearInterval(h); };
+  }, [scenario, scnTick, setScenario]);
+  useEffect(() => {
+    const f = (e: Event) => { const id = (e as CustomEvent<number>).detail; if (id === scenario) { setScenario(null); toast("The active scenario no longer exists or is not visible to you; back on main", undefined, "warn"); } };
+    addEventListener("amarh-scenario-gone", f); return () => removeEventListener("amarh-scenario-gone", f);
+  }, [scenario, setScenario]);
+  const refreshScenario = useCallback(() => setScnTick((n) => n + 1), []);
+  const v = useMemo(() => ({ role, setRole, me, meError, asOf, setAsOf, asOfQ, sim, simError, setSim, scenario, scenarioInfo, setScenario, refreshScenario }), [role, setRole, me, meError, asOf, asOfQ, sim, simError, scenario, scenarioInfo, setScenario, refreshScenario]);
   return <C.Provider value={v}>{children}</C.Provider>;
 }
 

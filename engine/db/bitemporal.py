@@ -16,6 +16,8 @@ history, list_objects, as_of queries, neighbours, link_history, bulk_load_*.
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 from datetime import UTC, datetime
 from typing import Any, Iterable, Sequence
@@ -24,6 +26,7 @@ from uuid import UUID
 import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 from psycopg.types.range import Range
 
 COMMON_COLS = ("valid_during", "recorded_during", "changed_by", "action_id", "scenario_id")
@@ -189,6 +192,152 @@ def _max(a, b):
     return b if _lt(a, b) else a
 
 
+
+# ------------------------------------------------------------ scenarios (Phase 5)
+class ScenarioLimit(Exception):
+    """A scenario reached AMARH_SCN_MAX_ROWS override rows."""
+
+
+ZERO_UUID = UUID(int=0)
+_SCN_META = ("valid_during", "recorded_during", "changed_by", "action_id", "scenario_id")
+
+
+def _max_rows() -> int:
+    return int(os.environ.get("AMARH_SCN_MAX_ROWS", "50000"))
+
+
+def _scn_ctx(conn, sid: int) -> tuple[datetime, datetime | None]:
+    """(base_recorded, clock) of scenario `sid`. Taken from the scoped GUCs when they name this scenario,
+    otherwise from the scenario tables (owner / loader / sim code). A scoped (amarh_app) connection whose GUC
+    names a different scenario is refused: reads and writes are only possible inside the scoped scenario."""
+    g_sid, g_base, g_now, cu = conn.execute(
+        "SELECT coalesce(nullif(current_setting('amarh.scenario', true), ''), '0')::int, "
+        "nullif(current_setting('amarh.scenario_base', true), '')::timestamptz, "
+        "nullif(current_setting('amarh.now', true), '')::timestamptz, current_user").fetchone()
+    if cu == "amarh_app" and g_sid != sid:
+        raise ValueError(f"scenario {sid} is not the scoped scenario ({g_sid or 'main'})")
+    if g_sid == sid and g_base is not None:
+        return g_base, g_now
+    row = conn.execute(
+        "SELECT s.base_recorded, st.clock FROM scenario s LEFT JOIN scenario_state st ON st.scenario_id = s.id "
+        "WHERE s.id = %s", [sid]).fetchone()
+    if row is None:
+        raise ValueError(f"scenario {sid} not found")
+    return row[0], (g_now if g_sid == sid and g_now is not None else row[1])
+
+
+def _scn_where(conn, kind: str, name: str, sid: int, as_of_valid, as_of_recorded) -> tuple[str, list]:
+    """WHERE fragment (on the object/link relation, or its rd_ view) selecting the rows that are EFFECTIVE in
+    scenario `sid` at the given instants: rows of the scenario itself, plus main rows as believed at the fork
+    (never later than `as_of_recorded`) for keys the scenario has not touched. Mirrors compiler eff_pred."""
+    base, clock = _scn_ctx(conn, sid)
+    v = _utc(as_of_valid) if as_of_valid is not None else None
+    r = _utc(as_of_recorded) if as_of_recorded is not None else None
+    vexpr = "%s::timestamptz" if v is not None else "coalesce(%s::timestamptz, now())"
+    vp = v if v is not None else clock
+    key = "o.key_a = id" if kind == "obj" else "o.key_a = src AND o.key_b = dst"
+    rec_s, rp = ("recorded_during @> %s::timestamptz", [r]) if r is not None else \
+        ("(upper_inf(recorded_during) OR upper(recorded_during) = 'infinity')", [])
+    main_rec = min(r, base) if r is not None else base
+    frag = (f"((scenario_id = %s AND valid_during @> {vexpr} AND {rec_s}) OR "
+            f"(scenario_id = 0 AND valid_during @> {vexpr} AND recorded_during @> %s::timestamptz AND NOT EXISTS ("
+            f"SELECT 1 FROM scenario_override o WHERE o.scenario_id = %s AND o.kind = %s AND o.type = %s AND {key})))")
+    return frag, [sid, vp, *rp, vp, main_rec, sid, kind, name]
+
+
+def _is_first_touch(conn, kind, type_name, keyvals, sid) -> bool:
+    """True when `sid` has no override row for this key yet (so the write must clone main's rows)."""
+    kb = keyvals[1] if len(keyvals) > 1 else ZERO_UUID
+    if conn.execute("SELECT 1 FROM scenario_override WHERE scenario_id = %s AND kind = %s AND type = %s "
+                    "AND key_a = %s AND key_b = %s", [sid, kind, type_name, keyvals[0], kb]).fetchone():
+        return False
+    return True
+
+
+def _guard_rows(conn, sid: int, add: int) -> None:
+    """AMARH_SCN_MAX_ROWS counts the scenario's actual ROW VERSIONS (cloned + inserted), not keys; checked on
+    every write (before any row is written for the part we can predict, and again after a clone)."""
+    st = conn.execute("SELECT override_rows FROM scenario_state WHERE scenario_id = %s FOR UPDATE", [sid]).fetchone()
+    if st is None:
+        raise ValueError(f"scenario {sid} not found")
+    if st[0] + add > _max_rows():
+        raise ScenarioLimit(f"scenario {sid} reached {_max_rows()} rows (AMARH_SCN_MAX_ROWS)")
+
+
+def _bump_rows(conn, sid: int, n: int) -> None:
+    if n:
+        conn.execute("UPDATE scenario_state SET override_rows = override_rows + %s WHERE scenario_id = %s", [n, sid])
+        if conn.execute("SELECT override_rows > %s FROM scenario_state WHERE scenario_id = %s",
+                        [_max_rows(), sid]).fetchone()[0]:
+            raise ScenarioLimit(f"scenario {sid} reached {_max_rows()} rows (AMARH_SCN_MAX_ROWS)")
+
+
+def _max_props_bytes() -> int:
+    return int(os.environ.get("AMARH_MAX_PROPS_BYTES", "65536"))
+
+
+def _clone_from_main(conn, table, kind, type_name, keycols, keyvals, sid, now, skip_lowers) -> None:
+    """Clone-on-first-touch: copy ALL of main's current-knowledge rows of the key as of `base_recorded` into
+    scenario `sid` (valid ranges preserved, recorded_during re-based to [now, inf)), except the versions whose
+    valid lower bound is in `skip_lowers` (the ones the write replaces: they are never copied, so no scenario
+    row ever has to be deleted). Then record the override row (with the fork-time `base`) and bump the counter."""
+    kb = keyvals[1] if len(keyvals) > 1 else ZERO_UUID
+    base, clock = _scn_ctx(conn, sid)
+    keyw = sql.SQL(" AND ").join(sql.SQL("{} = %s").format(_tbl(k)) for k in keycols)
+    cols = _table_cols(conn, table)[0]
+    # what main looked like for this key at the fork (masked source: override rows are readable by shared roles)
+    drop = (*_SCN_META, *keycols)
+    expr = sql.SQL("to_jsonb(r)") + sql.SQL("").join(sql.SQL(" - {}").format(sql.Literal(c)) for c in drop)
+    src = read_source(conn, table, True)
+    props = conn.execute(
+        sql.SQL("SELECT {e} FROM {t} r WHERE {kw} AND scenario_id = 0 AND recorded_during @> %s::timestamptz "
+                "AND valid_during @> coalesce(%s::timestamptz, now())").format(e=expr, t=_tbl(src), kw=keyw),
+        [*keyvals, base, clock]).fetchone()
+    main_lower = conn.execute(
+        sql.SQL("SELECT lower(recorded_during) FROM {t} WHERE {kw} AND scenario_id = 0 AND "
+                "(upper_inf(recorded_during) OR upper(recorded_during) = 'infinity') AND "
+                "valid_during @> coalesce(%s::timestamptz, now())").format(t=_tbl(table), kw=keyw),
+        [*keyvals, clock]).fetchone()
+    sel = sql.SQL(", ").join(
+        sql.SQL("tstzrange(%s, NULL, '[)')") if c == "recorded_during"
+        else sql.SQL("%s") if c == "scenario_id" else _tbl(c) for c in cols)
+    cloned = conn.execute(
+        sql.SQL("INSERT INTO {t} ({c}) SELECT {s} FROM {t} WHERE {kw} AND scenario_id = 0 "
+                "AND recorded_during @> %s::timestamptz AND NOT EXISTS ("
+                "SELECT 1 FROM unnest(%s::timestamptz[]) u WHERE u IS NOT DISTINCT FROM lower(valid_during))").format(
+            t=_tbl(table), c=sql.SQL(", ").join(_tbl(c) for c in cols), s=sel, kw=keyw),
+        [now, sid, *keyvals, base, list(skip_lowers)]).rowcount
+    info = {"present": props is not None, "props": props[0] if props else None,
+            "main_lower": main_lower[0].isoformat() if main_lower else None}
+    conn.execute("INSERT INTO scenario_override (scenario_id, kind, type, key_a, key_b, deleted, base) "
+                 "VALUES (%s,%s,%s,%s,%s,false,%s)", [sid, kind, type_name, keyvals[0], kb, Jsonb(info)])
+    _bump_rows(conn, sid, max(cloned, 0))  # cloned versions count against AMARH_SCN_MAX_ROWS
+
+
+def _after_scenario_write(conn, table, kind, type_name, keycols, keyvals, sid) -> None:
+    """Bump the graph cache key and refresh the tombstone flag of the override row."""
+    kb = keyvals[1] if len(keyvals) > 1 else ZERO_UUID
+    _, clock = _scn_ctx(conn, sid)
+    keyw = sql.SQL(" AND ").join(sql.SQL("{} = %s").format(_tbl(k)) for k in keycols)
+    alive = conn.execute(
+        sql.SQL("SELECT EXISTS (SELECT 1 FROM {t} WHERE {kw} AND scenario_id = %s AND "
+                "(upper_inf(recorded_during) OR upper(recorded_during) = 'infinity') AND "
+                "valid_during @> coalesce(%s::timestamptz, now()))").format(t=_tbl(table), kw=keyw),
+        [*keyvals, sid, clock]).fetchone()[0]
+    conn.execute("UPDATE scenario_override SET deleted = %s WHERE scenario_id = %s AND kind = %s AND type = %s "
+                 "AND key_a = %s AND key_b = %s", [not alive, sid, kind, type_name, keyvals[0], kb])
+    conn.execute("UPDATE scenario_state SET data_version = data_version + 1 WHERE scenario_id = %s", [sid])
+
+
+def list_overrides(conn, scenario_id: int) -> list[dict]:
+    """The scenario's override rows (scenario_id, kind, type, key_a, key_b, deleted, base), ordered by kind,
+    type, keys. `base` = fork-time snapshot `{"present": bool, "props": {...}|None, "main_lower": iso|None}`;
+    for a scoped caller who is not the owner/admin of the scenario (a shared role) it is None."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT * FROM amarh_scenario_overrides(%s)", [scenario_id])
+        return cur.fetchall()
+
+
 # ------------------------------------------------------------ write core
 def _apply(
     conn, table, keycols, keyvals, props, valid_from, valid_to, changed_by, action_id,
@@ -206,6 +355,12 @@ def _apply(
     pcols = _prop_cols(conn, table, keycols)
     geo = set(_table_cols(conn, table)[1])
     if props is not None:
+        try:
+            size = len(json.dumps(props, default=str))
+        except (TypeError, ValueError):
+            size = 0
+        if size > _max_props_bytes():
+            raise ValueError(f"properties too large ({size} bytes; max {_max_props_bytes()}, AMARH_MAX_PROPS_BYTES)")
         unknown = set(props) - set(pcols)
         if unknown:
             raise ValueError(f"unknown properties for {table}: {sorted(unknown)}")
@@ -213,14 +368,29 @@ def _apply(
     else:
         newp = None
 
+    return _apply_tx(conn, table, keycols, keyvals, newp, pcols, geo, vf, vt, changed_by, action_id,
+                     scenario_id, kind, type_name, outbox_extra)
+
+
+def _apply_tx(conn, table, keycols, keyvals, newp, pcols, geo, vf, vt, changed_by, action_id,
+              scenario_id, kind, type_name, outbox_extra) -> bool:
     with conn.transaction():
         _lock(conn, table, keyvals, scenario_id)
-        now = _now(conn)
+        now, g = conn.execute("SELECT clock_timestamp(), coalesce(current_setting('amarh.scenario', true), '')").fetchone()
+        first = False  # first touch of this key in a scenario: the logic runs on main's rows as of the fork
+        g = g.strip()
+        if g not in ("", "0") and g != str(scenario_id):  # M2: a connection scoped to scenario X never writes Y / main
+            raise ValueError(f"write to scenario {scenario_id or 'main'} refused: the connection is scoped to scenario {g}")
+        if scenario_id:
+            _scn_ctx(conn, scenario_id)  # refuses a scoped session whose scenario differs
+            first = _is_first_touch(conn, kind, type_name, keyvals, scenario_id)
         keyw = sql.SQL(" AND ").join(sql.SQL("{} = %s").format(_tbl(k)) for k in keycols)
         sel = sql.SQL(
             "SELECT {pc}, valid_during, lower(recorded_during) AS rec_lo, changed_by, action_id "
-            "FROM {t} WHERE {kw} AND scenario_id = %s AND (upper_inf(recorded_during) OR upper(recorded_during) = 'infinity') "
-            "AND (valid_during && %s::tstzrange OR valid_during -|- %s::tstzrange)"
+            "FROM {t} WHERE {kw} AND scenario_id = %s AND "
+            + ("recorded_during @> %s::timestamptz" if first
+               else "(upper_inf(recorded_during) OR upper(recorded_during) = 'infinity')") +
+            " AND (valid_during && %s::tstzrange OR valid_during -|- %s::tstzrange)"
         ).format(
             pc=sql.SQL(", ").join(
                 sql.SQL("encode(ST_AsEWKB({c}), 'hex') AS {c}").format(c=_tbl(c)) if c in geo
@@ -229,7 +399,10 @@ def _apply(
         )
         rng = Range(vf, vt, "[)")
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(sel, [*keyvals, scenario_id, rng, rng])
+            if first:
+                cur.execute(sel, [*keyvals, 0, _scn_ctx(conn, scenario_id)[0], rng, rng])
+            else:
+                cur.execute(sel, [*keyvals, scenario_id, rng, rng])
             existing = cur.fetchall()
 
         # originals keyed by (lo, hi, props)
@@ -263,8 +436,14 @@ def _apply(
         to_close = [k for k in originals if k not in new_keys]
         to_insert = [m for k, m in new_keys.items() if k not in originals]
         if not to_close and not to_insert:
-            return False
+            return False  # (a no-op on a first touch writes nothing: no clone, no override row)
 
+        if scenario_id:
+            _guard_rows(conn, scenario_id, len(to_insert))
+        if first:  # the replaced versions are main's rows: they are simply not cloned
+            _clone_from_main(conn, table, kind, type_name, keycols, keyvals, scenario_id, now,
+                             [lo for lo, _hi, _p in to_close])
+            to_close = []
         for lo, hi, p in to_close:
             r = originals[(lo, hi, p)]
             vr = lo  # lower bound is unique among current rows of a key
@@ -290,6 +469,10 @@ def _apply(
         for lo, hi, p, cb, aid, _new in to_insert:
             conn.execute(ins, [*keyvals, *p, Range(lo, hi, "[)"), Range(now, None, "[)"),
                                cb, aid, scenario_id])
+        if scenario_id:  # scenario writes never reach the graph outbox
+            _bump_rows(conn, scenario_id, len(to_insert))
+            _after_scenario_write(conn, table, kind, type_name, keycols, keyvals, scenario_id)
+            return True
         op = "upsert" if newp is not None else "delete"
         _outbox(conn, kind, type_name, op, **outbox_extra)
         return True
@@ -381,6 +564,10 @@ def get_object(conn, type, id: UUID, as_of_valid: datetime | None = None,
                as_of_recorded: datetime | None = None, scenario_id: int = 0,
                masked: bool = True) -> dict | None:
     """The object as true at `as_of_valid`, as believed at `as_of_recorded`."""
+    if scenario_id:
+        w, sp = _scn_where(conn, "obj", type, scenario_id, as_of_valid, as_of_recorded)
+        rows = _fetch(conn, obj_table(type), f"id = %s AND {w}", [id, *sp], masked=masked)
+        return rows[0] if rows else None
     c, p = _asof_clause(as_of_valid, as_of_recorded)
     rows = _fetch(conn, obj_table(type), f"id = %s AND scenario_id = %s AND {c}",
                   [id, scenario_id, *p], masked=masked)
@@ -394,8 +581,12 @@ def list_objects(conn, type, as_of_valid=None, as_of_recorded=None, scenario_id:
     """All objects of a type as of the given instants. `where` is an optional trusted SQL
     fragment (use %s placeholders with `params`). `order_by` is a column name (default id);
     limit/offset are pushed down into SQL."""
-    c, p = _asof_clause(as_of_valid, as_of_recorded)
-    w = f"scenario_id = %s AND {c}" + (f" AND ({where})" if where else "")
+    if scenario_id:
+        sw, sp = _scn_where(conn, "obj", type, scenario_id, as_of_valid, as_of_recorded)
+        w, p0 = sw + (f" AND ({where})" if where else ""), sp
+    else:
+        c, p = _asof_clause(as_of_valid, as_of_recorded)
+        w, p0 = f"scenario_id = %s AND {c}" + (f" AND ({where})" if where else ""), [scenario_id, *p]
     table = obj_table(type)
     ob = "id"
     if order_by:
@@ -403,7 +594,7 @@ def list_objects(conn, type, as_of_valid=None, as_of_recorded=None, scenario_id:
             raise ValueError(f"unknown order_by column {order_by!r}")
         ob = f'"{order_by}"'
     order = f"ORDER BY {ob}{' DESC' if desc else ''}" + ("" if ob == "id" else ", id")
-    args = [scenario_id, *p, *params]
+    args = [*p0, *params]
     if limit is not None:
         order += " LIMIT %s"
         args.append(int(limit))
@@ -430,6 +621,8 @@ def list_objects_bbox(conn, type, bbox: Sequence[float], as_of_valid=None, as_of
 def history(conn, type, id: UUID, scenario_id: int = 0, masked: bool = True) -> list[dict]:
     """Every stored version, ordered by recorded time then valid time (oldest first).
     Adds valid_from/valid_to/recorded_from/recorded_to (None = open)."""
+    if scenario_id:
+        return _scn_history(conn, "obj", type, ("id",), (id,), scenario_id, masked)
     rows = _fetch(conn, obj_table(type), "id = %s AND scenario_id = %s", [id, scenario_id],
                   "ORDER BY lower(recorded_during), lower(valid_during)", masked=masked)
     return [_decorate(r) for r in rows]
@@ -437,9 +630,36 @@ def history(conn, type, id: UUID, scenario_id: int = 0, masked: bool = True) -> 
 
 def link_history(conn, link: str, src: UUID, dst: UUID, scenario_id: int = 0,
                  masked: bool = True) -> list[dict]:
+    if scenario_id:
+        return _scn_history(conn, "link", link, ("src", "dst"), (src, dst), scenario_id, masked)
     rows = _fetch(conn, link_table(link), "src = %s AND dst = %s AND scenario_id = %s",
                   [src, dst, scenario_id], "ORDER BY lower(recorded_during), lower(valid_during)")
     return [_decorate(r) for r in rows]
+
+
+def _scn_history(conn, kind, name, keycols, keyvals, sid, masked) -> list[dict]:
+    """Scenario-effective history: for a key the scenario has touched, the scenario's own versions; for an
+    untouched key, main's history up to the fork (recorded ranges that extend past `base_recorded` are shown
+    as still open: the scenario never saw the later correction)."""
+    table = obj_table(name) if kind == "obj" else link_table(name)
+    base, _ = _scn_ctx(conn, sid)
+    kb = keyvals[1] if len(keyvals) > 1 else ZERO_UUID
+    keyw = " AND ".join(f"{k} = %s" for k in keycols)
+    touched = conn.execute("SELECT 1 FROM scenario_override WHERE scenario_id = %s AND kind = %s AND type = %s "
+                           "AND key_a = %s AND key_b = %s", [sid, kind, name, keyvals[0], kb]).fetchone()
+    order = "ORDER BY lower(recorded_during), lower(valid_during)"
+    if touched:
+        rows = _fetch(conn, table, f"{keyw} AND scenario_id = %s", [*keyvals, sid], order, masked=masked)
+        return [_decorate(r) for r in rows]
+    rows = _fetch(conn, table, f"{keyw} AND scenario_id = 0 AND lower(recorded_during) <= %s::timestamptz",
+                  [*keyvals, base], order, masked=masked)
+    out = []
+    for r in rows:
+        ru = r["recorded_during"].upper
+        if ru is not None and ru > base:
+            r = {**r, "recorded_during": Range(r["recorded_during"].lower, None, "[)")}
+        out.append(_decorate(r))
+    return out
 
 
 def _decorate(r: dict) -> dict:
@@ -456,6 +676,11 @@ def neighbours(conn, link: str, id: UUID, direction: str = "out", as_of_valid=No
     if direction not in ("out", "in"):
         raise ValueError("direction must be 'out' or 'in'")
     mine, other = ("src", "dst") if direction == "out" else ("dst", "src")
+    if scenario_id:
+        w, sp = _scn_where(conn, "link", link, scenario_id, as_of_valid, as_of_recorded)
+        rows = _fetch(conn, link_table(link), f"{mine} = %s AND {w}", [id, *sp], f"ORDER BY {other}",
+                      masked=masked)
+        return [r[other] for r in rows]
     c, p = _asof_clause(as_of_valid, as_of_recorded)
     rows = _fetch(conn, link_table(link), f"{mine} = %s AND scenario_id = %s AND {c}",
                   [id, scenario_id, *p], f"ORDER BY {other}", masked=masked)
@@ -464,6 +689,9 @@ def neighbours(conn, link: str, id: UUID, direction: str = "out", as_of_valid=No
 
 def list_links(conn, link: str, as_of_valid=None, as_of_recorded=None,
                scenario_id: int = 0, masked: bool = True) -> list[dict]:
+    if scenario_id:
+        w, sp = _scn_where(conn, "link", link, scenario_id, as_of_valid, as_of_recorded)
+        return _fetch(conn, link_table(link), w, sp, "ORDER BY src, dst", masked=masked)
     c, p = _asof_clause(as_of_valid, as_of_recorded)
     return _fetch(conn, link_table(link), f"scenario_id = %s AND {c}", [scenario_id, *p],
                   "ORDER BY src, dst", masked=masked)
@@ -479,6 +707,8 @@ def bulk_load_objects(conn, type, rows: Iterable[tuple[UUID, dict]], valid_from:
                       action_id: UUID | None = None) -> int:
     """COPY brand-new entities (no existing rows for these ids!). Bypasses splitting and
     locking; the exclusion constraint still rejects any accidental overlap."""
+    if scenario_id:
+        raise ValueError("bulk_load_objects is not supported inside a scenario (use write_object)")
     table = obj_table(type)
     pcols = _prop_cols(conn, table, ("id",))
     cols = ["id", *pcols, *COMMON_COLS]
@@ -516,6 +746,8 @@ def _reiter(conn, table, now, scenario_id):
 def bulk_load_links(conn, link: str, rows: Iterable[tuple[UUID, UUID]], valid_from: datetime,
                     changed_by: str, *, scenario_id: int = 0, outbox: bool = True,
                     action_id: UUID | None = None) -> int:
+    if scenario_id:
+        raise ValueError("bulk_load_links is not supported inside a scenario (use write_link)")
     table = link_table(link)
     now = _now(conn)
     vt, rt = _rng_text(valid_from), _rng_text(now)

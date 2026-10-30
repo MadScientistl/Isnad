@@ -8,6 +8,7 @@ import psycopg
 import pytest
 from psycopg import sql
 
+from engine.compiler.ddl import scenario_core_sql
 from engine.db import connect, get_dsn
 
 FIXTURE = Path(__file__).parent / "fixtures" / "schema.sql"
@@ -24,6 +25,7 @@ def schema():
     admin.execute(sql.SQL("SET search_path TO {}, public").format(sql.Identifier(name)))
     admin.execute("CREATE EXTENSION IF NOT EXISTS btree_gist")
     admin.execute(FIXTURE.read_text())
+    admin.execute(scenario_core_sql())  # scenario tables + helpers (the hand-written fixture has no governance)
     yield name
     admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(name)))
     admin.close()
@@ -34,7 +36,7 @@ def conn(schema):
     c = connect(schema=schema)
     yield c
     c.rollback()
-    c.execute("TRUNCATE obj_supplier, link_supplies, graph_outbox")
+    c.execute("TRUNCATE obj_supplier, link_supplies, graph_outbox, scenario_override, scenario_state")
     c.commit()
     c.close()
 

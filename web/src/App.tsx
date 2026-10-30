@@ -9,8 +9,11 @@ import Dashboard from "./pages/Dashboard";
 import AuditPage from "./pages/Audit";
 import ApprovalsPage from "./pages/Approvals";
 import AgentPage from "./pages/Agent";
+import ScenariosPage from "./pages/Scenarios";
+import ComparePage from "./pages/Compare";
+import ScenarioBanner from "./ScenarioBanner";
 
-const NAV = [["dashboard", "Dashboard"], ["map", "Map"], ["graph", "Graph"], ["", "Explorer"], ["audit", "Audit"], ["approvals", "Approvals"], ["agent", "Agent"]] as const;
+const NAV = [["dashboard", "Dashboard"], ["map", "Map"], ["graph", "Graph"], ["", "Explorer"], ["audit", "Audit"], ["approvals", "Approvals"], ["agent", "Agent"], ["scenarios", "Scenarios"]] as const;
 
 function useParts(): string[] {
   const [h, setH] = useState(location.hash.slice(2));
@@ -19,10 +22,10 @@ function useParts(): string[] {
 }
 
 function Shell() {
-  const { role, setRole, me, meError } = useApp();
+  const { role, setRole, me, meError, scenario } = useApp();
   const parts = useParts();
   const page = parts[0] ?? "";
-  const section = ["map", "graph", "dashboard", "audit", "approvals", "agent"].includes(page) ? page : "";
+  const section = ["map", "graph", "dashboard", "audit", "approvals", "agent", "scenarios"].includes(page) ? page : "";
   return (
     <div className="shell">
       <header className="top">
@@ -38,14 +41,16 @@ function Shell() {
           <span className="chip badge" aria-label="Active role">{role}</span>
         </div>
       </header>
+      <ScenarioBanner />
       <TimeBar />
-      <div className="view" key={role}>
+      <div className="view" key={`${role}:${scenario ?? "main"}`}>
         {page === "map" && <MapPage />}
         {page === "graph" && <GraphPage />}
         {page === "dashboard" && <Dashboard />}
         {page === "audit" && <AuditPage parts={parts} />}
         {page === "approvals" && <ApprovalsPage />}
         {page === "agent" && <AgentPage parts={parts} />}
+        {page === "scenarios" && (parts[2]?.startsWith("compare") ? <ComparePage /> : <ScenariosPage />)}
         {!section && <ExplorerPage parts={parts} />}
       </div>
     </div>

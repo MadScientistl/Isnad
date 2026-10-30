@@ -20,5 +20,7 @@ def apply_schema(conn: psycopg.Connection, schema_sql_text: str | None = None) -
     conn.execute(GOVERNANCE_SQL.read_text())
     text = schema_sql_text if schema_sql_text is not None else BUILD_SCHEMA_SQL.read_text()
     conn.execute(text)
+    from engine import versioning
+    versioning.apply(conn)
     from . import bitemporal
     bitemporal.clear_caches()

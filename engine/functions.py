@@ -44,26 +44,32 @@ def _jsonable(v):
     return v
 
 
-def _need(conn, type_: str, id_: UUID) -> dict:
-    o = bt.get_object(conn, type_, id_)
-    if o is None or id_ not in vis.visible_ids(conn, [id_]):
+def _need(conn, type_: str, id_: UUID, sid: int = 0) -> dict:
+    """The object as the (scoped) caller sees it; `sid` > 0 reads scenario `sid` (the connection must be scoped
+    to it). Hidden == missing."""
+    o = bt.get_object(conn, type_, id_, scenario_id=sid)
+    # inside a scenario the object policy of rd_* already evaluates the scenario-effective visibility (D4)
+    if o is None or (not sid and id_ not in vis.visible_ids(conn, [id_])):
         raise FunctionError(f"{type_} {id_} not found")
     return o
 
 
-def _visible_neighbours(conn, link: str, id_: UUID, direction: str) -> list[UUID]:
-    ids = bt.neighbours(conn, link, id_, direction)
+def _visible_neighbours(conn, link: str, id_: UUID, direction: str, sid: int = 0,
+                        other_type: str | None = None) -> list[UUID]:
+    ids = bt.neighbours(conn, link, id_, direction, scenario_id=sid)
+    if sid:  # scenario: keep the ids whose object (of the expected type) the caller can read
+        return [i for i in ids if other_type is None or bt.get_object(conn, other_type, i, scenario_id=sid)]
     ok = vis.visible_ids(conn, ids) if ids else set()
     return [i for i in ids if i in ok]
 
 
-def shipments_at_risk(conn, port) -> dict:
+def shipments_at_risk(conn, port, scenario_id: int = 0) -> dict:
     """Non-arrived shipments with a ships_via link to the port."""
     pid = _uuid(port, "port")
-    p = _need(conn, "Port", pid)
+    p = _need(conn, "Port", pid, scenario_id)
     out = []
-    for sid in _visible_neighbours(conn, "ships_via", pid, "in"):
-        s = bt.get_object(conn, "Shipment", sid)
+    for sid in _visible_neighbours(conn, "ships_via", pid, "in", scenario_id, "Shipment"):
+        s = bt.get_object(conn, "Shipment", sid, scenario_id=scenario_id)
         if s is None or s.get("status") == "arrived":
             continue
         out.append({"id": str(sid), "ref": s.get("ref"), "status": s.get("status"), "eta": s.get("eta"),
@@ -73,18 +79,18 @@ def shipments_at_risk(conn, port) -> dict:
                       "count": len(out), "shipments": out})
 
 
-def invoice_anomaly_score(conn, invoice) -> dict:
+def invoice_anomaly_score(conn, invoice, scenario_id: int = 0) -> dict:
     """Deterministic score in [0, 1]: amount vs the supplier's other invoices, plus status/due hints."""
     iid = _uuid(invoice, "invoice")
-    inv = _need(conn, "Invoice", iid)
+    inv = _need(conn, "Invoice", iid, scenario_id)
     amount = float(inv.get("amount") or 0.0)
     score, reasons = 0.0, []
     peers: list[float] = []
-    for sup in _visible_neighbours(conn, "billed_by", iid, "out"):
-        for oid in _visible_neighbours(conn, "billed_by", sup, "in"):
+    for sup in _visible_neighbours(conn, "billed_by", iid, "out", scenario_id, "Supplier"):
+        for oid in _visible_neighbours(conn, "billed_by", sup, "in", scenario_id, "Invoice"):
             if oid == iid:
                 continue
-            o = bt.get_object(conn, "Invoice", oid)
+            o = bt.get_object(conn, "Invoice", oid, scenario_id=scenario_id)
             if o is not None and o.get("amount") is not None:
                 peers.append(float(o["amount"]))
     if len(peers) >= 2:
@@ -113,18 +119,18 @@ def invoice_anomaly_score(conn, invoice) -> dict:
                       "peer_count": len(peers), "reasons": reasons})
 
 
-def risk_factors(conn, shipment) -> dict:
+def risk_factors(conn, shipment, scenario_id: int = 0) -> dict:
     """Delay, closed ports on the route, and open Events affecting those ports."""
     sid = _uuid(shipment, "shipment")
-    s = _need(conn, "Shipment", sid)
+    s = _need(conn, "Shipment", sid, scenario_id)
     ports, events = [], []
-    for pid in _visible_neighbours(conn, "ships_via", sid, "out"):
-        p = bt.get_object(conn, "Port", pid)
+    for pid in _visible_neighbours(conn, "ships_via", sid, "out", scenario_id, "Port"):
+        p = bt.get_object(conn, "Port", pid, scenario_id=scenario_id)
         if p is None:
             continue
         ports.append({"id": str(pid), "name": p.get("name"), "status": p.get("status")})
-        for eid in _visible_neighbours(conn, "affects", pid, "in"):
-            e = bt.get_object(conn, "Event", eid)
+        for eid in _visible_neighbours(conn, "affects", pid, "in", scenario_id, "Event"):
+            e = bt.get_object(conn, "Event", eid, scenario_id=scenario_id)
             if e is not None and e.get("ended") is None:
                 events.append({"id": str(eid), "kind": e.get("kind"), "severity": e.get("severity"),
                                "port": str(pid), "note": e.get("note")})
@@ -148,13 +154,15 @@ FUNCTIONS: dict[str, Callable] = {
 }
 
 
-def run(conn, name: str, params: dict | None = None) -> dict:
+def run(conn, name: str, params: dict | None = None, *, scenario_id: int = 0) -> dict:
     """Run a registered function. Raises FunctionError for unknown functions or bad parameters.
-    Role gating is the caller's job (`Ontology.role_can_run_function`)."""
+    Role gating is the caller's job (`Ontology.role_can_run_function`). `scenario_id` > 0 reads that scenario
+    (the connection must be scoped to it, `scoped(conn, principal, ctx)`); the scenario id is never a caller
+    parameter of the function itself."""
     fn = FUNCTIONS.get(name)
     if fn is None:
         raise FunctionError(f"unknown function {name!r}")
     try:
-        return fn(conn, **(params or {}))
+        return fn(conn, **{**(params or {}), "scenario_id": scenario_id})
     except TypeError as e:
         raise FunctionError(f"bad parameters for {name!r}: {e}") from None
