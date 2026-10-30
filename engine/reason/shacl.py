@@ -5,6 +5,12 @@ literals) can only be checked if properties are supplied: pass `props_loader` (s
 `pg_props_loader`) to hydrate the extracted subgraph from Postgres. Without it, only
 edge/type-based constraints are meaningful (property minCount shapes will report
 violations; filter or hydrate).
+
+Scenarios (Phase 5): `validate_changed(graph, ids, ns, props_loader, scenario=ctx)` validates the
+neighbourhood in the scenario's own store; `graph` is then the scenario's `ScenarioGraph`
+(`engine.sync.scenario_graph.get_store`), never the main store, and
+`pg_props_loader(conn, types, ns, scenario=ctx)` hydrates from the scenario-effective `eff_obj_*` views
+(the connection must be scoped with the same scenario).
 """
 from __future__ import annotations
 
@@ -18,6 +24,7 @@ from typing import Callable, Iterable
 from pyoxigraph import Literal, NamedNode, Quad, RdfFormat, Store, serialize
 
 from engine.sync import iri
+from engine.db.principal import ScenarioCtx
 from engine.sync.iri import G_ASSERTED, obj_iri
 
 SHAPES = Path(__file__).resolve().parents[2] / "build" / "shapes.ttl"
@@ -66,8 +73,11 @@ def _lit(v):
     return Literal(str(v))
 
 
-def pg_props_loader(conn, types: Iterable[str], ns: str = iri.DEFAULT_NS) -> Callable:
-    """Returns loader(ids)->[Quad]: literal properties of current rows for `ids` from cur_obj_<type>."""
+def pg_props_loader(conn, types: Iterable[str], ns: str = iri.DEFAULT_NS,
+                    scenario: ScenarioCtx | None = None) -> Callable:
+    """Returns loader(ids)->[Quad]: literal properties of current rows for `ids` from cur_obj_<type>
+    (or eff_obj_<type> inside a `scenario`; the connection's scenario GUC must match, and its
+    transaction is left open so the scoped identity survives)."""
     from psycopg import sql
     from engine.db.bitemporal import obj_table, COMMON_COLS
     types = tuple(types)
@@ -76,8 +86,12 @@ def pg_props_loader(conn, types: Iterable[str], ns: str = iri.DEFAULT_NS) -> Cal
         ids = list(ids)
         quads = []
         for t in types:
+            if scenario is not None:
+                got = conn.execute("SELECT current_setting('amarh.scenario', true)").fetchone()[0]
+                if str(got or "") != str(scenario.id):
+                    raise PermissionError("connection is not scoped to this scenario")
             cur = conn.execute(sql.SQL("SELECT * FROM {} WHERE id = ANY(%s)").format(
-                sql.Identifier("cur_" + obj_table(t))), [ids])
+                sql.Identifier(("eff_" if scenario is not None else "cur_") + obj_table(t))), [ids])
             cols = [d.name for d in cur.description]
             for row in cur.fetchall():
                 r = dict(zip(cols, row))
@@ -86,7 +100,8 @@ def pg_props_loader(conn, types: Iterable[str], ns: str = iri.DEFAULT_NS) -> Cal
                     if c == "id" or c in COMMON_COLS or v is None:
                         continue
                     quads.append(Quad(s, NamedNode(ns + c), _lit(v)))
-        conn.rollback()
+        if scenario is None:
+            conn.rollback()
         return quads
     return load
 
@@ -100,10 +115,22 @@ def _shapes(path: str):
 
 
 def validate_changed(st: Store, changed_ids: Iterable, ns: str = iri.DEFAULT_NS,
-                     props_loader: Callable | None = None, shapes_path: Path | str = SHAPES) -> ShaclResult:
-    """Extract neighbourhood of changed ids, optionally hydrate, validate with pySHACL."""
+                     props_loader: Callable | None = None, shapes_path: Path | str = SHAPES,
+                     scenario: ScenarioCtx | None = None) -> ShaclResult:
+    """Extract neighbourhood of changed ids, optionally hydrate, validate with pySHACL.
+
+    With `scenario`, `st` must be the scenario's ScenarioGraph (its isolated store is validated);
+    passing a plain Store/SyncPipeline store raises ValueError (never validate main by accident)."""
     from rdflib import Graph, Namespace, RDF
     import pyshacl
+    sid = getattr(st, "scenario_id", 0)
+    if scenario is not None:
+        if sid != scenario.id:
+            raise ValueError("scenario validation needs the ScenarioGraph of that scenario")
+    elif sid:
+        raise ValueError("a ScenarioGraph needs scenario=<its ScenarioCtx>")
+    if sid:
+        st = st.store
     changed_ids = list(changed_ids)
     t0 = time.perf_counter()
     quads = extract_subgraph(st, changed_ids, ns)

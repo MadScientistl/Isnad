@@ -71,7 +71,9 @@ def mask_out(om, p, x):
         if k == "diff":
             out[k] = mask_diff(om, p, v)
         elif k == "dry_run" and isinstance(v, dict):
-            out[k] = {**v, "diff": mask_diff(om, p, v.get("diff"))}
+            # scenario dry runs may also carry the scenario-side diff; impact holds aggregate KPIs only
+            out[k] = {**v, **{dk: mask_diff(om, p, v.get(dk)) for dk in ("diff", "scenario_diff", "main_diff")
+                              if dk in v}}
         elif k in ("before", "after") and isinstance(v, dict):
             if all(isinstance(i, dict) for i in v.values()) and all(":" in str(i) for i in v):
                 out[k] = mask_summary(om, p, v)

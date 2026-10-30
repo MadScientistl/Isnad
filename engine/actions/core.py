@@ -28,7 +28,7 @@ from psycopg import errors as pgerr
 
 from engine.compiler import exprs
 from engine.db import bitemporal as bt
-from engine.db.principal import OWNER, Principal, scoped
+from engine.db.principal import OWNER, Principal, ScenarioCtx, scoped
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ONTOLOGY = ROOT / "ontology" / "supply_chain.yaml"
@@ -59,6 +59,18 @@ class CriteriaFailed(Exception):
 
 class NotFound(ValueError):
     """Object (or proposal / execution) missing OR invisible to the caller: identical on purpose."""
+
+
+class ScenarioNotFound(NotFound):
+    """Scenario unknown, invisible to the caller, or not open: identical on purpose (hidden == missing)."""
+
+
+class MergeConflict(Exception):
+    """Main changed on objects/links a scenario touched. `conflicts`: [{kind, type, key, reason}]."""
+
+    def __init__(self, conflicts: list[dict]):
+        super().__init__(f"merge conflict on {len(conflicts)} key(s)")
+        self.conflicts = conflicts
 
 
 class ApprovalRequired(Exception):
@@ -103,6 +115,47 @@ class ActionResult:
     diff: list = field(default_factory=list)  # [{kind,type,key,op,before,after}]
     webhooks: list = field(default_factory=list)  # hook names enqueued
     proposal_id: UUID | None = None
+    impact: dict | None = None  # dry_run inside a scenario: {before:{kpis}, after:{kpis}, delta:{kpis}}
+
+
+def _sid(scenario_id) -> int:
+    if type(scenario_id) is not int or scenario_id < 0:
+        raise ValueError("scenario_id must be a non-negative int")
+    return scenario_id
+
+
+def _who(principal, sid: int):
+    """Identity to scope the connection to. The internal system principal (`SIM`) is not an owner/shared role of any
+    scenario, so inside a scenario its writes (what-if simulation, source='sim') are made through the loader
+    connection (OWNER scope + scenario GUCs) while permissions and audit still use the `sim` role identity. On
+    main nothing changes. Only the exact SIM identity qualifies (the API refuses `sim` as x-role)."""
+    if sid and principal is not OWNER and getattr(principal, "role", None) == SIM.role \
+            and getattr(principal, "user", None) == SIM.user:
+        return OWNER
+    return principal
+
+
+def _scn_ctx(conn, sid: int) -> ScenarioCtx | None:
+    """Trusted ScenarioCtx for `sid` (owner-side read). Visibility for the caller is checked inside the
+    scoped block by `_need_scn` (a ctx alone grants nothing: RLS and the eff_* views fail closed)."""
+    if not sid:
+        return None
+    from engine.db import scenario_admin
+    try:
+        return scenario_admin.ctx_of(conn, sid)
+    except LookupError:
+        raise ScenarioNotFound(f"scenario {sid} not found") from None
+
+
+def _need_scn(conn, sid: int, *, write: bool) -> None:
+    """Inside scoped(): the scenario must be open and visible (else NotFound); writing needs owner/admin."""
+    if not sid:
+        return
+    vis, wr = conn.execute("SELECT amarh_scenario_visible(%s), amarh_scenario_writable(%s)", [sid, sid]).fetchone()
+    if not vis:
+        raise ScenarioNotFound(f"scenario {sid} not found")
+    if write and not wr:
+        raise PermissionDenied("this scenario is read-only for your role (only the owner or an admin may change it)")
 
 
 def ensure_audit_schema(conn) -> None:
@@ -222,8 +275,9 @@ class _P:
 
 # ------------------------------------------------------------------- context
 class _Ctx:
-    def __init__(self, conn, model, pr: _P, valid_at, action_id):
+    def __init__(self, conn, model, pr: _P, valid_at, action_id, sid: int = 0):
         self.conn, self.model, self.pr = conn, model, pr
+        self.sid = sid
         self.actor = pr.user
         self.vt, self.aid = valid_at, action_id
         self.changed = False
@@ -245,7 +299,7 @@ class _Ctx:
 
     def get(self, type_, id_, masked=False):
         self._check_type(type_)
-        r = bt.get_object(self.conn, type_, id_, as_of_valid=self.vt, masked=masked)
+        r = bt.get_object(self.conn, type_, id_, as_of_valid=self.vt, masked=masked, scenario_id=self.sid)
         return None if r is None else {k: v for k, v in r.items() if k not in _STRIP}
 
     def need(self, type_, id_):
@@ -263,7 +317,8 @@ class _Ctx:
         key = f"{type_}:{id_}"
         if key not in self.before:
             self._snap(self.before, key, self.get(type_, id_))
-        ch = bt.write_object(self.conn, type_, id_, props, self.vt, self.actor, action_id=self.aid)
+        ch = bt.write_object(self.conn, type_, id_, props, self.vt, self.actor, action_id=self.aid,
+                             scenario_id=self.sid)
         self.changed |= ch
         self._snap(self.after, key, self.get(type_, id_))
 
@@ -278,7 +333,8 @@ class _Ctx:
         self.need(type_, id_)
         if key not in self.before:
             self._snap(self.before, key, self.get(type_, id_))
-        self.changed |= bt.delete_object(self.conn, type_, id_, self.vt, self.actor, action_id=self.aid)
+        self.changed |= bt.delete_object(self.conn, type_, id_, self.vt, self.actor, action_id=self.aid,
+                                          scenario_id=self.sid)
         self._snap(self.after, key, None)
 
     # links
@@ -296,7 +352,8 @@ class _Ctx:
         return out
 
     def visible_any(self, tname, id_) -> bool:
-        return any(bt.get_object(self.conn, t, id_, as_of_valid=self.vt) for t in self._concrete(tname))
+        return any(bt.get_object(self.conn, t, id_, as_of_valid=self.vt, scenario_id=self.sid)
+                   for t in self._concrete(tname))
 
     def _link_def(self, link):
         lt = self.model.link_types.get(link)
@@ -309,7 +366,7 @@ class _Ctx:
             raise NotFound(f"{tname} {id_} not found at {self.vt.isoformat()}")
 
     def _link_exists(self, link, src, dst):
-        return dst in bt.neighbours(self.conn, link, src, "out", as_of_valid=self.vt)
+        return dst in bt.neighbours(self.conn, link, src, "out", as_of_valid=self.vt, scenario_id=self.sid)
 
     def link(self, link, src, dst):
         lt = self._link_def(link)
@@ -318,7 +375,8 @@ class _Ctx:
         key = f"{link}:{src}>{dst}"
         if key not in self.before:
             self._snap(self.before, key, {"exists": self._link_exists(link, src, dst)})
-        self.changed |= bt.write_link(self.conn, link, src, dst, self.vt, self.actor, action_id=self.aid)
+        self.changed |= bt.write_link(self.conn, link, src, dst, self.vt, self.actor, action_id=self.aid,
+                                       scenario_id=self.sid)
         self._snap(self.after, key, {"exists": self._link_exists(link, src, dst)})
 
     def unlink(self, link, src, dst):
@@ -326,7 +384,8 @@ class _Ctx:
         key = f"{link}:{src}>{dst}"
         if key not in self.before:
             self._snap(self.before, key, {"exists": self._link_exists(link, src, dst)})
-        self.changed |= bt.end_link(self.conn, link, src, dst, self.vt, self.actor, action_id=self.aid)
+        self.changed |= bt.end_link(self.conn, link, src, dst, self.vt, self.actor, action_id=self.aid,
+                                     scenario_id=self.sid)
         self._snap(self.after, key, {"exists": self._link_exists(link, src, dst)})
 
     def diff(self) -> list[dict]:
@@ -404,18 +463,25 @@ def _delay_shipment(c, p):
     c.merge("Shipment", p["shipment"], **ch)
 
 
+REROUTE_COST_RATE = 0.02  # extra_cost added per unit of cargo_value on a reroute
+
+
 def _reroute_shipment(c, p):
     """End every current ships_via link of the shipment, then route it via the new port."""
     ship, new = p["shipment"], p["new_port"]
-    for old in bt.neighbours(c.conn, "ships_via", ship, "out", as_of_valid=c.vt):
+    for old in bt.neighbours(c.conn, "ships_via", ship, "out", as_of_valid=c.vt, scenario_id=c.sid):
         if old != new:
             c.unlink("ships_via", ship, old)
     c.link("ships_via", ship, new)
+    if c.changed:  # route actually changed: deterministic reroute cost (Phase 5 contract addendum)
+        cur = c.need("Shipment", ship)
+        cost = float(cur.get("extra_cost") or 0.0) + REROUTE_COST_RATE * float(cur.get("cargo_value") or 0.0)
+        c.merge("Shipment", ship, extra_cost=cost)
 
 
 def _open_closure(c, port):
     """Open port_closure Event (ended unset) affecting `port`, as of valid_at."""
-    for ev in bt.neighbours(c.conn, "affects", port, "in", as_of_valid=c.vt):
+    for ev in bt.neighbours(c.conn, "affects", port, "in", as_of_valid=c.vt, scenario_id=c.sid):
         e = c.get("Event", ev)
         if e and e["kind"] == "port_closure" and e.get("ended") is None:
             return ev
@@ -527,20 +593,20 @@ def _run_rules(c: _Ctx, a, clean: dict, aliases: dict) -> None:
 
 
 # ------------------------------------------------------------------ pipeline
-def _pipeline(conn, model, a, raw_params, pr: _P, valid_at, aid, *, gate: bool):
+def _pipeline(conn, model, a, raw_params, pr: _P, valid_at, aid, *, gate: bool, sid: int = 0):
     name = a.name
     if not pr.owner and not model.role_can_execute(pr.role, name):
         raise PermissionDenied(f"role {pr.role!r} may not execute {name!r}")
     clean = _validate(a, raw_params)
     if gate and a.requires_approval and pr.role not in a.approval_exempt:
         raise ApprovalRequired(name, a.approvers)
-    c = _Ctx(conn, model, pr, valid_at, aid)
+    c = _Ctx(conn, model, pr, valid_at, aid, sid)
     aliases: dict[str, dict | None] = {}
     for al, b in a.bind.items():
         oid = clean.get(b.id[1:]) if b.id.startswith("$") else b.id
         if oid is None:
             raise ValueError(f"bind {al!r}: missing id {b.id}")
-        obj = bt.get_object(conn, b.type, oid, as_of_valid=valid_at)
+        obj = bt.get_object(conn, b.type, oid, as_of_valid=valid_at, scenario_id=sid)
         if obj is None:
             raise NotFound(f"{b.type} {oid} not found at {valid_at.isoformat()}")
         d = {k: v for k, v in obj.items() if k not in _STRIP}
@@ -570,23 +636,25 @@ def _pipeline(conn, model, a, raw_params, pr: _P, valid_at, aid, *, gate: bool):
 def _persist(conn, model, a, pr: _P, c: _Ctx, clean, valid_at, aid, *, source, run_id, proposal_id,
              tool_trace, on_behalf_of, name=None, parent=None, params=None) -> tuple[int, list, list]:
     diff = c.diff()
+    sid = c.sid
     seq = conn.execute(
         "INSERT INTO audit_event (action_id, name, actor, source, run_id, params, sim_time, before, after, "
-        "role, on_behalf_of, proposal_id, status, tool_trace, parent_execution_id) "
-        "VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s::jsonb,%s,%s,%s,'executed',%s::jsonb,%s) RETURNING seq",
+        "role, on_behalf_of, proposal_id, status, tool_trace, parent_execution_id, scenario_id) "
+        "VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s::jsonb,%s,%s,%s,'executed',%s::jsonb,%s,%s) RETURNING seq",
         [aid, name or a.name, pr.user, source, run_id, _jdump(params if params is not None else clean),
          valid_at, json.dumps(c.before), json.dumps(c.after), pr.role, on_behalf_of, proposal_id,
-         None if tool_trace is None else _jdump(tool_trace), parent],
+         None if tool_trace is None else _jdump(tool_trace), parent, sid],
     ).fetchone()[0]
     if diff:
         conn.cursor().executemany(
-            "INSERT INTO execution_diff (action_id, kind, type, key, op, before, after) "
-            "VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb)",
+            "INSERT INTO execution_diff (action_id, kind, type, key, op, before, after, scenario_id) "
+            "VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s)",
             [(aid, d["kind"], d["type"], d["key"], d["op"],
               None if d["before"] is None else json.dumps(d["before"]),
-              None if d["after"] is None else json.dumps(d["after"])) for d in diff])
+              None if d["after"] is None else json.dumps(d["after"]), sid) for d in diff])
     hooks: list[str] = []
-    if a is not None and source != "sim" and c.changed:
+    # a scenario is a sandbox: it never enqueues webhooks (nothing leaves the platform)
+    if a is not None and source != "sim" and c.changed and not sid:
         for hook in a.webhooks:
             wd = model.webhooks.get(hook)
             if wd is None:
@@ -606,9 +674,10 @@ def _persist(conn, model, a, pr: _P, c: _Ctx, clean, valid_at, aid, *, source, r
 
 
 def _do_execute(conn, model, a, raw_params, pr: _P, valid_at, aid, *, source, run_id, proposal_id,
-                tool_trace, on_behalf_of, gate=True) -> ActionResult:
-    """Everything inside the (already open) scoped transaction."""
-    c, clean = _pipeline(conn, model, a, raw_params, pr, valid_at, aid, gate=gate)
+                tool_trace, on_behalf_of, gate=True, sid: int = 0) -> ActionResult:
+    """Everything inside the (already open) scoped transaction. Inside a scenario there is no approval gate
+    (sandbox: the approval gate protects main; merging re-applies the gate)."""
+    c, clean = _pipeline(conn, model, a, raw_params, pr, valid_at, aid, gate=gate and not sid, sid=sid)
     seq, diff, hooks = _persist(conn, model, a, pr, c, clean, valid_at, aid, source=source, run_id=run_id,
                                 proposal_id=proposal_id, tool_trace=tool_trace, on_behalf_of=on_behalf_of)
     return ActionResult(aid, c.changed, a.name, c.before, c.after, seq, c.created, "executed", diff, hooks,
@@ -623,25 +692,32 @@ def _action(model, name):
 
 
 def _audit_denied(conn, model, pr: _P, name, params, valid_at, source, run_id, proposal_id, tool_trace,
-                  error: str, failures=None) -> None:
-    """Own committed transaction: a denial leaves a status='denied' audit row, no data writes."""
+                  error: str, failures=None, sid: int = 0) -> None:
+    """Own committed transaction: a denial leaves a status='denied' audit row, no data writes. Inside a
+    scenario the row carries the scenario id (and is only visible under that scenario)."""
     try:
         conn.rollback()
     except Exception:
         pass
-    with conn.transaction():
-        with scoped(conn, OWNER if pr.owner else pr.p):
-            conn.execute(
-                "INSERT INTO audit_event (action_id, name, actor, source, run_id, params, sim_time, before, after, "
-                "role, proposal_id, status, tool_trace) VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,NULL,%s::jsonb,%s,%s,"
-                "'denied',%s::jsonb)",
-                [uuid4(), name, pr.user, source, run_id, _jdump(params), valid_at,
-                 _jdump({"error": error, "failures": failures or []}), pr.role, proposal_id,
-                 None if tool_trace is None else _jdump(tool_trace)])
-    conn.commit()
+    try:
+        sctx = _scn_ctx(conn, sid) if sid else None
+        with conn.transaction():
+            with scoped(conn, OWNER if pr.owner else pr.p, sctx):
+                conn.execute(
+                    "INSERT INTO audit_event (action_id, name, actor, source, run_id, params, sim_time, before, "
+                    "after, role, proposal_id, status, tool_trace, scenario_id) VALUES (%s,%s,%s,%s,%s,%s::jsonb,"
+                    "%s,NULL,%s::jsonb,%s,%s,'denied',%s::jsonb,%s)",
+                    [uuid4(), name, pr.user, source, run_id, _jdump(params), valid_at,
+                     _jdump({"error": error, "failures": failures or []}), pr.role, proposal_id,
+                     None if tool_trace is None else _jdump(tool_trace), sid])
+        conn.commit()
+    except (psycopg.Error, ScenarioNotFound) as e:
+        # e.g. the caller may not write that scenario (RLS) or it vanished: the denial is not auditable there
+        log.warning("denial in scenario %s could not be audited: %s", sid, str(e).splitlines()[0])
+        _safe_rollback(conn)
 
 
-def _guarded(conn, model, pr, name, params, valid_at, source, run_id, proposal_id, tool_trace, fn):
+def _guarded(conn, model, pr, name, params, valid_at, source, run_id, proposal_id, tool_trace, fn, sid: int = 0):
     try:
         try:
             return fn()
@@ -651,14 +727,14 @@ def _guarded(conn, model, pr, name, params, valid_at, source, run_id, proposal_i
     except PermissionDenied as e:
         if source in DENY_AUDIT_SOURCES:
             _audit_denied(conn, model, pr, name, params, valid_at, source, run_id, proposal_id, tool_trace,
-                          e.detail)
+                          e.detail, sid=sid)
         else:
             _safe_rollback(conn)
         raise
     except CriteriaFailed as e:
         if source in DENY_AUDIT_SOURCES:
             _audit_denied(conn, model, pr, name, params, valid_at, source, run_id, proposal_id, tool_trace,
-                          str(e), e.failures)
+                          str(e), e.failures, sid=sid)
         else:
             _safe_rollback(conn)
         raise
@@ -674,10 +750,14 @@ def _safe_rollback(conn):
 # ----------------------------------------------------------------- public API
 def execute(conn, name: str, params: dict, principal, *, valid_at: datetime, source: str = "api",
             run_id: str | None = None, proposal_id: UUID | None = None, tool_trace=None, ontology=None,
-            on_behalf_of: str | None = None) -> ActionResult:
+            on_behalf_of: str | None = None, scenario_id: int = 0) -> ActionResult:
     """Validate, authorise, write, audit and commit in ONE transaction (see module docstring).
 
-    Raises ValueError/NotFound (validation, missing or invisible object), PermissionDenied,
+    `scenario_id` > 0 runs the action inside that what-if scenario (Phase 5): same permission, criteria and RLS
+    checks as main, writes only the scenario overlay, audit rows carry the scenario id, no webhooks, no graph
+    outbox, no approval gate (sandbox). The caller must own the scenario (or be admin).
+
+    Raises ValueError/NotFound (validation, missing or invisible object), ScenarioNotFound, PermissionDenied,
     CriteriaFailed, ApprovalRequired (use `propose`).
     """
     model = _load(ontology)
@@ -685,30 +765,54 @@ def execute(conn, name: str, params: dict, principal, *, valid_at: datetime, sou
     valid_at = _vt(valid_at)
     pr = _P(principal)
     aid = uuid4()
+    sid = _sid(scenario_id)
 
     def go():
+        sctx = _scn_ctx(conn, sid)
         with conn.transaction():
-            with scoped(conn, principal):
+            with scoped(conn, _who(principal, sid), sctx):
+                _need_scn(conn, sid, write=True)
                 r = _do_execute(conn, model, a, params, pr, valid_at, aid, source=source, run_id=run_id,
-                                proposal_id=proposal_id, tool_trace=tool_trace, on_behalf_of=on_behalf_of)
+                                proposal_id=proposal_id, tool_trace=tool_trace, on_behalf_of=on_behalf_of,
+                                sid=sid)
         conn.commit()
         return r
 
-    return _guarded(conn, model, pr, name, params, valid_at, source, run_id, proposal_id, tool_trace, go)
+    return _guarded(conn, model, pr, name, params, valid_at, source, run_id, proposal_id, tool_trace, go, sid)
 
 
-def dry_run(conn, name: str, params: dict, principal, *, valid_at: datetime, ontology=None) -> ActionResult:
+def _impact(before: dict, after: dict) -> dict:
+    """Contract shape: {before:{kpis}, after:{kpis}, delta:{kpis}} with delta = after - before."""
+    keys = sorted(set(before) | set(after))
+    return {"before": {"kpis": before}, "after": {"kpis": after},
+            "delta": {"kpis": {k: (after.get(k) or 0) - (before.get(k) or 0) for k in keys}}}
+
+
+def dry_run(conn, name: str, params: dict, principal, *, valid_at: datetime, ontology=None,
+            scenario_id: int = 0) -> ActionResult:
     """Run the whole pipeline (permissions, criteria, rules) and return the diff; commits nothing.
-    The approval gate is not applied (a dry run is how a proposal previews its effect)."""
+    The approval gate is not applied (a dry run is how a proposal previews its effect). With `scenario_id`
+    the run happens inside the scenario and `impact` holds the KPIs (main before, scenario after, delta)."""
+    from engine import kpis
     model = _load(ontology)
     a = _action(model, name)
     valid_at = _vt(valid_at)
     pr = _P(principal)
     aid = uuid4()
+    sid = _sid(scenario_id)
+    sctx = _scn_ctx(conn, sid)
     with conn.transaction(force_rollback=True):
-        with scoped(conn, principal):
-            c, clean = _pipeline(conn, model, a, params, pr, valid_at, aid, gate=False)
-            return ActionResult(aid, c.changed, name, c.before, c.after, None, c.created, "dry_run", c.diff())
+        before = None
+        if sid:
+            with scoped(conn, principal):
+                before = kpis.compute(conn, principal, 0, valid_at)
+        with scoped(conn, _who(principal, sid), sctx):
+            _need_scn(conn, sid, write=True)
+            c, clean = _pipeline(conn, model, a, params, pr, valid_at, aid, gate=False, sid=sid)
+            # evaluated AT the action's valid time (SQL now() is the transaction start, before the write)
+            impact = _impact(before, kpis.compute(conn, principal, sid, valid_at)) if sid else None
+            return ActionResult(aid, c.changed, name, c.before, c.after, None, c.created, "dry_run", c.diff(),
+                                impact=impact)
 
 
 PROPOSAL_TTL_H = float(os.environ.get("AMARH_PROPOSAL_TTL_H", "24"))
@@ -717,50 +821,94 @@ PROPOSAL_TTL_H = float(os.environ.get("AMARH_PROPOSAL_TTL_H", "24"))
 def propose(conn, name: str, params: dict, principal, rationale: str | None = None, *, valid_at: datetime,
             source: str = "api", run_id: str | None = None, tool_trace=None, ontology=None,
             on_behalf_of: str | None = None, evidence=None, idempotency_key: str | None = None,
-            ttl_h: float | None = None) -> UUID:
+            ttl_h: float | None = None, scenario_id: int = 0) -> UUID:
     """Store a proposal (with a dry-run preview). Writes nothing else; the role must be allowed to
-    execute the action. Criteria are checked now so that doomed proposals are refused early."""
+    execute the action. Criteria are checked now so that doomed proposals are refused early.
+
+    With `scenario_id` the preview is the real run INSIDE that scenario plus `impact` (KPIs: main before,
+    scenario after, delta) and `scenario_id`; the proposal row keeps it as evidence scenario but still
+    executes ONLY on main after a human approves (staleness is evaluated against main: the stored base
+    versions come from a main dry run, empty when the action cannot run on main yet)."""
     model = _load(ontology)
     a = _action(model, name)
     valid_at = _vt(valid_at)
     pr = _P(principal)
     pid = uuid4()
+    sid = _sid(scenario_id)
 
     def go():
+        sctx = _scn_ctx(conn, sid)
         with conn.transaction():
-            with scoped(conn, principal):
-                try:
-                    with conn.transaction():  # savepoint, rolled back by _Preview: a pure preview
-                        c, clean = _pipeline(conn, model, a, params, pr, valid_at, uuid4(), gate=False)
-                        preview = {"valid_at": valid_at.isoformat(), "changed": c.changed, "diff": c.diff()}
-                        raise _Preview(clean, preview)
-                except _Preview as pv:
-                    clean, preview = pv.clean, pv.preview
-                if idempotency_key:
-                    dup = conn.execute("SELECT id FROM proposal WHERE idempotency_key=%s",
-                                       [idempotency_key]).fetchone()
-                    if dup:
-                        return dup[0]
-                ttl = PROPOSAL_TTL_H if ttl_h is None else ttl_h
-                conn.execute(
-                    "INSERT INTO proposal (id, action, params, proposer, proposer_role, rationale, dry_run, "
-                    "run_id, tool_trace, on_behalf_of, idempotency_key, evidence, base_versions, expires_at) "
-                    "VALUES (%s,%s,%s::jsonb,%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s,%s,%s::jsonb,%s::jsonb,"
-                    "clock_timestamp() + make_interval(secs => %s))",
-                    [pid, name, _jdump(clean), pr.user, pr.role, rationale, _jdump(preview), run_id,
-                     None if tool_trace is None else _jdump(tool_trace), on_behalf_of, idempotency_key,
-                     None if evidence is None else _jdump(evidence),
-                     _jdump(_base_versions(preview["diff"])),
-                     ttl * 3600])
+            r = _propose_open(conn, model, a, params, principal, pr, sctx, sid, pid, name, rationale, valid_at,
+                              run_id, tool_trace, on_behalf_of, evidence, idempotency_key, ttl_h)
         conn.commit()
-        return pid
+        return r
 
-    return _guarded(conn, model, pr, name, params, valid_at, source, run_id, None, tool_trace, go)
+    return _guarded(conn, model, pr, name, params, valid_at, source, run_id, None, tool_trace, go, sid)
+
+
+def _preview_run(conn, model, a, params, pr, valid_at, sid, with_kpis=None):
+    """One pipeline run inside a savepoint that is always rolled back. Returns (clean, preview, extra)."""
+    try:
+        with conn.transaction():
+            c, clean = _pipeline(conn, model, a, params, pr, valid_at, uuid4(), gate=False, sid=sid)
+            extra = with_kpis() if with_kpis else None
+            raise _Preview(clean, {"valid_at": valid_at.isoformat(), "changed": c.changed, "diff": c.diff()}, extra)
+    except _Preview as pv:
+        return pv.clean, pv.preview, pv.extra
+
+
+def _propose_open(conn, model, a, params, principal, pr, sctx, sid, pid, name, rationale, valid_at, run_id,
+                  tool_trace, on_behalf_of, evidence, idempotency_key, ttl_h):
+    """Body of `propose` inside the open transaction (shared with the scenario merge, which must not commit)."""
+    from engine import kpis
+    base_diff = None
+    if not sid:
+        with scoped(conn, principal):
+            clean, preview, _ = _preview_run(conn, model, a, params, pr, valid_at, 0)
+        base_diff = preview["diff"]
+    else:
+        # main side first: baseline KPIs and what approval would do on main (staleness base)
+        with scoped(conn, principal):
+            before = kpis.compute(conn, principal, 0, valid_at)
+            try:
+                _c0, main_preview, _ = _preview_run(conn, model, a, params, pr, valid_at, 0)
+                base_diff = main_preview["diff"]
+            except (NotFound, CriteriaFailed, ValueError):
+                main_preview = None  # e.g. the target only exists inside the scenario: nothing to compare yet
+        with scoped(conn, principal, sctx):
+            _need_scn(conn, sid, write=True)
+            clean, preview, after = _preview_run(conn, model, a, params, pr, valid_at, sid,
+                                                 with_kpis=lambda: kpis.compute(conn, principal, sid, valid_at))
+            preview["scenario_id"] = sid
+            preview["impact"] = _impact(before, after)
+            if not preview["diff"] and main_preview is not None:  # already applied inside the scenario
+                preview["scenario_diff"], preview["diff"] = preview["diff"], main_preview["diff"]
+    with scoped(conn, principal, sctx):
+        if idempotency_key:
+            dup = conn.execute("SELECT id FROM proposal WHERE idempotency_key=%s", [idempotency_key]).fetchone()
+            if dup:
+                return dup[0]
+        ttl = PROPOSAL_TTL_H if ttl_h is None else ttl_h
+        conn.execute(
+            "INSERT INTO proposal (id, action, params, proposer, proposer_role, rationale, dry_run, "
+            "run_id, tool_trace, on_behalf_of, idempotency_key, evidence, base_versions, expires_at, scenario_id) "
+            "VALUES (%s,%s,%s::jsonb,%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s,%s,%s::jsonb,%s::jsonb,"
+            "clock_timestamp() + make_interval(secs => %s),%s)",
+            [pid, name, _jdump(clean), pr.user, pr.role, rationale, _jdump(preview), run_id,
+             None if tool_trace is None else _jdump(tool_trace), on_behalf_of, idempotency_key,
+             None if evidence is None else _jdump(evidence),
+             _jdump(_base_versions(base_diff if base_diff is not None else [])),
+             ttl * 3600, sid])
+        if sid:
+            conn.execute("INSERT INTO scenario_event (scenario_id, kind, actor, payload) VALUES (%s,'proposal',%s,%s::jsonb)",
+                         [sid, pr.user, _jdump({"proposal_id": str(pid), "action": name})])
+    return pid
 
 
 class _Preview(Exception):
-    def __init__(self, clean, preview):
-        self.clean, self.preview = clean, preview
+    def __init__(self, clean, preview, extra=None):
+        self.clean, self.preview, self.extra = clean, preview, extra
 
 
 def decide(conn, proposal_id: UUID, principal, approve: bool, comment: str | None = None, *,
@@ -891,7 +1039,8 @@ def _revive(model, type_, props: dict | None):
 
 
 def rollback(conn, action_id: UUID, principal, reason: str | None = None, *, valid_at: datetime | None = None,
-             source: str = "api", run_id: str | None = None, ontology=None, tool_trace=None) -> ActionResult:
+             source: str = "api", run_id: str | None = None, ontology=None, tool_trace=None,
+             scenario_id: int = 0) -> ActionResult:
     """D1 compensating rollback: only if every affected object/link still equals the recorded `after`
     (as of `valid_at`, default now); else RollbackConflict(keys). The rollback is itself an audited
     execution (name 'rollback', parent_execution_id) plus a `rollback` row. Webhooks are not undone and
@@ -899,18 +1048,26 @@ def rollback(conn, action_id: UUID, principal, reason: str | None = None, *, val
 
     Who may roll back: a role that may execute the original action; for approval-gated actions
     (and roles not exempt) only a role that may approve it.
+
+    `scenario_id` > 0 rolls back an execution of that scenario INSIDE it (compensating writes in the overlay,
+    no webhooks); the execution must belong to that exact scenario (main executions cannot be rolled back
+    from a scenario and vice versa: NotFound).
     """
     model = _load(ontology)
     pr = _P(principal)
     vt = _vt(valid_at) if valid_at is not None else datetime.now(UTC)
     aid = uuid4()
     orig = {"name": "rollback"}
+    sid = _sid(scenario_id)
 
     def go():
+        sctx = _scn_ctx(conn, sid)
         with conn.transaction():
-            with scoped(conn, principal):
+            with scoped(conn, _who(principal, sid), sctx):
+                _need_scn(conn, sid, write=True)
                 row = conn.execute(
-                    "SELECT name, status, params FROM audit_event WHERE action_id=%s", [action_id]).fetchone()
+                    "SELECT name, status, params FROM audit_event WHERE action_id=%s AND scenario_id=%s",
+                    [action_id, sid]).fetchone()
                 if row is None:
                     raise NotFound(f"execution {action_id} not found")
                 oname, ostatus, _oparams = row
@@ -931,7 +1088,7 @@ def rollback(conn, action_id: UUID, principal, reason: str | None = None, *, val
                 diff = conn.execute(
                     "SELECT kind, type, key, op, before, after FROM execution_diff WHERE action_id=%s ORDER BY seq",
                     [action_id]).fetchall()
-                c = _Ctx(conn, model, pr, vt, aid)
+                c = _Ctx(conn, model, pr, vt, aid, sid)
                 conflicts = []
                 for kind, typ, key, op, before, after in diff:
                     if kind == "object":
@@ -963,8 +1120,8 @@ def rollback(conn, action_id: UUID, principal, reason: str | None = None, *, val
                                          proposal_id=None, tool_trace=tool_trace, on_behalf_of=None,
                                          name="rollback", parent=action_id, params=params)
                 conn.execute(
-                    "INSERT INTO rollback (id, original_action_id, rollback_action_id, actor, reason) "
-                    "VALUES (%s,%s,%s,%s,%s)", [uuid4(), action_id, aid, pr.user, reason])
+                    "INSERT INTO rollback (id, original_action_id, rollback_action_id, actor, reason, scenario_id) "
+                    "VALUES (%s,%s,%s,%s,%s,%s)", [uuid4(), action_id, aid, pr.user, reason, sid])
         conn.commit()
         return ActionResult(aid, c.changed, "rollback", c.before, c.after, seq, c.created, "executed", rdiff, [])
 
@@ -977,7 +1134,7 @@ def rollback(conn, action_id: UUID, principal, reason: str | None = None, *, val
     except PermissionDenied as e:
         if source in DENY_AUDIT_SOURCES:
             _audit_denied(conn, model, pr, "rollback", {"original_action_id": str(action_id), "reason": reason},
-                          vt, source, run_id, None, tool_trace, e.detail)
+                          vt, source, run_id, None, tool_trace, e.detail, sid=sid)
         else:
             _safe_rollback(conn)
         raise
