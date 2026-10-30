@@ -8,9 +8,19 @@ CREATE TABLE IF NOT EXISTS ontology_version (
     yaml text NOT NULL,
     created_by text NOT NULL,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    source text NOT NULL CHECK (source IN ('startup', 'proposal', 'rollback')),
+    source text NOT NULL CHECK (source IN ('startup', 'proposal', 'rollback', 'import')),
     note text
 );
+-- Phase 6: a brand-new workspace schema starts with an 'import' version; widen the CHECK on existing schemas.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'ontology_version'::regclass
+                 AND conname = 'ontology_version_source_check' AND pg_get_constraintdef(oid) LIKE '%import%') THEN
+    ALTER TABLE ontology_version DROP CONSTRAINT IF EXISTS ontology_version_source_check;
+    ALTER TABLE ontology_version ADD CONSTRAINT ontology_version_source_check
+        CHECK (source IN ('startup', 'proposal', 'rollback', 'import'));
+  END IF;
+END $$;
 -- not UNIQUE: a rollback legitimately re-registers an older definition (see engine/versioning docstring)
 CREATE INDEX IF NOT EXISTS ontology_version_hash_idx ON ontology_version (hash);
 

@@ -77,6 +77,23 @@ def register_current(conn, yaml_text: str, by: str = "startup") -> dict:
     return _insert_version(conn, yaml_text, cur["hash"] if cur else None, by, "startup", None)
 
 
+def register_import(conn, yaml_text: str, by: str, note: str | None = None) -> dict:
+    """First version of a brand-new (workspace) schema, created by a dataset import (source 'import').
+
+    Only valid on a schema with no registered version (or idempotently when the latest version already is this
+    YAML); any later change must go through propose/decide. Never commits.
+    """
+    parse(yaml_text)  # validate
+    if not by or not isinstance(by, str):
+        raise VersioningError(422, "an importing actor is required")
+    cur = latest(conn)
+    if cur is not None:
+        if cur["hash"] == _hash(yaml_text):
+            return cur
+        raise VersioningError(409, "schema already has an ontology version; changes must go through propose/decide")
+    return _insert_version(conn, yaml_text, None, by, "import", note)
+
+
 def list_versions(conn, principal) -> list[dict]:
     _require_admin(principal)
     return _q(conn, "SELECT id, hash, parent_hash, created_by, created_at, source, note "

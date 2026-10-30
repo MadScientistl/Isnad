@@ -11,13 +11,20 @@ from .ddl import generate_base_ddl, generate_ddl, generate_policy_ddl
 from .rdf import owl_turtle, shacl_turtle
 from .codegen import pydantic_source, ts_source
 
-__all__ = ["compile_ontology", "CompiledOntology", "OntologyError", "write_outputs"]
+__all__ = ["compile_ontology", "CompiledOntology", "OntologyError", "write_outputs", "kpi_sql", "parse_kpi"]
+from .kpi import kpi_sql, parse_kpi  # noqa: E402
 
 
 @dataclass
 class CompiledOntology:
     model: Ontology
     yaml_text: str
+
+    @classmethod
+    def from_text(cls, yaml_text: str) -> "CompiledOntology":
+        """Parse + validate YAML text (size / node / alias bounds of the versioning parser apply)."""
+        from engine.versioning.diff import parse
+        return cls(parse(yaml_text), yaml_text)
 
     @property
     def hash(self) -> str:

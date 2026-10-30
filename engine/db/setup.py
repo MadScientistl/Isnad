@@ -7,6 +7,7 @@ import psycopg
 
 ROOT = Path(__file__).resolve().parents[2]
 GOVERNANCE_SQL = Path(__file__).with_name("governance.sql")
+INGEST_SQL = ROOT / "engine" / "ingest" / "schema.sql"
 BUILD_SCHEMA_SQL = ROOT / "build" / "schema.sql"
 
 
@@ -22,5 +23,6 @@ def apply_schema(conn: psycopg.Connection, schema_sql_text: str | None = None) -
     conn.execute(text)
     from engine import versioning
     versioning.apply(conn)
+    conn.execute(INGEST_SQL.read_text())
     from . import bitemporal
     bitemporal.clear_caches()

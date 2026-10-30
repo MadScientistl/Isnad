@@ -1,0 +1,18 @@
+version: 1
+namespace: https://example.org/bikes#
+objectTypes:
+  Zone:    {properties: {code: "string!", name: "string!", city: string}}
+  StationCluster: {properties: {code: "string!", name: "string!"}}
+  Station: {properties: {code: "string!", name: "string!", location: point, capacity: int}}
+  Bike:    {properties: {code: "string!", status: {enum: [available, in_use, maintenance, retired]}, model: {enum: [classic, electric]}, purchased_on: timestamp}}
+  Rider:   {properties: {code: "string!", full_name: string, plan: {enum: [casual, member, student]}, joined: timestamp}}
+  Trip:    {properties: {code: "string!", started_at: "timestamp!", ended_at: timestamp}}
+  Ticket:  {properties: {code: "string!", issue: {enum: [brakes, tyre, battery, chain, lock]}, severity: {enum: [low, medium, high]}, opened_at: timestamp, closed_at: timestamp}}
+linkTypes:
+  in_zone:     {from: StationCluster, to: Zone,    cardinality: many-to-one}
+  in_cluster:  {from: Station, to: StationCluster, cardinality: many-to-one}
+  starts_at:   {from: Trip, to: Station, cardinality: many-to-one}
+  ends_at:     {from: Trip, to: Station, cardinality: many-to-one}
+  ridden_bike: {from: Trip, to: Bike,    cardinality: many-to-one}
+  ridden_by:   {from: Trip, to: Rider,   cardinality: many-to-one}
+  ticket_for:  {from: Ticket, to: Bike,  cardinality: many-to-one}

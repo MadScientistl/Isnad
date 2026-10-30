@@ -1,0 +1,269 @@
+{
+ "dataset": "messy_supply",
+ "enums": {
+  "Invoice.status": {
+   "values": [
+    "open",
+    "approved",
+    "paid",
+    "flagged"
+   ]
+  },
+  "Port.region": {
+   "values": [
+    "APAC",
+    "EMEA",
+    "AMER"
+   ]
+  },
+  "Port.status": {
+   "values": [
+    "open",
+    "closed"
+   ]
+  },
+  "Shipment.status": {
+   "values": [
+    "planned",
+    "in_transit",
+    "delayed",
+    "arrived"
+   ]
+  },
+  "Warehouse.region": {
+   "values": [
+    "APAC",
+    "EMEA",
+    "AMER"
+   ]
+  }
+ },
+ "expected_rows": {
+  "Carrier": 8,
+  "Invoice": 3000,
+  "Port": 16,
+  "Shipment": 2500,
+  "Supplier": 40,
+  "Warehouse": 30
+ },
+ "links": {
+  "billed_by": {
+   "cardinality": "many-to-one",
+   "from": "Invoice",
+   "from_col": "supp_id",
+   "to": "Supplier"
+  },
+  "invoices_for": {
+   "cardinality": "many-to-one",
+   "from": "Invoice",
+   "from_col": "shipment_ref",
+   "to": "Shipment"
+  },
+  "operated_by": {
+   "cardinality": "many-to-one",
+   "from": "Shipment",
+   "from_col": "carrier_id",
+   "to": "Carrier"
+  },
+  "ships_from": {
+   "cardinality": "many-to-one",
+   "from": "Shipment",
+   "from_col": "origin_port",
+   "to": "Port"
+  },
+  "ships_to": {
+   "cardinality": "many-to-one",
+   "from": "Shipment",
+   "from_col": "dest_wh",
+   "to": "Warehouse"
+  },
+  "supplied_by": {
+   "cardinality": "many-to-one",
+   "from": "Shipment",
+   "from_col": "supplier",
+   "to": "Supplier"
+  }
+ },
+ "reference": "messy_supply.yaml",
+ "types": {
+  "Carrier": {
+   "denormalised": true,
+   "key": [
+    "carrier_id"
+   ],
+   "properties": {
+    "code": {
+     "column": "carrier_id",
+     "required": true,
+     "type": "string"
+    },
+    "name": {
+     "column": "Carrier Name",
+     "required": true,
+     "type": "string"
+    }
+   },
+   "table": "shipments"
+  },
+  "Invoice": {
+   "denormalised": false,
+   "key": [
+    "inv_no"
+   ],
+   "properties": {
+    "amount": {
+     "column": "Amount",
+     "required": false,
+     "type": "float"
+    },
+    "currency": {
+     "column": "ccy",
+     "required": false,
+     "type": "string"
+    },
+    "due": {
+     "column": "Due Date",
+     "required": false,
+     "type": "timestamp"
+    },
+    "ref": {
+     "column": "inv_no",
+     "required": true,
+     "type": "string"
+    },
+    "status": {
+     "column": "Status",
+     "required": false,
+     "type": "enum"
+    }
+   },
+   "table": "invoices"
+  },
+  "Port": {
+   "denormalised": false,
+   "geo": {
+    "lat": "lat",
+    "lon": "lon",
+    "property": "location"
+   },
+   "key": [
+    "port_code"
+   ],
+   "properties": {
+    "code": {
+     "column": "port_code",
+     "required": true,
+     "type": "string"
+    },
+    "name": {
+     "column": "Port Name",
+     "required": true,
+     "type": "string"
+    },
+    "region": {
+     "column": "Region",
+     "required": false,
+     "type": "enum"
+    },
+    "status": {
+     "column": "Status",
+     "required": false,
+     "type": "enum"
+    }
+   },
+   "table": "ports"
+  },
+  "Shipment": {
+   "denormalised": false,
+   "key": [
+    "ship_ref"
+   ],
+   "properties": {
+    "cargo_value": {
+     "column": "Cargo Val",
+     "required": false,
+     "type": "float"
+    },
+    "delay_hours": {
+     "column": "deley_hrs",
+     "required": false,
+     "type": "float"
+    },
+    "eta": {
+     "column": "ETA",
+     "required": false,
+     "type": "timestamp"
+    },
+    "ref": {
+     "column": "ship_ref",
+     "required": true,
+     "type": "string"
+    },
+    "status": {
+     "column": "status",
+     "required": false,
+     "type": "enum"
+    }
+   },
+   "table": "shipments"
+  },
+  "Supplier": {
+   "denormalised": false,
+   "key": [
+    "Supp ID"
+   ],
+   "properties": {
+    "code": {
+     "column": "Supp ID",
+     "required": true,
+     "type": "string"
+    },
+    "country": {
+     "column": "cntry",
+     "required": false,
+     "type": "string"
+    },
+    "name": {
+     "column": "SUPPLIER_NAME",
+     "required": true,
+     "type": "string"
+    },
+    "price_index": {
+     "column": "Price Idx",
+     "required": false,
+     "type": "float"
+    }
+   },
+   "table": "suppliers"
+  },
+  "Warehouse": {
+   "denormalised": false,
+   "geo": {
+    "lat": "latitude",
+    "lon": "longitude",
+    "property": "location"
+   },
+   "key": [
+    "wh_id"
+   ],
+   "properties": {
+    "code": {
+     "column": "wh_id",
+     "required": true,
+     "type": "string"
+    },
+    "name": {
+     "column": "WH Name",
+     "required": true,
+     "type": "string"
+    },
+    "region": {
+     "column": "reg",
+     "required": false,
+     "type": "enum"
+    }
+   },
+   "table": "warehouses"
+  }
+ }
+}

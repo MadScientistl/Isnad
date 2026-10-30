@@ -1,0 +1,286 @@
+{
+ "dataset": "bikeshare",
+ "enums": {
+  "Bike.model": {
+   "values": [
+    "classic",
+    "electric"
+   ]
+  },
+  "Bike.status": {
+   "values": [
+    "available",
+    "in_use",
+    "maintenance",
+    "retired"
+   ]
+  },
+  "Rider.plan": {
+   "values": [
+    "casual",
+    "member",
+    "student"
+   ]
+  },
+  "Ticket.issue": {
+   "values": [
+    "brakes",
+    "tyre",
+    "battery",
+    "chain",
+    "lock"
+   ]
+  },
+  "Ticket.severity": {
+   "values": [
+    "low",
+    "medium",
+    "high"
+   ]
+  }
+ },
+ "expected_rows": {
+  "Bike": 300,
+  "Rider": 800,
+  "Station": 60,
+  "StationCluster": 6,
+  "Ticket": 400,
+  "Trip": 3000,
+  "Zone": 3
+ },
+ "links": {
+  "ends_at": {
+   "cardinality": "many-to-one",
+   "from": "Trip",
+   "from_col": "end_station_id",
+   "to": "Station"
+  },
+  "in_cluster": {
+   "cardinality": "many-to-one",
+   "from": "Station",
+   "from_col": "cluster_id",
+   "to": "StationCluster"
+  },
+  "in_zone": {
+   "cardinality": "many-to-one",
+   "from": "StationCluster",
+   "from_col": "zone_id",
+   "to": "Zone"
+  },
+  "ridden_bike": {
+   "cardinality": "many-to-one",
+   "from": "Trip",
+   "from_col": "bike_id",
+   "to": "Bike"
+  },
+  "ridden_by": {
+   "cardinality": "many-to-one",
+   "from": "Trip",
+   "from_col": "rider_id",
+   "to": "Rider"
+  },
+  "starts_at": {
+   "cardinality": "many-to-one",
+   "from": "Trip",
+   "from_col": "start_station_id",
+   "to": "Station"
+  },
+  "ticket_for": {
+   "cardinality": "many-to-one",
+   "from": "Ticket",
+   "from_col": "bike_id",
+   "to": "Bike"
+  }
+ },
+ "reference": "bikeshare.yaml",
+ "types": {
+  "Bike": {
+   "denormalised": false,
+   "key": [
+    "bike_id"
+   ],
+   "properties": {
+    "code": {
+     "column": "bike_id",
+     "required": true,
+     "type": "string"
+    },
+    "model": {
+     "column": "model",
+     "required": false,
+     "type": "enum"
+    },
+    "purchased_on": {
+     "column": "purchased_on",
+     "required": false,
+     "type": "timestamp"
+    },
+    "status": {
+     "column": "status",
+     "required": false,
+     "type": "enum"
+    }
+   },
+   "table": "bikes"
+  },
+  "Rider": {
+   "denormalised": false,
+   "key": [
+    "rider_id"
+   ],
+   "properties": {
+    "code": {
+     "column": "rider_id",
+     "required": true,
+     "type": "string"
+    },
+    "full_name": {
+     "column": "full_name",
+     "required": false,
+     "type": "string"
+    },
+    "joined": {
+     "column": "joined",
+     "required": false,
+     "type": "timestamp"
+    },
+    "plan": {
+     "column": "plan",
+     "required": false,
+     "type": "enum"
+    }
+   },
+   "table": "riders"
+  },
+  "Station": {
+   "denormalised": false,
+   "geo": {
+    "lat": "lat",
+    "lon": "lon",
+    "property": "location"
+   },
+   "key": [
+    "station_id"
+   ],
+   "properties": {
+    "capacity": {
+     "column": "capacity",
+     "required": false,
+     "type": "int"
+    },
+    "code": {
+     "column": "station_id",
+     "required": true,
+     "type": "string"
+    },
+    "name": {
+     "column": "name",
+     "required": true,
+     "type": "string"
+    }
+   },
+   "table": "stations"
+  },
+  "StationCluster": {
+   "denormalised": false,
+   "key": [
+    "cluster_id"
+   ],
+   "properties": {
+    "code": {
+     "column": "cluster_id",
+     "required": true,
+     "type": "string"
+    },
+    "name": {
+     "column": "cluster_name",
+     "required": true,
+     "type": "string"
+    }
+   },
+   "table": "clusters"
+  },
+  "Ticket": {
+   "denormalised": false,
+   "key": [
+    "ticket_id"
+   ],
+   "properties": {
+    "closed_at": {
+     "column": "closed_at",
+     "required": false,
+     "type": "timestamp"
+    },
+    "code": {
+     "column": "ticket_id",
+     "required": true,
+     "type": "string"
+    },
+    "issue": {
+     "column": "issue",
+     "required": false,
+     "type": "enum"
+    },
+    "opened_at": {
+     "column": "opened_at",
+     "required": false,
+     "type": "timestamp"
+    },
+    "severity": {
+     "column": "severity",
+     "required": false,
+     "type": "enum"
+    }
+   },
+   "table": "maintenance"
+  },
+  "Trip": {
+   "denormalised": false,
+   "key": [
+    "trip_id"
+   ],
+   "properties": {
+    "code": {
+     "column": "trip_id",
+     "required": true,
+     "type": "string"
+    },
+    "ended_at": {
+     "column": "ended_at",
+     "required": false,
+     "type": "timestamp"
+    },
+    "started_at": {
+     "column": "started_at",
+     "required": true,
+     "type": "timestamp"
+    }
+   },
+   "table": "trips"
+  },
+  "Zone": {
+   "denormalised": false,
+   "key": [
+    "zone_id"
+   ],
+   "properties": {
+    "city": {
+     "column": "city",
+     "required": false,
+     "type": "string"
+    },
+    "code": {
+     "column": "zone_id",
+     "required": true,
+     "type": "string"
+    },
+    "name": {
+     "column": "zone_name",
+     "required": true,
+     "type": "string"
+    }
+   },
+   "table": "zones"
+  }
+ }
+}

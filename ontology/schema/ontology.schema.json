@@ -13,6 +13,11 @@
       "type": "integer",
       "minimum": 1
     },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80
+    },
     "namespace": {
       "type": "string",
       "pattern": "^https?://.*[#/]$"
@@ -65,6 +70,36 @@
                       "uniqueItems": true
                     },
                     "required": {
+                      "type": "boolean"
+                    },
+                    "volatile": {
+                      "type": "boolean"
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "type"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "string",
+                        "int",
+                        "float",
+                        "bool",
+                        "timestamp",
+                        "point",
+                        "linestring"
+                      ]
+                    },
+                    "required": {
+                      "type": "boolean"
+                    },
+                    "volatile": {
                       "type": "boolean"
                     }
                   }
@@ -530,6 +565,42 @@
             },
             "uniqueItems": true
           }
+        }
+      }
+    },
+    "kpis": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]{0,63}$"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "expr"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "expr": {
+            "type": "string",
+            "maxLength": 2000
+          }
+        }
+      }
+    },
+    "sim": {
+      "type": "object",
+      "required": [
+        "module"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "module": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$"
         }
       }
     }
