@@ -281,3 +281,77 @@ Findings H1, M1-M6, L1, L2, L4-L6 of the Phase 5 security review. Interfaces bel
 - L3: the what-if simulation builds its world from the full effective state and runs as the scenario owner (loader path with the scenario GUCs, `source='sim'`); the new guards confine its writes to its scenario, but it is not filtered per user.
 - Scenarios are snapshots (see above); `x-role` remains a non-secret header; `audit_event.tool_trace` of merge replays holds an object (`origin`), not a list of tool calls.
 - Lazy expiry and the build semaphore are per process; a multi-worker deployment would need a shared janitor.
+
+# Phase 6 contracts (owned by the main session; frozen before implementation)
+
+Decisions (user approved the plan and said "do all"): W1 one workspace = one Postgres schema `ws_<slug>` + one YAML + one API process (no multi-ontology process); W2 minimal real auth (`ISNAD_AUTH=1`, signed bearer tokens; the role switcher stays for dev when unset); W3 sources: CSV/TSV/zip upload, SQLite file, PostgreSQL named read-only source; W4 interfaces map to `classes`; W5 no Anthropic key available yet: quality is measured with recorded proposals (cassettes) and a heuristic baseline and labelled unverified until a live run exists; W6 generated ontologies use declarative `rules:` plus the five generic actions only (no `functions:`, no custom handlers).
+
+## Layout
+`engine/ingest/` (package; `profile/`, `sources/`, `validate.py`, `importer.py`, `proposal.py`, `schema.sql`), `engine/api/ingest_routes.py` (router, mounted by main), `agent/ontogen/`, `evals/ontogen/`, `workspaces/<slug>/{ontology.yaml,mapping.json,import_report.json}` (gitignored except the demo fixtures), `web/src/pages/Ontology*.tsx`.
+
+## Identifiers (safety rule shared by all code)
+`engine.ingest.names.safe_prop(s) -> str` (`[a-z][a-z0-9_]{0,40}`), `safe_type(s)` (`[A-Z][A-Za-z0-9]{0,40}`), `safe_link(s)` (`[a-z][a-z0-9_]{0,40}`): NFKD ASCII fold, strip control chars, non-alnum -> `_`, leading digit gets a prefix, reserved words (SQL keywords, `id`, `valid_during`, `recorded_during`, `changed_by`, `action_id`, `scenario_id`, `src`, `dst`) get a suffix, collisions get `_2`. Every identifier in generated YAML and DDL passes through these; the original text is stored only as data (`label`).
+
+## Profile (`engine.ingest.profile.profile_source(source, *, caps, seed=1) -> Profile`, JSON-serialisable)
+```
+Profile {
+  version: 1, source: {kind: "csv"|"sqlite"|"postgres", name: str, sha256: str, bytes: int|null},
+  caps: {max_tables, max_columns, max_rows_profiled, max_sample, top_k}, truncated: bool, seed: int,
+  tables: [Table], fks: [FK], warnings: [str]
+}
+Table { id: "t1", name: str (original, data), ident: str (safe_type), rows: int, sampled_rows: int,
+  columns: [Column], key_candidates: [[col_id,...]]  (<=2 columns; unique and non-null in the profiled rows),
+  is_join_table: bool }
+Column { id: "t1.c3", name: str (original, data), ident: str (safe_prop), type: "int"|"float"|"bool"|"timestamp"|"string"|"geojson",
+  null_rate: float, distinct: int, unique: bool, min: str|null, max: str|null, top: [[value<=80 chars, count]] (<=top_k),
+  enum_candidate: [str]|null (distinct <= 20 and distinct/rows <= 0.2), format: str|null (e.g. "iso8601", "dd/mm/yyyy"),
+  geo: {role:"lat"|"lon"|"point"|"wkt"|"geojson", pair: col_id|null}|null, time: bool, notes: [str] }
+FK { id: "f1", from: "t2.c1", to: "t1.c1", declared: bool, containment: float (share of non-null from-values found in to),
+  name_score: float, confidence: float (0..1), cardinality: "many-to-one"|"one-to-one", orphans: int }
+```
+All strings that originate in the data (names, values) are untrusted. The profiler never executes data content. `profile_hash = sha256(canonical json)`.
+Heuristic baseline: `engine.ingest.profile.baseline_proposal(profile) -> Proposal` (below), no LLM.
+
+## Proposal (`engine/ingest/proposal.py`; the model emits JSON, validated by `Proposal.model_validate`)
+```
+Proposal {
+  version: 1, profile_hash: str, namespace: str (derived server side, never model-chosen),
+  objectTypes: [{name, label, extends: str|null, key: [col_id,...], source_table: "t1",
+    properties: [{name, type: <ontology type|{enum:[..]}>, required: bool, column: col_id|null,
+                  transform: "none"|"int"|"float"|"bool"|"timestamp:<fmt>"|"enum_map:<json map>"|"point(lat_col,lon_col)"|"geojson", label}]}],
+  linkTypes: [{name, from, to, cardinality, inverse: str|null, transitive: bool, required: bool,
+    source: {kind:"fk", from_col: col_id, to_type_key: col_id} | {kind:"join_table", table: "t3", src_col: col_id, dst_col: col_id}}],
+  classes: [{name, extends: str|null}],
+  actions: [{name, description, kind:"update_props"|"set_status"|"link"|"unlink", type: str, params: {...}}]   // compiled to declarative rules by engine.ingest.proposal.to_yaml
+  roles: [{name, description, access: "read"|"write"|"admin"}]                                                  // expanded from a fixed template
+  rationale: str, notes: [str]
+}
+```
+`to_yaml(proposal, profile) -> (yaml_text, mapping)` is the only producer of YAML and is deterministic. Roles are template-expanded: `admin` always (types all, links all, actions all, approves all); other roles are `read` (read all, no actions) or `write` (read all, listed generic + declared actions, no approvals); no masks/row filters are generated. Object ids are `uuid5(NAMESPACE_URL, f"{namespace}{Type}/{key values joined by \x1f}")`. `mapping.json` = `{version:1, profile_hash, source, types:{Type:{table, key_cols, columns:{prop:{col, transform}}}}, links:{link:{...}}}`.
+
+## Validation (`engine.ingest.validate.validate(profile, proposal, source, *, caps) -> ValidationReport`)
+Runs only in scratch schema `gen_<8 hex>` (dropped in `finally`; stale ones swept by age). Checks and thresholds (defaults, env-overridable): `schema_ok`, `ddl_ok`, `key_violations == 0`, `required_null_rate <= 0.0` on required props (or the model must relax `required`), `type_coercion_fail_rate <= 0.02`, `enum_violation_rate <= 0.02`, `link_resolution >= 0.95` per link, `shacl_conforms`, `reasoner_consistent` (materialize completes, inferred triples <= 50x asserted). `ValidationReport {ok: bool, checks: [{name, ok, value, threshold, detail, examples: [<=3 sanitised]}], stats: {rows_loaded:{Type:n}, links_loaded:{l:n}}, seconds}`.
+
+## Ingest tables (host schema, append-only, FORCE RLS, admin only; `engine/ingest/schema.sql`, applied from `apply_schema`)
+`ingest_session(id uuid pk, created_by, created_at, source_kind, source_name, source_sha256, profile jsonb, profile_hash)`, `ingest_proposal(id uuid pk, session_id, seq int, parent_id uuid null, proposal jsonb, yaml text, mapping jsonb, validation jsonb, model text, cost_usd numeric, created_by, created_at, kind 'baseline'|'model'|'repair'|'edit')`, `ingest_decision(id uuid pk, proposal_id, decision 'approved'|'rejected', items jsonb (per item accept/reject/edit), comment, approver, approver_role, at, workspace text null, import_action_id uuid null)`. Source bytes are stored under `ISNAD_INGEST_DIR` (default `var/ingest/<session>/`) with a sha256; the profile and import always re-read these stored bytes (tamper check: hash must match at import).
+
+## Import (`engine.ingest.importer.run_import(conn_factory, decision_id, principal) -> ImportResult`)
+Preconditions: decision approved by an admin who is not the session creator (when auth is on), validation of the FINAL yaml+mapping re-run and ok, source hash matches. Steps in one owner transaction in the new schema `ws_<slug>`: create schema, `apply_schema`, `register_current(..., source='import')`, `bt.bulk_load_objects/links` with deterministic ids and one shared `action_id`, endpoint pre-check (unresolved links dropped and counted, never silently), ONE `audit_event(name='import_dataset', source='import', role='owner', actor=<approver>, params={counts, source_sha256, profile_hash, ontology_hash, proposal_id, decision_id, dropped_links})`, then write `workspaces/<slug>/`. Idempotent: same decision + same ids re-run is a no-op (`already_imported`). Cleans up the schema on failure. Exact row counts are in `ImportResult` and `import_report.json`.
+
+## API (admin only, 404 for others; all behind `Principal`; body limit for upload `ISNAD_MAX_UPLOAD_BYTES` default 20 MiB, raw body, no multipart dependency)
+`POST /ingest/uploads?filename=` (raw body; csv/tsv/zip/sqlite) -> 201 `{session_id, profile_summary}`; `GET /ingest/sources` -> named SQL sources `[name, kind]` (no DSNs); `POST /ingest/sources/{name}/profile` -> 201 `{session_id, ...}`; `GET /ingest/sessions[/{id}]` -> session, profile, proposals; `POST /ingest/sessions/{id}/proposals {mode:"baseline"|"model"}` -> 202 `{job_id}` (model needs a key, else 503 `agent_unavailable`; baseline always works); `GET /ingest/jobs/{id}` (+ SSE `/stream`) -> `{status, events, proposal_id, cost_usd}`; `POST /ingest/proposals/{id}/repair` -> 202; `PATCH /ingest/proposals/{id}/items {items:[{path, action:"accept"|"reject"|"edit", value?}]}` -> 201 new proposal `kind='edit'` (re-validated); `GET /ingest/proposals/{id}` -> `{proposal, yaml, mapping, validation, diff}` (diff against empty or against an existing workspace ontology via `engine.versioning.diff`); `POST /ingest/proposals/{id}/approve {comment}` -> 201 decision (needs comment when `sensitive` entries); `POST /ingest/decisions/{id}/import` -> 202 `{job_id}`; `GET /workspaces` -> `[{slug, schema, ontology_hash, imported_at, rows, api_base|null}]`.
+Caps (env): `ISNAD_INGEST_MAX_TABLES` 50, `_MAX_COLUMNS` 60 per table, `_MAX_ROWS_PROFILED` 200000, `_MAX_SAMPLE` 5000, `_MAX_ZIP_MEMBERS` 100, `_MAX_ZIP_RATIO` 50, `ISNAD_INGEST_SESSIONS_PER_USER` 10, generator model: 8 turns, 30000 output tokens, USD 1.00 per proposal, 3 repair rounds (max 5), daily USD cap shared with `ISNAD_AGENT_DAILY_USD`.
+Named SQL sources: `ISNAD_IMPORT_SOURCES="name=postgresql://..."` or `name=sqlite:/abs/path` (server side only).
+
+## Generator agent (`agent/ontogen/`)
+Tools: `get_profile(table_id)`, `get_samples(column_id, k<=10)`, `check_proposal(proposal)` (validation in scratch schema, result envelope), `submit_proposal(proposal)` (terminal). Tool results use the existing untrusted envelope; `injection.scan` runs on every data string; data strings are truncated (names 64, values 80), control chars stripped, and are never placed in the system prompt. The model sees column ids, not raw SQL or file paths. No other tools. Mock model: `agent.mock_model.MockModel` with cassettes under `evals/ontogen/cassettes/`.
+
+## Generalisation contract (workspace processes)
+- `create_app(ontology_path, schema, ...)` stays one-ontology; everything that used supply-chain defaults takes them from the loaded `Ontology`: namespace, link semantics, shapes/ttl paths per workspace (`build/` for the default, `workspaces/<slug>/build/` otherwise), agent prompt name (`ontology.name` or namespace host), `GEO_TYPES` = object types with a point/linestring property, `/stats/summary` generic shape `{as_of, counts:{Type:n}, enums:{Type:{prop:{value:n}}}, kpis:{...}}` (the legacy keys stay for the supply-chain ontology: its YAML declares `kpis:`), `/sim/*` returns 404 `{code:'sim_unavailable'}` when the ontology has no `sim:` block. YAML additions: top-level `name`, `kpis: {<key>: {description, sql|expr}}` (declarative, compiled, no raw SQL from generated ontologies), `sim: {module: sim.world}` (supply chain only), per-property `volatile: true`.
+- `GET /types` returns, per type: properties with types/enums, `geo: bool`, `volatile`, links in/out; the UI builds its pages from this, not from `@sdk/client` constants (`SELECTABLE_ROLES`, `ACTION_META` come from `/roles` and `/actions`).
+
+## Auth (W2; `engine/auth/`, wired into `get_principal`)
+`ISNAD_AUTH=1` enables it; `ISNAD_AUTH_SECRET` (required, >= 32 bytes) signs tokens; users from `ISNAD_USERS_FILE` (JSON `{"users":[{"user":"alice","role":"planner","password_hash":"scrypt$..."}]}`; `python -m engine.auth hash` helper). `POST /auth/login {user,password}` -> `{token, user, role, expires_at}` (HMAC-SHA256 signed `v1.<b64 payload>.<sig>`, TTL `ISNAD_AUTH_TTL_H` 12, constant-time compare, per-IP and per-user login rate limit); `Authorization: Bearer`. With auth on, `x-role` is ignored (never trusted), `user` is the token's user (so launcher/approver separation is real), a role not matching a known role is refused, `sim` can never be logged in. With auth off (default) behaviour is unchanged (dev role switcher). `/ingest/*` and `/ontology/*` additionally require `ISNAD_ALLOW_IMPORT=1` when auth is off.
+
+## Docs/polish contract
+README.md (architecture diagram as Mermaid + ASCII fallback), `scripts/setup.sh` (idempotent: docker compose up, wait healthy, `uv sync`, compile, seed, print URLs) and `scripts/dev.sh` (API + UI), `scripts/demo_phase6.py` (mock model default, `--live`), `workspaces/` demo fixtures `evals/ontogen/datasets/{bikeshare,messy_supply,injection}/`.
