@@ -28,13 +28,17 @@ Outcome: an organisation can let agents investigate and recommend at machine spe
 
 Amarh is a simulated, local-first reference platform, not a production deployment. Known limits (no real login, view-level masking, trusted identity settings inside a scoped session, no live Claude API run yet) are in `docs/contracts.md`.
 
-## Fit with a central data platform
+## Fit with HUMAIN Fabric
 
-Assumption: a central data platform (a governed lakehouse/fabric with catalog, pipelines and identity) is the enterprise's system of record for raw data. Amarh does not replace it; it adds a meaning, permission and action layer on top.
+HUMAIN Fabric is described in press releases and marketplace listings as HUMAIN's AI-native unified data platform, built with MinIO: it ingests, processes and governs enterprise data from any cloud or on-premises source, serves it as agent-ready assets over MCP, and is the data and memory foundation of the HUMAIN AI Stack, including HUMAIN ONE, an agentic operating system for functions such as HR, finance and procurement ([MinIO partnership](https://www.storagenewsletter.com/?p=305021), [AWS Marketplace](https://aws.amazon.com/marketplace/pp/prodview-hlybez5nfcjng), [HUMAIN ONE](https://www.hpcwire.com/aiwire/2026/05/04/humain-expands-aws-collaboration-with-humain-one-enterprise-ai-operating-system/)). These are self-reported; I have not seen Fabric's technical documentation.
 
-- **Read path:** platform tables are mapped by the YAML ontology into typed objects and links (Postgres, bitemporal, row-level security), then into the semantic graph for reasoning.
-- **Write path:** agents only propose. An approved action runs in one transaction, is audited, and leaves through the outbox as a webhook or API call to the source system or platform.
-- **Identity:** platform SSO groups would map to Amarh roles, replacing the non-secret `x-role` header.
-- **Governance:** platform lineage and classification can feed masking and row rules; Amarh adds per-edge filtering and audit.
+Proposed fit (a design, not an integration that exists):
 
-Not built yet: a connector to a real data platform, SSO, and a live Claude API run. Today Amarh runs on simulated data.
+- **Layering:** Fabric is the governed data and memory foundation. Amarh sits on top as the ontology and action layer: shared meaning, multi-hop reasoning, bitemporal history, role-scoped permissions, and propose-approve-execute with audit.
+- **Read path:** Fabric assets are mapped by the YAML ontology (or pulled over MCP) into typed objects and links in Postgres, then into the semantic graph.
+- **Write path:** approved actions leave through the outbox as webhooks or API calls to the system of record or Fabric. Agents never write directly into Fabric.
+- **MCP both ways:** Amarh would consume Fabric's MCP data, and expose its own tools (query, traverse, propose) as MCP so other agents, such as HUMAIN ONE's, can use them under the same permissions.
+- **Identity and governance:** enterprise SSO groups map to Amarh roles; Fabric governance and classification feed masking and row rules; Amarh adds per-edge filtering and audit.
+- **Value for HUMAIN ONE:** automation of business functions gains shared meaning, indirect-impact analysis, history and an approval trail.
+
+Not built: a Fabric connector, an MCP client or server, SSO, and a live Claude API run. Today Amarh runs on simulated data.

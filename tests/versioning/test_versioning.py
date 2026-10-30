@@ -11,7 +11,8 @@ from engine.compiler.model import OntologyError
 from engine.db import Principal
 from engine.db.principal import scoped
 
-from conftest import BASE_YAML
+from pathlib import Path
+BASE_YAML = (Path(__file__).resolve().parents[2] / "ontology" / "supply_chain.yaml").read_text()
 
 ADMIN = Principal("admin", "adam")
 PLANNER = Principal("planner", "pat")
