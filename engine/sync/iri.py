@@ -7,15 +7,15 @@ DEFAULT_NS = "https://example.org/sc#"
 RDF_TYPE = NamedNode("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
 
 # Named graphs. Asserted = what Postgres says; inferred = reasoner output only.
-G_ASSERTED = NamedNode("urn:amarh:g:asserted")
-G_INFERRED = NamedNode("urn:amarh:g:inferred")
-G_ONTOLOGY = NamedNode("urn:amarh:g:ontology")
-G_META = NamedNode("urn:amarh:g:meta")
-SYNC_SUBJ = NamedNode("urn:amarh:sync")
-LAST_SEQ = NamedNode("urn:amarh:lastSeq")
-DATA_VERSION = NamedNode("urn:amarh:dataVersion")
-INFERRED_FLAG = NamedNode("urn:amarh:isInferredGraph")
-DERIVED_BY = NamedNode("urn:amarh:derivedBy")
+G_ASSERTED = NamedNode("urn:isnad:g:asserted")
+G_INFERRED = NamedNode("urn:isnad:g:inferred")
+G_ONTOLOGY = NamedNode("urn:isnad:g:ontology")
+G_META = NamedNode("urn:isnad:g:meta")
+SYNC_SUBJ = NamedNode("urn:isnad:sync")
+LAST_SEQ = NamedNode("urn:isnad:lastSeq")
+DATA_VERSION = NamedNode("urn:isnad:dataVersion")
+INFERRED_FLAG = NamedNode("urn:isnad:isInferredGraph")
+DERIVED_BY = NamedNode("urn:isnad:derivedBy")
 
 
 def obj_iri(ns: str, id) -> NamedNode:

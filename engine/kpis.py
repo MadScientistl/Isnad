@@ -54,7 +54,7 @@ def _scope(conn, principal, sid: int):
         ctx = scenario_admin.ctx_of(conn, sid)
     with conn.transaction():
         with scoped(conn, principal, ctx):
-            if sid and not conn.execute("SELECT amarh_scenario_visible(%s)", [sid]).fetchone()[0]:
+            if sid and not conn.execute("SELECT isnad_scenario_visible(%s)", [sid]).fetchone()[0]:
                 raise LookupError(f"scenario {sid} not found")
             yield
 

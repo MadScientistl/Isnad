@@ -40,7 +40,7 @@ from engine.sync import visibility as V
 from .injection import scan
 from .policy import PolicyDenied, allowed_actions, check_action, check_tool
 
-log = logging.getLogger("amarh.agent")
+log = logging.getLogger("isnad.agent")
 
 MAX_STR = 300            # database strings are capped to this many characters
 MAX_DATA_CHARS = 16_000  # serialised `data` budget per tool result (~4k tokens)

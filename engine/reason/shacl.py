@@ -87,7 +87,7 @@ def pg_props_loader(conn, types: Iterable[str], ns: str = iri.DEFAULT_NS,
         quads = []
         for t in types:
             if scenario is not None:
-                got = conn.execute("SELECT current_setting('amarh.scenario', true)").fetchone()[0]
+                got = conn.execute("SELECT current_setting('isnad.scenario', true)").fetchone()[0]
                 if str(got or "") != str(scenario.id):
                     raise PermissionError("connection is not scoped to this scenario")
             cur = conn.execute(sql.SQL("SELECT * FROM {} WHERE id = ANY(%s)").format(

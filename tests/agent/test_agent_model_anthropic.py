@@ -40,9 +40,9 @@ def test_requires_env_key(monkeypatch):
 
 def test_default_and_env_model(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
-    monkeypatch.delenv("AMARH_AGENT_MODEL", raising=False)
+    monkeypatch.delenv("ISNAD_AGENT_MODEL", raising=False)
     assert AnthropicModel().name == DEFAULT_MODEL == "claude-sonnet-5-5"
-    monkeypatch.setenv("AMARH_AGENT_MODEL", "claude-opus-5-5")
+    monkeypatch.setenv("ISNAD_AGENT_MODEL", "claude-opus-5-5")
     assert AnthropicModel().name == "claude-opus-5-5"
 
 

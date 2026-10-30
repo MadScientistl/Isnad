@@ -54,7 +54,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [scenario, scnTick, setScenario]);
   useEffect(() => {
     const f = (e: Event) => { const id = (e as CustomEvent<number>).detail; if (id === scenario) { setScenario(null); toast("The active scenario no longer exists or is not visible to you; back on main", undefined, "warn"); } };
-    addEventListener("amarh-scenario-gone", f); return () => removeEventListener("amarh-scenario-gone", f);
+    addEventListener("isnad-scenario-gone", f); return () => removeEventListener("isnad-scenario-gone", f);
   }, [scenario, setScenario]);
   const refreshScenario = useCallback(() => setScnTick((n) => n + 1), []);
   const v = useMemo(() => ({ role, setRole, me, meError, asOf, setAsOf, asOfQ, sim, simError, setSim, scenario, scenarioInfo, setScenario, refreshScenario }), [role, setRole, me, meError, asOf, asOfQ, sim, simError, scenario, scenarioInfo, setScenario, refreshScenario]);
@@ -94,4 +94,4 @@ export const fmtT = (iso: string | Date | null | undefined) => {
 /** Tiny toast bus: toast(message, href?) shows a transient notice with an optional link. */
 export interface ToastMsg { id: number; text: string; href?: string; kind: "ok" | "warn" | "err" }
 let tid = 0;
-export const toast = (text: string, href?: string, kind: ToastMsg["kind"] = "ok") => window.dispatchEvent(new CustomEvent("amarh-toast", { detail: { id: ++tid, text, href, kind } }));
+export const toast = (text: string, href?: string, kind: ToastMsg["kind"] = "ok") => window.dispatchEvent(new CustomEvent("isnad-toast", { detail: { id: ++tid, text, href, kind } }));

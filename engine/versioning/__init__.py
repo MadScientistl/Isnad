@@ -140,7 +140,7 @@ def decide(conn, principal, proposal_id, approve: bool, comment: str = "", *, wr
     """Approve or reject. Approval of a breaking or stale proposal fails (nothing is recorded).
 
     Returns {decision, version, yaml, notes}. The YAML file is written only when `write_path` is given.
-    Review L5: the proposer cannot approve their own proposal (dev override: AMARH_ONTOLOGY_SELF_APPROVE=1);
+    Review L5: the proposer cannot approve their own proposal (dev override: ISNAD_ONTOLOGY_SELF_APPROVE=1);
     approving a proposal whose diff widens permissions of existing roles/actions (`sensitive`) needs a comment.
     """
     _require_admin(principal)
@@ -149,7 +149,7 @@ def decide(conn, principal, proposal_id, approve: bool, comment: str = "", *, wr
     p = get_proposal(conn, principal, proposal_id)
     if p["decision"] is not None:
         raise VersioningError(409, f"proposal already {p['decision']}")
-    if approve and p["proposer"] == principal.user and os.environ.get("AMARH_ONTOLOGY_SELF_APPROVE") != "1":
+    if approve and p["proposer"] == principal.user and os.environ.get("ISNAD_ONTOLOGY_SELF_APPROVE") != "1":
         raise VersioningError(403, "the proposer cannot approve their own ontology proposal")
     if not approve:
         _q(conn, "INSERT INTO ontology_change_decision (proposal_id, decision, approver, comment) "

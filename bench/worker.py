@@ -61,10 +61,10 @@ def stage_materialize(a):
             "dropped_non_instance": r.dropped_non_instance, "phases": r.phases, "peak_rss_mb": rss_mb()}
 
 
-Q_FIXED = "SELECT (COUNT(DISTINCT ?o) AS ?n) WHERE {{ GRAPH <urn:amarh:g:asserted> {{ <{s}> sc:supplies/sc:supplies/sc:supplies/sc:supplies ?o }} }}"
-Q_PLUS = "SELECT (COUNT(DISTINCT ?o) AS ?n) WHERE {{ GRAPH <urn:amarh:g:asserted> {{ <{s}> sc:supplies+ ?o }} }}"
-Q_MIXED = "SELECT (COUNT(DISTINCT ?o) AS ?n) WHERE {{ GRAPH <urn:amarh:g:asserted> {{ <{s}> sc:ships_via/^sc:ships_via/sc:operated_by/^sc:operated_by ?o }} }}"
-Q_INF = "SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH <urn:amarh:g:inferred> {{ <{s}> sc:supplies ?o }} }}"
+Q_FIXED = "SELECT (COUNT(DISTINCT ?o) AS ?n) WHERE {{ GRAPH <urn:isnad:g:asserted> {{ <{s}> sc:supplies/sc:supplies/sc:supplies/sc:supplies ?o }} }}"
+Q_PLUS = "SELECT (COUNT(DISTINCT ?o) AS ?n) WHERE {{ GRAPH <urn:isnad:g:asserted> {{ <{s}> sc:supplies+ ?o }} }}"
+Q_MIXED = "SELECT (COUNT(DISTINCT ?o) AS ?n) WHERE {{ GRAPH <urn:isnad:g:asserted> {{ <{s}> sc:ships_via/^sc:ships_via/sc:operated_by/^sc:operated_by ?o }} }}"
+Q_INF = "SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH <urn:isnad:g:inferred> {{ <{s}> sc:supplies ?o }} }}"
 PFX = "PREFIX sc: <https://example.org/sc#>\n"
 
 
@@ -79,9 +79,9 @@ def stage_queries(a):
     st = open_store(a.store)
     rnd = random.Random(a.seed)
     sup_starts = sorted({r["s"].value for r in st.query(
-        PFX + "SELECT DISTINCT ?s WHERE { GRAPH <urn:amarh:g:asserted> { ?s sc:supplies ?o } }")})
+        PFX + "SELECT DISTINCT ?s WHERE { GRAPH <urn:isnad:g:asserted> { ?s sc:supplies ?o } }")})
     ship_starts = sorted({r["s"].value for r in st.query(
-        PFX + "SELECT DISTINCT ?s WHERE { GRAPH <urn:amarh:g:asserted> { ?s sc:operated_by ?o } } LIMIT 5000")})
+        PFX + "SELECT DISTINCT ?s WHERE { GRAPH <urn:isnad:g:asserted> { ?s sc:operated_by ?o } } LIMIT 5000")})
     n = a.n_starts
     out = {"open_s": time.perf_counter() - t_open}
     sets = {"fixed_4hop": (Q_FIXED, rnd.sample(sup_starts, n)), "plus_transitive": (Q_PLUS, rnd.sample(sup_starts, n)),
@@ -104,7 +104,7 @@ def stage_shacl(a):
     st = open_store(a.store)
     rnd = random.Random(a.seed)
     ships = sorted({r["s"].value.rsplit("/", 1)[1] for r in st.query(
-        PFX + "SELECT DISTINCT ?s WHERE { GRAPH <urn:amarh:g:asserted> { ?s sc:operated_by ?o } }")})
+        PFX + "SELECT DISTINCT ?s WHERE { GRAPH <urn:isnad:g:asserted> { ?s sc:operated_by ?o } }")})
     changed = [UUID(x) for x in rnd.sample(ships, min(a.shacl_ships, len(ships)))]
     loader = pg_props_loader(conn, ["Shipment", "Port", "Carrier"])
     clean = validate_changed(st, changed, NS, loader)

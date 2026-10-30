@@ -40,7 +40,7 @@ _ontology_cache: dict[str, Any] = {}
 
 
 # ------------------------------------------------------------------- errors
-log = logging.getLogger("amarh.actions")
+log = logging.getLogger("isnad.actions")
 
 
 class PermissionDenied(Exception):
@@ -151,7 +151,7 @@ def _need_scn(conn, sid: int, *, write: bool) -> None:
     """Inside scoped(): the scenario must be open and visible (else NotFound); writing needs owner/admin."""
     if not sid:
         return
-    vis, wr = conn.execute("SELECT amarh_scenario_visible(%s), amarh_scenario_writable(%s)", [sid, sid]).fetchone()
+    vis, wr = conn.execute("SELECT isnad_scenario_visible(%s), isnad_scenario_writable(%s)", [sid, sid]).fetchone()
     if not vis:
         raise ScenarioNotFound(f"scenario {sid} not found")
     if write and not wr:
@@ -723,7 +723,7 @@ def _audit_denied(conn, model, pr: _P, name, params, valid_at, source, run_id, p
                 # identity, so the denial is written through the loader path with the scenario id set -- but only if
                 # the scenario is open and visible to the caller (never an audit row in a scenario they cannot see)
                 with scoped(conn, OWNER if pr.owner else pr.p, sctx):
-                    if not conn.execute("SELECT amarh_scenario_visible(%s)", [sid]).fetchone()[0]:
+                    if not conn.execute("SELECT isnad_scenario_visible(%s)", [sid]).fetchone()[0]:
                         raise ScenarioNotFound(f"scenario {sid} not found")
                 ident = OWNER
             else:
@@ -842,7 +842,7 @@ def dry_run(conn, name: str, params: dict, principal, *, valid_at: datetime, ont
                                 impact=impact)
 
 
-PROPOSAL_TTL_H = float(os.environ.get("AMARH_PROPOSAL_TTL_H", "24"))
+PROPOSAL_TTL_H = float(os.environ.get("ISNAD_PROPOSAL_TTL_H", "24"))
 
 
 def propose(conn, name: str, params: dict, principal, rationale: str | None = None, *, valid_at: datetime,
@@ -979,7 +979,7 @@ def decide(conn, proposal_id: UUID, principal, approve: bool, comment: str | Non
                     ev_sid = conn.execute("SELECT scenario_id FROM proposal WHERE id=%s", [proposal_id]).fetchone()[0]
                     seen = (dry or {}).get("scenario_data_version") if isinstance(dry, dict) else None
                     if ev_sid and seen is not None and conn.execute(
-                            "SELECT amarh_scenario_changed(%s, %s)", [ev_sid, seen]).fetchone()[0]:
+                            "SELECT isnad_scenario_changed(%s, %s)", [ev_sid, seen]).fetchone()[0]:
                         raise StaleProposal(["scenario"])
                 aid = uuid4()
                 res = None

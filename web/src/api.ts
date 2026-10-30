@@ -38,7 +38,7 @@ export function installScenarioFetch() {
     else if (!h["x-scenario"]) Object.assign(h, scnHeaders(path));
     const r = await orig(input, { ...init, headers: h });
     if (r.status === 404 && h["x-scenario"] && !/^\/scenarios(\/|$)/.test(path)) {
-      r.clone().json().then((b) => { const c = b?.detail?.code ?? b?.code; if (c === "scenario_not_found") window.dispatchEvent(new CustomEvent("amarh-scenario-gone", { detail: Number(h["x-scenario"]) })); }, () => {});
+      r.clone().json().then((b) => { const c = b?.detail?.code ?? b?.code; if (c === "scenario_not_found") window.dispatchEvent(new CustomEvent("isnad-scenario-gone", { detail: Number(h["x-scenario"]) })); }, () => {});
     }
     return r;
   };

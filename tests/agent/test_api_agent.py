@@ -41,9 +41,9 @@ def delay_script(ship):
 
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
-    monkeypatch.delenv("AMARH_DEFAULT_ROLE", raising=False)
-    for k in ("AMARH_AGENT_MAX_CONCURRENT", "AMARH_AGENT_RUNS_PER_MIN", "AMARH_AGENT_DAILY_USD",
-              "AMARH_AGENT_MAX_GLOBAL"):
+    monkeypatch.delenv("ISNAD_DEFAULT_ROLE", raising=False)
+    for k in ("ISNAD_AGENT_MAX_CONCURRENT", "ISNAD_AGENT_RUNS_PER_MIN", "ISNAD_AGENT_DAILY_USD",
+              "ISNAD_AGENT_MAX_GLOBAL"):
         monkeypatch.delenv(k, raising=False)
 
 
@@ -243,7 +243,7 @@ def test_concurrency_limit_then_cancel(api, world):
 
 
 def test_per_minute_limit(api, monkeypatch):
-    monkeypatch.setenv("AMARH_AGENT_RUNS_PER_MIN", "2")
+    monkeypatch.setenv("ISNAD_AGENT_RUNS_PER_MIN", "2")
     for _ in range(2):
         api.wait(api.run("planner", [Turn(text="ok")]), "planner")
     api.scripts.append([Turn(text="ok")])
@@ -258,13 +258,13 @@ def test_daily_budget_limit(api, monkeypatch):
     api.scripts.append([Turn(text="ok")])
     r = api.c.post("/agent/runs", json={"prompt": "more"}, headers=H("planner"))
     assert r.status_code == 429 and "budget" in r.json()["detail"]
-    monkeypatch.setenv("AMARH_AGENT_DAILY_USD", "1000")
+    monkeypatch.setenv("ISNAD_AGENT_DAILY_USD", "1000")
     api.scripts.append([Turn(text="ok")])
     assert api.c.post("/agent/runs", json={"prompt": "more"}, headers=H("planner")).status_code == 201
 
 
 def test_global_cap(api, monkeypatch):
-    monkeypatch.setenv("AMARH_AGENT_MAX_GLOBAL", "1")
+    monkeypatch.setenv("ISNAD_AGENT_MAX_GLOBAL", "1")
     gate = threading.Event()
     api.run("planner", [Turn(text="x", hook=lambda: gate.wait(10))])
     api.scripts.append([Turn(text="y")])

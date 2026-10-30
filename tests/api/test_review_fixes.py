@@ -52,7 +52,7 @@ def test_sim_control_and_inject_admin_only_uniform_error(make_schema, role):
 
 
 def test_sim_admin_actions_are_audited_with_actor(make_schema, monkeypatch):
-    monkeypatch.delenv("AMARH_ALLOW_RESET", raising=False)
+    monkeypatch.delenv("ISNAD_ALLOW_RESET", raising=False)
     name = make_schema()
     c = TestClient(create_app(ONTOLOGY, schema=name, pipeline=False, runner=FakeRunner()))
     assert c.post("/sim/control", json={"step": True}, headers=H("admin")).status_code == 200

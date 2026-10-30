@@ -67,9 +67,9 @@ def test_create_validation(conn, world):
 
 
 def test_limits(conn, world, monkeypatch):
-    monkeypatch.setenv("AMARH_SCN_MAX_PER_USER", "2")
-    monkeypatch.setenv("AMARH_SCN_MAX_PER_RUN", "1")
-    monkeypatch.setenv("AMARH_SCN_MAX_GLOBAL", "3")
+    monkeypatch.setenv("ISNAD_SCN_MAX_PER_USER", "2")
+    monkeypatch.setenv("ISNAD_SCN_MAX_PER_RUN", "1")
+    monkeypatch.setenv("ISNAD_SCN_MAX_GLOBAL", "3")
     a = mk(conn)
     mk(conn)
     with pytest.raises(ScenarioLimit):
@@ -79,7 +79,7 @@ def test_limits(conn, world, monkeypatch):
     r1 = mk(conn, ADMIN, run_id="run-1")
     with pytest.raises(ScenarioLimit):
         mk(conn, ADMIN, run_id="run-1")                       # per run (and global: 3 open)
-    monkeypatch.setenv("AMARH_SCN_MAX_PER_RUN", "3")
+    monkeypatch.setenv("ISNAD_SCN_MAX_PER_RUN", "3")
     with pytest.raises(ScenarioLimit):
         mk(conn, PLANNER2)                                    # global cap counts other users' scenarios
     assert r1

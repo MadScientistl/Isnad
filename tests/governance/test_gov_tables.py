@@ -52,15 +52,15 @@ def test_append_only(conn, who):
 @pytest.mark.parametrize("t", TABLES)
 def test_all_tables_have_triggers(conn, t):
     n = conn.execute("SELECT count(*) FROM pg_trigger WHERE tgrelid = %s::regclass AND NOT tgisinternal "
-                     "AND tgname IN ('amarh_no_update', 'amarh_no_truncate')", [t]).fetchone()[0]
-    assert n == 2   # (the outbox tables carry one more trigger: amarh_no_scn, see the review-fix tests)
+                     "AND tgname IN ('isnad_no_update', 'isnad_no_truncate')", [t]).fetchone()[0]
+    assert n == 2   # (the outbox tables carry one more trigger: isnad_no_scn, see the review-fix tests)
     assert conn.execute("SELECT relforcerowsecurity FROM pg_class WHERE oid=%s::regclass", [t]).fetchone()[0]
 
 
 def test_app_has_no_update_grants(conn):
     for t in TABLES:
         for priv in ("UPDATE", "DELETE", "TRUNCATE"):
-            assert not conn.execute("SELECT has_table_privilege('amarh_app', %s, %s)", [t, priv]).fetchone()[0]
+            assert not conn.execute("SELECT has_table_privilege('isnad_app', %s, %s)", [t, priv]).fetchone()[0]
 
 
 def test_rls_per_role(conn):
@@ -102,7 +102,7 @@ def test_proposal_approval_visibility(conn):
 
 def test_unset_or_unknown_role_fails_closed(conn):
     ins_audit(conn, "alice")
-    conn.execute("SET LOCAL ROLE amarh_app")
+    conn.execute("SET LOCAL ROLE isnad_app")
     assert count(conn, "audit_event") == 0
     with pytest.raises(psycopg.Error):
         conn.execute("INSERT INTO audit_event (action_id,name,actor,source) VALUES (gen_random_uuid(),'y','a','api')")
@@ -131,23 +131,23 @@ def test_scoped_sets_and_resets_identity(conn):
     assert current_principal(conn) is None
     with scoped(conn, ALICE):
         assert current_principal(conn) == ALICE
-        assert conn.execute("SELECT current_user").fetchone()[0] == "amarh_app"
+        assert conn.execute("SELECT current_user").fetchone()[0] == "isnad_app"
         assert conn.execute("SHOW statement_timeout").fetchone()[0] == "5s"
     assert current_principal(conn) is None
-    assert conn.execute("SELECT current_user").fetchone()[0] != "amarh_app"
+    assert conn.execute("SELECT current_user").fetchone()[0] != "isnad_app"
     with scoped(conn, OWNER):
-        assert conn.execute("SELECT current_user").fetchone()[0] != "amarh_app"
+        assert conn.execute("SELECT current_user").fetchone()[0] != "isnad_app"
 
 
 def test_identity_never_leaks_across_transactions(conn):
     with scoped(conn, ALICE):
         pass
     # exit without reset on purpose: even a leaked in-flight scope dies with the transaction
-    conn.execute("SET LOCAL ROLE amarh_app")
-    conn.execute("SELECT set_config('amarh.role','admin',true), set_config('amarh.user','root',true)")
+    conn.execute("SET LOCAL ROLE isnad_app")
+    conn.execute("SELECT set_config('isnad.role','admin',true), set_config('isnad.user','root',true)")
     conn.commit()
     assert current_principal(conn) is None
-    assert conn.execute("SELECT current_user").fetchone()[0] != "amarh_app"
+    assert conn.execute("SELECT current_user").fetchone()[0] != "isnad_app"
     for p in (ALICE, BOB, ALICE):  # pooled-style reuse
         with scoped(conn, p):
             assert current_principal(conn) == p

@@ -1,5 +1,5 @@
 """Row-level security of the scenario overlay (Phase 5): no role can read or write another scenario's rows,
-a forged amarh.scenario fails closed, masking and filters apply to scenario-effective data."""
+a forged isnad.scenario fails closed, masking and filters apply to scenario-effective data."""
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -62,7 +62,7 @@ def test_other_user_cannot_read_a_scenario(c, world):
             assert c.execute("SELECT count(*) FROM obj_shipment WHERE scenario_id = %s", [ctx.id]).fetchone()[0] == 0
             assert c.execute("SELECT count(*) FROM scenario_override").fetchone()[0] == 0
             assert c.execute("SELECT count(*) FROM scenario WHERE id = %s", [ctx.id]).fetchone()[0] == 0
-            assert c.execute("SELECT amarh_scenario_visible(%s)", [ctx.id]).fetchone()[0] is False
+            assert c.execute("SELECT isnad_scenario_visible(%s)", [ctx.id]).fetchone()[0] is False
     assert "SCN-ONLY" in names(c, ADMIN, ctx, "rd_eff_obj_shipment", "ref")      # admin sees every scenario
 
 
@@ -238,7 +238,7 @@ def test_forged_scenario_guc_by_raw_sql_is_fail_closed(c, world):
     ctx = mk(c, PLAN)
     put(c, PLAN, ctx, "Shipment", uuid.uuid4(), {"ref": "SECRET-SCN", "status": "planned"})
     with scoped(c, PLAN2):                                                         # main context, then forge the GUC
-        c.execute("SELECT set_config('amarh.scenario', %s, true), set_config('amarh.scenario_base', now()::text, true)",
+        c.execute("SELECT set_config('isnad.scenario', %s, true), set_config('isnad.scenario_base', now()::text, true)",
                   [str(ctx.id)])
         assert c.execute("SELECT count(*) FROM rd_eff_obj_shipment").fetchone()[0] == 0
         assert c.execute("SELECT count(*) FROM obj_shipment WHERE ref = 'SECRET-SCN'").fetchone()[0] == 0
@@ -259,7 +259,7 @@ def test_scenario_writes_leave_graph_outbox_and_main_untouched(c, world):
     assert "Houston" not in names(c, ADMIN, ctx, "rd_eff_obj_port") and "Houston" in names(c, ADMIN, None, "rd_cur_obj_port")
 
 
-def test_amarh_app_cannot_tamper_with_scenario_tables(c, world):
+def test_isnad_app_cannot_tamper_with_scenario_tables(c, world):
     ctx = mk(c, PLAN)
     with scoped(c, PLAN, ctx):
         for stmt in ("DELETE FROM scenario_override", "TRUNCATE scenario_override", "UPDATE scenario SET name = 'x'",

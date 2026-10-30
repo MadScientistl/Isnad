@@ -146,7 +146,7 @@ def make_model(mode: str, plan: str | None, args: dict):
     if not have_key():
         raise RuntimeError("ANTHROPIC_API_KEY is not set; live mode refused")
     from agent.model_anthropic import AnthropicModel
-    return Recording(AnthropicModel(os.environ.get("AMARH_EVAL_MODEL") or "claude-haiku-5-5", effort="low")), "live model"
+    return Recording(AnthropicModel(os.environ.get("ISNAD_EVAL_MODEL") or "claude-haiku-5-5", effort="low")), "live model"
 
 
 def run_agent(world: World, role: str, prompt: str, mode: str = "mock", plan: str | None = None,
@@ -199,8 +199,8 @@ def run_agent(world: World, role: str, prompt: str, mode: str = "mock", plan: st
 
 # ------------------------------------------------------------------ HTTP (approval flow)
 def api_client(world: World):
-    os.environ.setdefault("AMARH_OUTBOX_WORKER", "0")
-    os.environ.pop("AMARH_DEFAULT_ROLE", None)
+    os.environ.setdefault("ISNAD_OUTBOX_WORKER", "0")
+    os.environ.pop("ISNAD_DEFAULT_ROLE", None)
     from fastapi.testclient import TestClient
     from engine.api.main import create_app
     return TestClient(create_app(ONTOLOGY, schema=world.schema, pipeline=world.pipeline or False))

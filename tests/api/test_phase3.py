@@ -70,7 +70,7 @@ def cl(w):
 
 @pytest.fixture(autouse=True)
 def _no_default_role(monkeypatch):
-    monkeypatch.delenv("AMARH_DEFAULT_ROLE", raising=False)
+    monkeypatch.delenv("ISNAD_DEFAULT_ROLE", raising=False)
 
 
 def S(i):
@@ -105,7 +105,7 @@ def test_role_spoofing_and_missing_header(cl, monkeypatch):
     assert cl.get("/me", headers=H("analyst")).status_code == 403  # removed Phase 2 role
     assert cl.get("/objects/Port", headers=H("sim")).status_code == 403
     assert cl.post("/actions/close_port/execute", json={"params": {}}, headers=H("sim")).status_code == 403
-    monkeypatch.setenv("AMARH_DEFAULT_ROLE", "planner")  # documented dev switch
+    monkeypatch.setenv("ISNAD_DEFAULT_ROLE", "planner")  # documented dev switch
     assert cl.get("/me").json()["role"] == "planner"
 
 
@@ -277,7 +277,7 @@ class Receiver:
         class Hd(BaseHTTPRequestHandler):
             def do_POST(self):
                 n = int(self.headers.get("content-length", 0))
-                outer.hits.append((self.headers.get("Idempotency-Key"), self.headers.get("X-Amarh-Signature"),
+                outer.hits.append((self.headers.get("Idempotency-Key"), self.headers.get("X-Isnad-Signature"),
                                    self.rfile.read(n)))
                 self.send_response(outer.status)
                 self.end_headers()
@@ -295,8 +295,8 @@ class Receiver:
 def test_webhook_delivery_failure_and_retry(cl, w, monkeypatch):
     rcv = Receiver()
     try:
-        monkeypatch.setenv("AMARH_WEBHOOK_OPS_URL", rcv.url)
-        monkeypatch.setenv("AMARH_WEBHOOK_SECRET", "s3")
+        monkeypatch.setenv("ISNAD_WEBHOOK_OPS_URL", rcv.url)
+        monkeypatch.setenv("ISNAD_WEBHOOK_SECRET", "s3")
         factory = lambda: connect(schema=w.schema)  # noqa: E731
         # healthy receiver
         ok = cl.post("/actions/close_port/execute", json={"params": {"port": S(w.busan)}}, headers=H("planner")).json()
@@ -427,7 +427,7 @@ def test_sparql_filtering_and_rejections(sp, w):
 
 # ------------------------------------------------------------------ reset
 def test_reset_admin_only_keeps_audit(make_schema, monkeypatch):
-    monkeypatch.setenv("AMARH_ALLOW_RESET", "1")
+    monkeypatch.setenv("ISNAD_ALLOW_RESET", "1")
     name = make_schema()
 
     class R:

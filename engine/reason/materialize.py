@@ -194,7 +194,7 @@ def write_support(conn, st: Store, ns: str, yaml_path=None, max_derivations: int
                   data_version: int | None = None, scenario_id: int = 0) -> dict:
     """(Re)populate `inferred_support` from the ASSERTED graph for every inferred instance edge.
 
-    Runs as OWNER (loader connection; `amarh_app` has SELECT only). For each inferred edge
+    Runs as OWNER (loader connection; `isnad_app` has SELECT only). For each inferred edge
     (s, L, d) of a transitive link or inverse name, stores up to `max_derivations` simple
     paths over the asserted base-link edges (shortest first) as separate derivations
     (`derivation_no` 0..), `support` = ordered node ids of the path in base-link direction.

@@ -193,7 +193,7 @@ def test_scenario_state_counters_and_cap(c, monkeypatch):
     port(c, ids[0], "a2", scenario_id=sid)                  # same key: one override key, two row versions
     st = c.execute("SELECT override_rows, data_version FROM scenario_state WHERE scenario_id=%s", [sid]).fetchone()
     assert st == (2, 2)                                      # review M4a: the cap counts row versions, not keys
-    monkeypatch.setenv("AMARH_SCN_MAX_ROWS", "3")
+    monkeypatch.setenv("ISNAD_SCN_MAX_ROWS", "3")
     port(c, ids[1], "b", scenario_id=sid)
     with pytest.raises(bt.ScenarioLimit):
         port(c, ids[2], "c", scenario_id=sid)
@@ -289,19 +289,19 @@ def test_scoped_scenario_param_validation_and_gucs(c):
     with pytest.raises(ValueError):
         ScenarioCtx(0, NOW)
     with scoped(c, Principal("admin", "u-admin", ""), ctx):
-        row = c.execute("SELECT amarh_scn(), amarh_scn_base() = %s, amarh_now() <= now() + interval '1 second'",
+        row = c.execute("SELECT isnad_scn(), isnad_scn_base() = %s, isnad_now() <= now() + interval '1 second'",
                         [ctx.base_recorded]).fetchone()
         assert row == (sid, True, True)
         # a scoped session cannot touch a scenario other than its own
         with pytest.raises(ValueError):
             bt.get_object(c, "Port", uuid.uuid4(), scenario_id=sid + 1)
-    assert c.execute("SELECT amarh_scn(), current_setting('amarh.scenario_base', true), "
-                     "current_setting('amarh.now', true)").fetchone() == (0, "", "")
+    assert c.execute("SELECT isnad_scn(), current_setting('isnad.scenario_base', true), "
+                     "current_setting('isnad.now', true)").fetchone() == (0, "", "")
     with scoped(c, Principal("admin", "u-admin", "")):          # no scenario: GUCs explicitly cleared
-        assert c.execute("SELECT amarh_scn()").fetchone()[0] == 0
+        assert c.execute("SELECT isnad_scn()").fetchone()[0] == 0
     with scoped(c, OWNER, ctx):
-        assert c.execute("SELECT amarh_scn()").fetchone()[0] == sid
-    assert c.execute("SELECT amarh_scn()").fetchone()[0] == 0
+        assert c.execute("SELECT isnad_scn()").fetchone()[0] == sid
+    assert c.execute("SELECT isnad_scn()").fetchone()[0] == 0
 
 
 def test_eff_views_follow_the_rule(c):

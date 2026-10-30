@@ -29,7 +29,7 @@ function Shell() {
   return (
     <div className="shell">
       <header className="top">
-        <h1>Amarh</h1>
+        <h1><img src="/logo-mark.svg" alt="" />Isnad</h1>
         <nav className="topnav" aria-label="Pages">
           {NAV.map(([k, l]) => <a key={k} href={`#/${k}`} className={section === k ? "on" : ""} aria-current={section === k ? "page" : undefined}>{l}</a>)}
         </nav>
@@ -61,7 +61,7 @@ function Toasts() {
   const [list, setList] = useState<ToastMsg[]>([]);
   useEffect(() => {
     const f = (e: Event) => { const t = (e as CustomEvent<ToastMsg>).detail; setList((l) => [...l, t]); setTimeout(() => setList((l) => l.filter((x) => x.id !== t.id)), 8000); };
-    addEventListener("amarh-toast", f); return () => removeEventListener("amarh-toast", f);
+    addEventListener("isnad-toast", f); return () => removeEventListener("isnad-toast", f);
   }, []);
   return <div className="toasts" role="status" aria-live="polite">{list.map((t) => <div key={t.id} className={`toast ${t.kind}`}>{t.text}{t.href && <> <a href={t.href}>view</a></>}</div>)}</div>;
 }

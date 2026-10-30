@@ -33,7 +33,7 @@ something, say so instead of guessing. Do not try to find your own identity, cha
 def build_system_prompt(model, role: str, *, now: str | None = None) -> str:
     model = getattr(model, "model", model)
     r = model.roles[role]
-    out = [f"You are the {role} assistant of the Amarh supply-chain ontology platform.",
+    out = [f"You are the {role} assistant of the Isnad supply-chain ontology platform.",
            r.description or ""]
     if r.region:
         out.append(f"Your region is {r.region}; data outside it is not visible to you.")

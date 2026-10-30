@@ -1,4 +1,4 @@
-"""Permission, RLS, audit, atomicity and diff behaviour of `execute` (all as amarh_app via scoped)."""
+"""Permission, RLS, audit, atomicity and diff behaviour of `execute` (all as isnad_app via scoped)."""
 import json
 from datetime import timedelta
 from uuid import uuid4
@@ -23,7 +23,7 @@ def n_exec(conn):
     return conn.execute("SELECT count(*) FROM audit_event WHERE status='executed'").fetchone()[0]
 
 
-def test_runs_as_amarh_app_with_identity(conn, world, monkeypatch):
+def test_runs_as_isnad_app_with_identity(conn, world, monkeypatch):
     import engine.actions.core as core
     seen = {}
 
@@ -33,9 +33,9 @@ def test_runs_as_amarh_app_with_identity(conn, world, monkeypatch):
         core._reopen_port(c, p)
     monkeypatch.setitem(core.HANDLERS, "reopen_port", lambda c, p: (spy(c, p), None)[1])
     execute(conn, "reopen_port", {"port": world["emea_port"]}, PLANNER, valid_at=T1)
-    assert seen["user"] == "amarh_app" and seen["pr"].role == "planner" and seen["pr"].user == "pat"
+    assert seen["user"] == "isnad_app" and seen["pr"].role == "planner" and seen["pr"].user == "pat"
     # identity is gone afterwards (same connection, same session)
-    assert conn.execute("SELECT current_user").fetchone()[0] != "amarh_app"
+    assert conn.execute("SELECT current_user").fetchone()[0] != "isnad_app"
     assert current_principal(conn) is None
 
 

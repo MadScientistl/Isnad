@@ -334,7 +334,7 @@ class FakeRunner:
 
 
 def test_sim_endpoints_with_double(schema, make_schema, monkeypatch):
-    monkeypatch.delenv("AMARH_ALLOW_RESET", raising=False)
+    monkeypatch.delenv("ISNAD_ALLOW_RESET", raising=False)
     r = FakeRunner()
     c = TestClient(create_app(ONTOLOGY, schema=schema, pipeline=False, runner=r))
     s = c.get("/sim/state", headers=H).json()
@@ -347,7 +347,7 @@ def test_sim_endpoints_with_double(schema, make_schema, monkeypatch):
     assert c.post("/sim/control", json={"step": True}, headers=H).json()["tick"] == 1
     assert c.post("/sim/control", json={"reset": True}, headers=H).status_code == 403  # opt-in only
     assert ("reset",) not in r.calls and ("step",) in r.calls
-    monkeypatch.setenv("AMARH_ALLOW_RESET", "1")
+    monkeypatch.setenv("ISNAD_ALLOW_RESET", "1")
     scratch = make_schema()  # reset truncates its schema: never the shared fixture
     r2 = FakeRunner()
     c2 = TestClient(create_app(ONTOLOGY, schema=scratch, pipeline=False, runner=r2))

@@ -1,7 +1,7 @@
 """Event sinks for agent runs: MemorySink (tests) and DbSink (agent_run / agent_run_event, append-only).
 
 DbSink writes short committed transactions under `scoped(conn, human_principal)`, so the RLS insert policies
-(user = amarh.user AND role = amarh.role) bind every row to the human who started the run. Payloads are the
+(user = isnad.user AND role = isnad.role) bind every row to the human who started the run. Payloads are the
 already-masked versions produced by the runner; nothing here ever sees the API key or raw HTTP headers.
 """
 from __future__ import annotations

@@ -37,8 +37,8 @@ def cl(sch):
 
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
-    monkeypatch.delenv("AMARH_DEFAULT_ROLE", raising=False)
-    monkeypatch.setenv("AMARH_OUTBOX_WORKER", "0")
+    monkeypatch.delenv("ISNAD_DEFAULT_ROLE", raising=False)
+    monkeypatch.setenv("ISNAD_OUTBOX_WORKER", "0")
 
 
 @pytest.fixture
@@ -152,7 +152,7 @@ def test_crud_and_list_isolation(cl, mk):
 
 
 def test_limit_429(cl, mk, monkeypatch):
-    monkeypatch.setenv("AMARH_SCN_MAX_PER_USER", "1")
+    monkeypatch.setenv("ISNAD_SCN_MAX_PER_USER", "1")
     mk("finance_analyst")
     r = cl.post("/scenarios", json={"name": "two"}, headers=H("finance_analyst"))
     assert r.status_code == 429 and r.json()["code"] == "scenario_limit"
@@ -352,7 +352,7 @@ def test_proposals_from_scenario_show_in_main_inbox(cl, mk, ship):
 
 # ------------------------------------------------------------ startup / reset
 def test_startup_registers_version_and_reset_discards_scenarios(sch, monkeypatch):
-    monkeypatch.setenv("AMARH_ALLOW_RESET", "1")
+    monkeypatch.setenv("ISNAD_ALLOW_RESET", "1")
     app = create_app(ONTOLOGY, schema=sch, pipeline=False)
     with TestClient(app) as c:
         cx = connect(schema=sch)

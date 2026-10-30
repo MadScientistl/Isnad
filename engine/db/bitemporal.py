@@ -123,7 +123,7 @@ def read_source(conn, table: str, masked: bool = True) -> str:
         _rd_cache[key] = conn.execute("SELECT to_regclass(%s) IS NOT NULL", [rd]).fetchone()[0]
     if _rd_cache[key]:
         return rd
-    if conn.execute("SELECT current_user = 'amarh_app'").fetchone()[0]:
+    if conn.execute("SELECT current_user = 'isnad_app'").fetchone()[0]:
         raise LookupError(f"masked view {rd} is missing: refusing to read the base table as a scoped role")
     return table
 
@@ -195,7 +195,7 @@ def _max(a, b):
 
 # ------------------------------------------------------------ scenarios (Phase 5)
 class ScenarioLimit(Exception):
-    """A scenario reached AMARH_SCN_MAX_ROWS override rows."""
+    """A scenario reached ISNAD_SCN_MAX_ROWS override rows."""
 
 
 ZERO_UUID = UUID(int=0)
@@ -203,18 +203,18 @@ _SCN_META = ("valid_during", "recorded_during", "changed_by", "action_id", "scen
 
 
 def _max_rows() -> int:
-    return int(os.environ.get("AMARH_SCN_MAX_ROWS", "50000"))
+    return int(os.environ.get("ISNAD_SCN_MAX_ROWS", "50000"))
 
 
 def _scn_ctx(conn, sid: int) -> tuple[datetime, datetime | None]:
     """(base_recorded, clock) of scenario `sid`. Taken from the scoped GUCs when they name this scenario,
-    otherwise from the scenario tables (owner / loader / sim code). A scoped (amarh_app) connection whose GUC
+    otherwise from the scenario tables (owner / loader / sim code). A scoped (isnad_app) connection whose GUC
     names a different scenario is refused: reads and writes are only possible inside the scoped scenario."""
     g_sid, g_base, g_now, cu = conn.execute(
-        "SELECT coalesce(nullif(current_setting('amarh.scenario', true), ''), '0')::int, "
-        "nullif(current_setting('amarh.scenario_base', true), '')::timestamptz, "
-        "nullif(current_setting('amarh.now', true), '')::timestamptz, current_user").fetchone()
-    if cu == "amarh_app" and g_sid != sid:
+        "SELECT coalesce(nullif(current_setting('isnad.scenario', true), ''), '0')::int, "
+        "nullif(current_setting('isnad.scenario_base', true), '')::timestamptz, "
+        "nullif(current_setting('isnad.now', true), '')::timestamptz, current_user").fetchone()
+    if cu == "isnad_app" and g_sid != sid:
         raise ValueError(f"scenario {sid} is not the scoped scenario ({g_sid or 'main'})")
     if g_sid == sid and g_base is not None:
         return g_base, g_now
@@ -255,13 +255,13 @@ def _is_first_touch(conn, kind, type_name, keyvals, sid) -> bool:
 
 
 def _guard_rows(conn, sid: int, add: int) -> None:
-    """AMARH_SCN_MAX_ROWS counts the scenario's actual ROW VERSIONS (cloned + inserted), not keys; checked on
+    """ISNAD_SCN_MAX_ROWS counts the scenario's actual ROW VERSIONS (cloned + inserted), not keys; checked on
     every write (before any row is written for the part we can predict, and again after a clone)."""
     st = conn.execute("SELECT override_rows FROM scenario_state WHERE scenario_id = %s FOR UPDATE", [sid]).fetchone()
     if st is None:
         raise ValueError(f"scenario {sid} not found")
     if st[0] + add > _max_rows():
-        raise ScenarioLimit(f"scenario {sid} reached {_max_rows()} rows (AMARH_SCN_MAX_ROWS)")
+        raise ScenarioLimit(f"scenario {sid} reached {_max_rows()} rows (ISNAD_SCN_MAX_ROWS)")
 
 
 def _bump_rows(conn, sid: int, n: int) -> None:
@@ -269,11 +269,11 @@ def _bump_rows(conn, sid: int, n: int) -> None:
         conn.execute("UPDATE scenario_state SET override_rows = override_rows + %s WHERE scenario_id = %s", [n, sid])
         if conn.execute("SELECT override_rows > %s FROM scenario_state WHERE scenario_id = %s",
                         [_max_rows(), sid]).fetchone()[0]:
-            raise ScenarioLimit(f"scenario {sid} reached {_max_rows()} rows (AMARH_SCN_MAX_ROWS)")
+            raise ScenarioLimit(f"scenario {sid} reached {_max_rows()} rows (ISNAD_SCN_MAX_ROWS)")
 
 
 def _max_props_bytes() -> int:
-    return int(os.environ.get("AMARH_MAX_PROPS_BYTES", "65536"))
+    return int(os.environ.get("ISNAD_MAX_PROPS_BYTES", "65536"))
 
 
 def _clone_from_main(conn, table, kind, type_name, keycols, keyvals, sid, now, skip_lowers) -> None:
@@ -311,7 +311,7 @@ def _clone_from_main(conn, table, kind, type_name, keycols, keyvals, sid, now, s
             "main_lower": main_lower[0].isoformat() if main_lower else None}
     conn.execute("INSERT INTO scenario_override (scenario_id, kind, type, key_a, key_b, deleted, base) "
                  "VALUES (%s,%s,%s,%s,%s,false,%s)", [sid, kind, type_name, keyvals[0], kb, Jsonb(info)])
-    _bump_rows(conn, sid, max(cloned, 0))  # cloned versions count against AMARH_SCN_MAX_ROWS
+    _bump_rows(conn, sid, max(cloned, 0))  # cloned versions count against ISNAD_SCN_MAX_ROWS
 
 
 def _after_scenario_write(conn, table, kind, type_name, keycols, keyvals, sid) -> None:
@@ -334,7 +334,7 @@ def list_overrides(conn, scenario_id: int) -> list[dict]:
     type, keys. `base` = fork-time snapshot `{"present": bool, "props": {...}|None, "main_lower": iso|None}`;
     for a scoped caller who is not the owner/admin of the scenario (a shared role) it is None."""
     with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute("SELECT * FROM amarh_scenario_overrides(%s)", [scenario_id])
+        cur.execute("SELECT * FROM isnad_scenario_overrides(%s)", [scenario_id])
         return cur.fetchall()
 
 
@@ -360,7 +360,7 @@ def _apply(
         except (TypeError, ValueError):
             size = 0
         if size > _max_props_bytes():
-            raise ValueError(f"properties too large ({size} bytes; max {_max_props_bytes()}, AMARH_MAX_PROPS_BYTES)")
+            raise ValueError(f"properties too large ({size} bytes; max {_max_props_bytes()}, ISNAD_MAX_PROPS_BYTES)")
         unknown = set(props) - set(pcols)
         if unknown:
             raise ValueError(f"unknown properties for {table}: {sorted(unknown)}")
@@ -376,7 +376,7 @@ def _apply_tx(conn, table, keycols, keyvals, newp, pcols, geo, vf, vt, changed_b
               scenario_id, kind, type_name, outbox_extra) -> bool:
     with conn.transaction():
         _lock(conn, table, keyvals, scenario_id)
-        now, g = conn.execute("SELECT clock_timestamp(), coalesce(current_setting('amarh.scenario', true), '')").fetchone()
+        now, g = conn.execute("SELECT clock_timestamp(), coalesce(current_setting('isnad.scenario', true), '')").fetchone()
         first = False  # first touch of this key in a scenario: the logic runs on main's rows as of the fork
         g = g.strip()
         if g not in ("", "0") and g != str(scenario_id):  # M2: a connection scoped to scenario X never writes Y / main

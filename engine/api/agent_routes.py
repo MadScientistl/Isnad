@@ -7,8 +7,8 @@ Reads of agent_run / agent_run_event always happen under `scoped()` as the calle
 an invisible run is a 404 (never 403). Status is derived at read time: the last `finished` event, else `running`
 if the run is in the in-process registry, else `interrupted` (rows are never updated).
 
-Limits (env, read per request): AMARH_AGENT_MAX_CONCURRENT=1 per user, AMARH_AGENT_RUNS_PER_MIN=6 per user,
-AMARH_AGENT_DAILY_USD=5 per user, AMARH_AGENT_MAX_GLOBAL=4 runs at once. They are checked under one lock that also
+Limits (env, read per request): ISNAD_AGENT_MAX_CONCURRENT=1 per user, ISNAD_AGENT_RUNS_PER_MIN=6 per user,
+ISNAD_AGENT_DAILY_USD=5 per user, ISNAD_AGENT_MAX_GLOBAL=4 runs at once. They are checked under one lock that also
 registers the new run, so concurrent POSTs cannot both pass.
 """
 from __future__ import annotations
@@ -30,7 +30,7 @@ from agent import AgentContext, AgentRun, DbSink, allowed_actions, allowed_tools
 from agent.context import Caps
 from engine.db.principal import Principal, scoped
 
-log = logging.getLogger("amarh.agent_api")
+log = logging.getLogger("isnad.agent_api")
 
 PROMPT_MAX = 4000
 START_WAIT_S = 5.0
@@ -128,10 +128,10 @@ MAX_STREAMS_PER_RUN = 4
 
 
 def limits() -> dict:
-    return {"max_concurrent": _env_num("AMARH_AGENT_MAX_CONCURRENT", 1, int),
-            "runs_per_minute": _env_num("AMARH_AGENT_RUNS_PER_MIN", 6, int),
-            "daily_usd": _env_num("AMARH_AGENT_DAILY_USD", 5.0, float),
-            "max_global": _env_num("AMARH_AGENT_MAX_GLOBAL", 4, int),
+    return {"max_concurrent": _env_num("ISNAD_AGENT_MAX_CONCURRENT", 1, int),
+            "runs_per_minute": _env_num("ISNAD_AGENT_RUNS_PER_MIN", 6, int),
+            "daily_usd": _env_num("ISNAD_AGENT_DAILY_USD", 5.0, float),
+            "max_global": _env_num("ISNAD_AGENT_MAX_GLOBAL", 4, int),
             "prompt_max_chars": PROMPT_MAX}
 
 

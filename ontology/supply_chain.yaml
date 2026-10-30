@@ -124,8 +124,8 @@ functions:
     params: {shipment: "uuid(Shipment)!"}
     roles: [planner, regional_ops_lead, finance_analyst, admin]
 webhooks:
-  notify_ops: {url_env: AMARH_WEBHOOK_OPS_URL, method: POST, max_attempts: 5, description: Notify operations of port disruptions.}
-  notify_finance: {url_env: AMARH_WEBHOOK_FINANCE_URL, method: POST, max_attempts: 5, description: Notify finance of flagged invoices.}
+  notify_ops: {url_env: ISNAD_WEBHOOK_OPS_URL, method: POST, max_attempts: 5, description: Notify operations of port disruptions.}
+  notify_finance: {url_env: ISNAD_WEBHOOK_FINANCE_URL, method: POST, max_attempts: 5, description: Notify finance of flagged invoices.}
 actions:
   create_object:
     description: Create an object of any type (generic, used by REST).

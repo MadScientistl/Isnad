@@ -170,7 +170,7 @@ def seed(conn, schema_sql: str | None = None) -> dict:
 
 
 def main() -> None:
-    schema = os.environ.get("AMARH_SCHEMA")
+    schema = os.environ.get("ISNAD_SCHEMA")
     conn = connect(schema=schema)
     if schema:
         conn.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema)))

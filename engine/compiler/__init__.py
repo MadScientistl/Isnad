@@ -44,10 +44,10 @@ class CompiledOntology:
 
     def pydantic_models(self) -> types.ModuleType:
         """Exec the generated source; returns a module with one model class per object type."""
-        mod = types.ModuleType("amarh_models")
+        mod = types.ModuleType("isnad_models")
         import sys
-        sys.modules["amarh_models"] = mod
-        exec(compile(self.pydantic_source(), "<amarh_models>", "exec"), mod.__dict__)
+        sys.modules["isnad_models"] = mod
+        exec(compile(self.pydantic_source(), "<isnad_models>", "exec"), mod.__dict__)
         return mod
 
     def ts_sdk(self) -> str:

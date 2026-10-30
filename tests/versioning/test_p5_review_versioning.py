@@ -16,7 +16,7 @@ ADMIN2 = Principal("admin", "ada")
 
 @pytest.fixture(autouse=True)
 def _no_self_approve(monkeypatch):
-    monkeypatch.delenv("AMARH_ONTOLOGY_SELF_APPROVE", raising=False)
+    monkeypatch.delenv("ISNAD_ONTOLOGY_SELF_APPROVE", raising=False)
 
 
 def test_proposer_cannot_approve_their_own_proposal(conn, raw, dump):
@@ -34,7 +34,7 @@ def test_proposer_may_still_reject_and_dev_override_exists(conn, raw, dump, monk
     p = V.propose(conn, ADMIN, additive(raw, dump), "x")
     assert V.decide(conn, ADMIN, p["id"], False)["decision"] == "rejected"
     p2 = V.propose(conn, ADMIN, additive(raw, dump, "Other"), "x")
-    monkeypatch.setenv("AMARH_ONTOLOGY_SELF_APPROVE", "1")
+    monkeypatch.setenv("ISNAD_ONTOLOGY_SELF_APPROVE", "1")
     assert V.decide(conn, ADMIN, p2["id"], True)["decision"] == "approved"
 
 

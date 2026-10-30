@@ -111,14 +111,14 @@ def test_cli_roundtrip_schema_has_policy(tmp_path):
     assert r.returncode == 0, r.stderr
     sql = (tmp_path / "schema.sql").read_text()
     assert sql == comp.ddl() and comp.policy_ddl() in sql and comp.base_ddl() in sql
-    assert "FORCE ROW LEVEL SECURITY" in sql and "amarh_visible_port" in sql and "rd_cur_obj_supplier" in sql
+    assert "FORCE ROW LEVEL SECURITY" in sql and "isnad_visible_port" in sql and "rd_cur_obj_supplier" in sql
 
 
 def test_policy_ddl_shape():
     sql = comp.policy_ddl()
-    assert "CREATE ROLE amarh_app NOLOGIN" in sql and "pg_catalog, %I, public, pg_temp" in sql
+    assert "CREATE ROLE isnad_app NOLOGIN" in sql and "pg_catalog, %I, public, pg_temp" in sql
     assert "DELETE" not in sql.replace("REVOKE DELETE, TRUNCATE", "")
-    assert "TO amarh_app USING" in sql and "TO CURRENT_USER" in sql
+    assert "TO isnad_app USING" in sql and "TO CURRENT_USER" in sql
     assert sql.count("FORCE ROW LEVEL SECURITY") == len(M.object_types) + len(M.link_types)
 
 

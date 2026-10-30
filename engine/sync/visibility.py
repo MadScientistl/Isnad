@@ -73,7 +73,7 @@ def _check_scn(conn, scenario, as_of=None) -> int:
         raise TypeError("scenario must be a ScenarioCtx or None")
     if as_of is not None:
         raise ValueError("as_of is not supported inside a scenario")
-    got = conn.execute("SELECT current_setting('amarh.scenario', true)").fetchone()[0]
+    got = conn.execute("SELECT current_setting('isnad.scenario', true)").fetchone()[0]
     if str(got or "") != str(scenario.id):
         raise PermissionError("connection is not scoped to this scenario")
     return scenario.id

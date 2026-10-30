@@ -47,10 +47,10 @@ def ctx_of(conn, scenario_id: int) -> ScenarioCtx:
 def purge(conn, scenario_id: int) -> dict[str, int]:
     """Owner-only janitor: delete the scenario's object/link rows, override rows and inferred_support rows.
     Audit tables, the scenario row, its events and its state row stay (the state counters are reset).
-    Refuses scenario 0 (main) and refuses to run as `amarh_app`. Returns {table: rows deleted}."""
+    Refuses scenario 0 (main) and refuses to run as `isnad_app`. Returns {table: rows deleted}."""
     if type(scenario_id) is not int or scenario_id <= 0:
         raise ValueError("purge needs a scenario id > 0 (main cannot be purged)")
-    if conn.execute("SELECT current_user = 'amarh_app' OR current_setting('role') <> 'none'").fetchone()[0]:
+    if conn.execute("SELECT current_user = 'isnad_app' OR current_setting('role') <> 'none'").fetchone()[0]:
         raise PermissionError("purge is an owner-only operation")
     tables = [r[0] for r in conn.execute(
         "SELECT tablename FROM pg_tables WHERE schemaname = current_schema() AND "

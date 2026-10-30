@@ -38,8 +38,8 @@ def cl(sch):
 
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
-    monkeypatch.delenv("AMARH_DEFAULT_ROLE", raising=False)
-    monkeypatch.setenv("AMARH_OUTBOX_WORKER", "0")
+    monkeypatch.delenv("ISNAD_DEFAULT_ROLE", raising=False)
+    monkeypatch.setenv("ISNAD_OUTBOX_WORKER", "0")
 
 
 @pytest.fixture
@@ -158,7 +158,7 @@ def test_contention_is_a_retryable_409_busy_not_a_500():
 
 
 def test_graph_too_large_is_disclosed_only_to_owner_and_admin(cl, mk, monkeypatch):
-    monkeypatch.setenv("AMARH_SCN_GRAPH_MAX_OBJECTS", "2")
+    monkeypatch.setenv("ISNAD_SCN_GRAPH_MAX_OBJECTS", "2")
     sid = mk("planner", shared_roles=["finance_analyst"])
     p = _id("Port", "Rotterdam")
     own = cl.get(f"/graph?center={p}&depth=1", headers=H("planner", sid))

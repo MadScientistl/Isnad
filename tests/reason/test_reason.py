@@ -43,7 +43,7 @@ def test_transitive_inverse_separate_graph_flagged(conn):
     assert (i(0), SUP, i(1)) not in inf  # asserted edge is not re-listed as inferred
     assert r.inferred_triples == len(inf) == 10 + 15  # 10 transitive supplies + 15 supplied_by
     flags = {(q.predicate.value, q.object.value) for q in st.quads_for_pattern(G_INFERRED, None, None, G_META)}
-    assert ("urn:amarh:isInferredGraph", "true") in flags
+    assert ("urn:isnad:isInferredGraph", "true") in flags
 
 
 def test_cycle_terminates(conn):

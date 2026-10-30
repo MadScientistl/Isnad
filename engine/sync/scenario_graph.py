@@ -10,12 +10,12 @@ Isolation rules (all enforced by construction and covered by tests/sync/test_sce
   Non-admin reads never see this store directly: `sparql.build_visible_store` and
   `visibility.*` re-filter every node and edge through RLS + D6 (`inferred_support WHERE scenario_id = N`).
 * `get_store` first checks, on the CALLER'S connection, that the scenario is visible to the caller
-  (`amarh_scenario_visible` + a visible `scenario_state` row); otherwise `ScenarioNotVisible`
+  (`isnad_scenario_visible` + a visible `scenario_state` row); otherwise `ScenarioNotVisible`
   (the HTTP layer maps it to 404 `scenario_not_found`). The cache is therefore safe to share
   between users: a hit still requires that check.
-* Cache: key `(scenario_id, data_version, clock)`, LRU of `AMARH_SCN_GRAPH_CACHE` (default 3) entries,
+* Cache: key `(scenario_id, data_version, clock)`, LRU of `ISNAD_SCN_GRAPH_CACHE` (default 3) entries,
   thread-safe; a new data_version of a scenario evicts its older entries. One build at a time per
-  scenario. Hard cap `AMARH_SCN_GRAPH_MAX_OBJECTS` (default 20000 objects) -> `GraphTooLarge`
+  scenario. Hard cap `ISNAD_SCN_GRAPH_MAX_OBJECTS` (default 20000 objects) -> `GraphTooLarge`
   (HTTP 413). The error carries no counts (a size is data about hidden rows).
 
 Signatures the API layer calls (see also visibility / sparql / shacl):
@@ -54,11 +54,11 @@ from .store import SyncConfig, _set_last_seq, open_store
 
 
 class GraphTooLarge(RuntimeError):
-    """The scenario holds more objects than AMARH_SCN_GRAPH_MAX_OBJECTS (HTTP 413). No counts in the message."""
+    """The scenario holds more objects than ISNAD_SCN_GRAPH_MAX_OBJECTS (HTTP 413). No counts in the message."""
 
 
 class GraphBusy(RuntimeError):
-    """Too many scenario graph builds are running (AMARH_SCN_MAX_GRAPH_BUILDS); HTTP 503 `graph_busy`."""
+    """Too many scenario graph builds are running (ISNAD_SCN_MAX_GRAPH_BUILDS); HTTP 503 `graph_busy`."""
 
 
 class ScenarioNotVisible(LookupError):
@@ -66,7 +66,7 @@ class ScenarioNotVisible(LookupError):
 
 
 def max_objects() -> int:
-    return int(os.environ.get("AMARH_SCN_GRAPH_MAX_OBJECTS", "20000"))
+    return int(os.environ.get("ISNAD_SCN_GRAPH_MAX_OBJECTS", "20000"))
 
 
 _build_slots: dict[int, threading.BoundedSemaphore] = {}
@@ -76,7 +76,7 @@ _build_slots_lock = threading.Lock()
 def _slots() -> threading.BoundedSemaphore:
     """Process-wide limit on concurrent scenario graph builds (review M4c): each build holds the full effective
     state of a scenario in memory and runs reasoning, so builds for DIFFERENT scenarios must not pile up."""
-    n = max(1, int(os.environ.get("AMARH_SCN_MAX_GRAPH_BUILDS", "2")))
+    n = max(1, int(os.environ.get("ISNAD_SCN_MAX_GRAPH_BUILDS", "2")))
     with _build_slots_lock:
         if n not in _build_slots:
             _build_slots[n] = threading.BoundedSemaphore(n)
@@ -84,11 +84,11 @@ def _slots() -> threading.BoundedSemaphore:
 
 
 def build_timeout_s() -> float:
-    return float(os.environ.get("AMARH_SCN_GRAPH_TIMEOUT_S", "120"))
+    return float(os.environ.get("ISNAD_SCN_GRAPH_TIMEOUT_S", "120"))
 
 
 def cache_size() -> int:
-    return max(1, int(os.environ.get("AMARH_SCN_GRAPH_CACHE", "3")))
+    return max(1, int(os.environ.get("ISNAD_SCN_GRAPH_CACHE", "3")))
 
 
 @dataclass(eq=False)
@@ -229,7 +229,7 @@ def get_store(conn, ctx: ScenarioCtx, comp, *, dsn: str | None = None, schema: s
     if not isinstance(ctx, ScenarioCtx):
         raise TypeError("ctx must be a ScenarioCtx")
     row = conn.execute(
-        "SELECT amarh_scenario_visible(%s), (SELECT data_version FROM scenario_state WHERE scenario_id = %s), "
+        "SELECT isnad_scenario_visible(%s), (SELECT data_version FROM scenario_state WHERE scenario_id = %s), "
         "current_schema()", [ctx.id, ctx.id]).fetchone()
     if not row[0] or row[1] is None:
         raise ScenarioNotVisible(str(ctx.id))

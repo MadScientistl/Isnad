@@ -13,7 +13,7 @@ BUILD_SCHEMA_SQL = ROOT / "build" / "schema.sql"
 def apply_schema(conn: psycopg.Connection, schema_sql_text: str | None = None) -> None:
     """Apply governance.sql then the compiler DDL to the connection's current search_path schema.
 
-    Both are idempotent. Governance goes first so the `amarh_app` role and the append-only
+    Both are idempotent. Governance goes first so the `isnad_app` role and the append-only
     function exist before the compiler's grants/policies reference them. Commits nothing when
     the caller is inside a transaction block; in autocommit mode each statement script commits.
     """

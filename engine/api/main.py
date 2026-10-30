@@ -2,7 +2,7 @@
 
 Identity: every request carries `x-role`; the role maps to a `Principal(role, 'demo-<role>', region)`
 (there is no real login in v1, but nothing below this seam trusts the client). Unknown roles and the
-system role `sim` are refused (403); a missing header is refused unless AMARH_DEFAULT_ROLE names a role
+system role `sim` are refused (403); a missing header is refused unless ISNAD_DEFAULT_ROLE names a role
 (a documented dev switch, unset by default). Reads run inside `scoped(conn, principal)` (Postgres RLS +
 masked `rd_*` views decide what exists for the caller; hidden == missing, 404 never 403). All mutations go
 through `engine.actions.execute / propose / decide / rollback` with the caller's principal.
@@ -48,7 +48,7 @@ from engine.db.principal import Principal, ScenarioCtx, scoped
 from engine.sync import visibility as V
 from engine.sync.store import SyncConfig
 
-log = logging.getLogger("amarh.api")
+log = logging.getLogger("isnad.api")
 
 DEFAULT_ONTOLOGY = "ontology/supply_chain.yaml"
 HIDDEN = ("valid_during", "recorded_during", "scenario_id", "action_id")
@@ -193,12 +193,12 @@ class InjectBody(BaseModel):
 
 
 MAX_TEXT = 4000          # comment / rationale / reason / note fields
-MAX_BODY_BYTES = int(os.environ.get("AMARH_MAX_BODY_BYTES", str(2 * 1024 * 1024)))
+MAX_BODY_BYTES = int(os.environ.get("ISNAD_MAX_BODY_BYTES", str(2 * 1024 * 1024)))
 MAX_INJECTIONS = 20
 
 
 def _sim_days_cap() -> int:
-    return int(os.environ.get("AMARH_SCN_SIM_MAX_DAYS", "90"))
+    return int(os.environ.get("ISNAD_SCN_SIM_MAX_DAYS", "90"))
 
 
 class ExecBody(BaseModel):
@@ -237,7 +237,7 @@ class MergeBody(BaseModel):
 
 class InjectionBody(BaseModel):
     """One what-if injection. Bounds (review L4): finite numbers only; magnitude in (0, 100]; times within the
-    simulated horizon (AMARH_SCN_SIM_MAX_DAYS); target is a UUID (validated by pydantic)."""
+    simulated horizon (ISNAD_SCN_SIM_MAX_DAYS); target is a UUID (validated by pydantic)."""
     kind: Literal["port_closure", "shipment_delay", "supplier_delay", "price_shock", "invoice_anomaly"]
     target: UUID | None = None
     at_h: float | None = Field(default=None, ge=0, le=24 * 365, allow_inf_nan=False)
@@ -309,9 +309,9 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
                agent_model_factory: Any = None) -> FastAPI:
     """`runner` / `pipeline`: optional injected doubles. `pipeline=False` disables sync entirely.
     `agent_model_factory(principal) -> model client` (tests inject MockModel; default: Anthropic, needs a key)."""
-    path = ontology_path or os.environ.get("AMARH_ONTOLOGY", DEFAULT_ONTOLOGY)
+    path = ontology_path or os.environ.get("ISNAD_ONTOLOGY", DEFAULT_ONTOLOGY)
     from pathlib import Path as _Path
-    schema = schema or os.environ.get("AMARH_SCHEMA")
+    schema = schema or os.environ.get("ISNAD_SCHEMA")
     comp = compile_ontology(path)
     om = comp.model
     models = comp.pydantic_models()
@@ -319,7 +319,7 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
 
     state = {"runner": runner, "runner_failed": False,
              "pipeline": pipeline if pipeline is not None else
-             (False if os.environ.get("AMARH_PIPELINE", "1") == "0" else None),
+             (False if os.environ.get("ISNAD_PIPELINE", "1") == "0" else None),
              "reasoning": False}
     plock = threading.RLock()
     worker = {"stop": None, "thread": None}
@@ -347,15 +347,15 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
                 c.close()
         except Exception as e:  # database may be down at startup; endpoints will report it
             log.warning("startup schema check failed: %s", e)
-        if os.environ.get("AMARH_OUTBOX_WORKER", "1") != "0":
+        if os.environ.get("ISNAD_OUTBOX_WORKER", "1") != "0":
             stop = threading.Event()
             th = threading.Thread(
                 target=outbox_mod.run_worker, name="outbox-worker", daemon=True,
-                args=(stop, float(os.environ.get("AMARH_OUTBOX_INTERVAL_S", "2"))),
+                args=(stop, float(os.environ.get("ISNAD_OUTBOX_INTERVAL_S", "2"))),
                 kwargs={"conn_factory": lambda: connect(dsn, schema=schema), "ontology": comp})
             th.start()
             worker["stop"], worker["thread"] = stop, th
-        if os.environ.get("AMARH_SIM_AUTOSTART", "0") == "1":
+        if os.environ.get("ISNAD_SIM_AUTOSTART", "0") == "1":
             try:
                 get_runner().start()
             except HTTPException:
@@ -370,7 +370,7 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
             except Exception:  # noqa: BLE001
                 pass
 
-    app = FastAPI(title="Amarh ontology API", lifespan=lifespan)
+    app = FastAPI(title="Isnad ontology API", lifespan=lifespan)
     app.add_middleware(_BodyLimit, max_bytes=MAX_BODY_BYTES)
     app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
                        allow_methods=["*"], allow_headers=["*"])
@@ -392,7 +392,7 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
     # ---------------------------------------------------------- identity + connections
     def get_principal(x_role: str | None = Header(default=None)) -> Principal:
         """The single identity seam. Unknown role / `sim` / missing header => 403."""
-        role = x_role or os.environ.get("AMARH_DEFAULT_ROLE") or None
+        role = x_role or os.environ.get("ISNAD_DEFAULT_ROLE") or None
         if not role:
             raise ApiError(403, "role_required", "x-role header required")
         if role == "sim" or role not in om.roles:
@@ -847,8 +847,8 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
         if body.speed is not None and str(body.speed) not in SPEEDS:
             raise HTTPException(422, f"speed must be one of {list(SPEEDS)}")
         if body.reset:
-            if os.environ.get("AMARH_ALLOW_RESET") != "1":
-                raise HTTPException(403, "reset deletes all data in this schema; set AMARH_ALLOW_RESET=1 to allow it")
+            if os.environ.get("ISNAD_ALLOW_RESET") != "1":
+                raise HTTPException(403, "reset deletes all data in this schema; set ISNAD_ALLOW_RESET=1 to allow it")
         try:
             if body.reset:
                 r.stop()
@@ -1721,7 +1721,7 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
 
     @app.post("/scenarios/{sid}/simulate", status_code=202)
     def simulate_scenario(sid: int, body: SimulateBody, p: Principal = Depends(get_principal), conn=Depends(wconn)):
-        max_days = int(os.environ.get("AMARH_SCN_SIM_MAX_DAYS", "90"))
+        max_days = int(os.environ.get("ISNAD_SCN_SIM_MAX_DAYS", "90"))
         if not 1 <= body.days <= max_days:
             raise ApiError(422, "invalid", f"days must be 1..{max_days}")
         try:
