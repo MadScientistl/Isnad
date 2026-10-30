@@ -10,6 +10,7 @@ proposal|finished, "payload": {...}, "tokens_in", "tokens_out", "cost_usd"}. Onl
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import threading
 from dataclasses import dataclass, field
@@ -24,6 +25,9 @@ from .tools import run_tool, safe_input, tool_schemas
 
 MAX_TOOL_RESULT_CHARS = 24_000
 PER_CALL_MAX_TOKENS = 16_000
+
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -175,8 +179,29 @@ class AgentRun:
             res.error = res.error or f"audit sink failed: {type(e).__name__}"
             res.status = "error"
         finally:
+            self._expire_scenarios()
             ctx.close()
         return res
+
+    def _expire_scenarios(self) -> None:
+        """Run ended (any state): discard the run's scenarios that no proposal references. Best effort."""
+        ctx = self.ctx
+        if not ctx.scenario_ids:
+            return
+        if ctx.on_finish is not None:
+            try:
+                ctx.on_finish()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            from engine.scenarios.service import expire_run
+            c = ctx.conn_factory()
+            try:
+                expire_run(c, ctx.run_id)
+            finally:
+                c.close()
+        except Exception as e:  # noqa: BLE001 - never fails the run
+            log.warning("expire_run failed for %s: %s", ctx.run_id, type(e).__name__)
 
     def _tool(self, tu, res: RunResult) -> dict:
         ctx = self.ctx

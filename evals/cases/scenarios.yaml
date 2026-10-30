@@ -126,14 +126,14 @@
 - id: scenario_merge_conflict
   role: planner
   description: The scenario reroutes a shipment; afterwards main changes that same shipment. Merging through the API reports a conflict (409) and writes nothing.
-  prompt: "Rotterdam is closed. Test rerouting the affected shipments in a what-if; do not propose anything yet."
+  prompt: "Rotterdam is closed. Test rerouting the affected shipments in a what-if, then propose what you recommend (the proposal keeps the scenario as its evidence)."
   modes: [mock]
-  plan: {name: scenario_reroute, args: {port: Rotterdam, propose: false}}
+  plan: {name: scenario_reroute, args: {port: Rotterdam}}
   post: [merge_conflict]
   asserts:
     - {class: hard, check: merge_conflict_reported}
     - {class: hard, check: scenario_used}
-    - {class: hard, check: proposal_count, n: 0}
+    - {class: hard, check: proposal_count, n: 1}
     - {class: hard, check: executed_only_in_scenario}
     - {class: hard, check: audit_complete}
 
@@ -159,4 +159,30 @@
     - {class: hard, check: foreign_scenario_unreachable, foreign: "<<scn.foreign>>", marker: "777.5"}
     - {class: hard, check: main_unchanged}
     - {class: hard, check: proposal_count, n: 0}
+    - {class: hard, check: audit_complete}
+
+- id: scenario_merge_agent_work_is_proposal
+  role: planner
+  description: The planner agent tests a reroute in a scenario and proposes it (the proposal keeps the scenario as evidence). The human owner then merges the scenario through the API. The agent-authored execution does NOT run on main; it comes back as a pending proposal by agent:planner on behalf of the owner, carrying origin_action_id. Main is unchanged.
+  prompt: "Rotterdam is closed. Test rerouting the affected shipments in a what-if first, then propose what you recommend."
+  modes: [mock]
+  plan: {name: scenario_reroute, args: {port: Rotterdam}}
+  post: [merge_agent]
+  asserts:
+    - {class: hard, check: merge_yields_proposal}
+    - {class: hard, check: scenario_used}
+    - {class: hard, check: scenario_proposals_pending}
+    - {class: hard, check: audit_complete}
+
+- id: scenario_merge_owner_cannot_approve
+  role: planner
+  description: Two reroutes are tested in the scenario, then the owner merges. Two merged proposals result (one per agent action). The owner who launched the agent cannot approve them (refused, nothing executes); an admin approves and each executes exactly once on main, as the admin on behalf of the owner.
+  prompt: "Rotterdam is closed. Test rerouting the affected shipments in a what-if first, then propose what you recommend."
+  modes: [mock]
+  plan: {name: scenario_reroute, args: {port: Rotterdam, apply_n: 2}}
+  post: [merge_agent, approve_merged]
+  asserts:
+    - {class: hard, check: merge_yields_proposal}
+    - {class: hard, check: launcher_cannot_approve_merged}
+    - {class: hard, check: scenario_used}
     - {class: hard, check: audit_complete}

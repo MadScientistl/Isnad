@@ -209,13 +209,63 @@ def test_foreign_scenario_is_unreachable(world, factory, conn):
     assert "777.5" not in str(q.envelope) and ctx.sid != foreign["id"]
 
 
-def test_agent_principal_cannot_write_a_launchers_scenario(world, factory, conn):
-    """Documents why scenario writes use the launching human: the agent identity is not the scenario owner."""
+def test_agent_principal_writes_launchers_scenario_as_agent_on_behalf(world, factory, conn):
+    """The agent identity (agent:<role>, on_behalf_of = launcher) writes the launcher's scenario; audit says so."""
     ctx = opened("planner", factory, world)
-    from engine.actions.core import ScenarioNotFound
-    with pytest.raises(ScenarioNotFound):
-        execute(conn, "delay_shipment", {"shipment": world["s_emea"], "delay_hours": 1.0, "reason": "x"},
-                ctx.agent_principal, valid_at=datetime.now(UTC), scenario_id=ctx.sid, ontology=COMP)
+    assert ctx.agent_principal.user == "agent:planner" and ctx.agent_principal.on_behalf_of == ctx.principal.user
+    assert call(ctx, "scenario_apply", "a1", action="delay_shipment",
+                params={"shipment": str(world["s_emea"]), "delay_hours": 3.0, "reason": "x"}).ok
+    rows = conn.execute("SELECT actor, on_behalf_of, source FROM audit_event WHERE scenario_id = %s AND "
+                        "status='executed'", [ctx.sid]).fetchall()
+    conn.rollback()
+    assert rows == [("agent:planner", ctx.principal.user, "agent")]
+
+
+@pytest.mark.parametrize("role,action,params", [
+    ("finance_analyst", "delay_shipment", lambda w: {"shipment": w["s_emea"], "delay_hours": 1.0, "reason": "x"}),
+    ("regional_ops_lead", "reroute_shipment", None),
+])
+def test_engine_denies_agent_principal_what_the_role_cannot_execute(world, factory, conn, role, action, params):
+    """Defence in depth: even with the agent code bypassed, the engine permission check on the agent principal
+    (role of the launcher) refuses actions the launcher's role cannot execute."""
+    from engine.actions import PermissionDenied
+    ctx = ctx_for(role, factory)
+    d = scenarios.create(conn, ctx.agent_principal, "x", run_id=ctx.run_id, ontology=COMP)
+    ctx.see_id(str(world["s_emea"]))
+    p = params(world) if params else {"shipment": world["s_emea"], "new_port": world["apac_port"], "reason": "x"}
+    with pytest.raises((PermissionDenied, ValueError)):
+        execute(conn, action, p, ctx.agent_principal, valid_at=datetime.now(UTC), source="agent",
+                run_id=ctx.run_id, scenario_id=d["id"], ontology=COMP)
+    conn.rollback()
+    rows = conn.execute("SELECT count(*) FROM audit_event WHERE scenario_id=%s AND status='executed'",
+                        [d["id"]]).fetchone()
+    conn.rollback()
+    assert rows[0] == 0
+
+
+def test_scenario_proposal_is_attributed_to_the_agent(world, factory, conn):
+    ctx = opened("planner", factory, world)
+    q = call(ctx, "query_objects", "q1", type="Shipment", filters=[{"property": "ref", "op": "eq", "value": "SH-EMEA"}])
+    ref = q.envelope["data"]["objects"][0]["ref"]
+    assert call(ctx, "propose_action", "p1", action="delay_shipment",
+                params={"shipment": str(world["s_emea"]), "delay_hours": 5.0, "reason": "x"}, rationale="r",
+                evidence=[{"ref": ref, "claim": "c", "kind": "asserted", "tool_call_id": "q1"}]).ok
+    row = conn.execute("SELECT proposer, on_behalf_of, scenario_id FROM proposal WHERE run_id=%s",
+                       [ctx.run_id]).fetchall()
+    conn.rollback()
+    assert row == [("agent:planner", ctx.principal.user, ctx.sid)]
+
+
+def test_expire_run_discards_unreferenced_scenarios_at_run_end(world, factory, conn):
+    from agent import Turn
+    res, sink, _m, ctx = run_agent("planner", factory, [
+        Turn(tool_uses=[("a", "scenario_open", {"name": "tmp"})]), Turn(tool_uses=[tu("b", "scenario_compare")]),
+        Turn(text="done")])
+    assert res.status == "completed" and ctx.scenario_ids
+    conn.rollback()
+    ev = conn.execute("SELECT kind FROM scenario_event WHERE scenario_id=%s ORDER BY seq", [ctx.scenario_ids[0]]).fetchall()
+    conn.rollback()
+    assert ("discarded",) in ev
 
 
 # ------------------------------------------------------------------ compare

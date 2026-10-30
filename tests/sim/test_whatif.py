@@ -159,3 +159,34 @@ def test_14_day_timing(world):
     r = go(schema, ctx, days=14)
     print(f"\n14-day what-if: {time.perf_counter() - t0:.1f}s, {r.actions} actions")
     assert r.last_error is None and r.actions > 100
+
+
+def test_deadline_stops_cleanly_with_partial_result(world):
+    schema, _ = world
+    ctx, _p = fork(schema)
+    r = go(schema, ctx, days=5, deadline=time.monotonic() - 1)
+    assert r.partial and "time budget" in (r.last_error or "")
+    assert r.sim_now < EPOCH + timedelta(days=6, hours=24 * 5 - 1) and r.actions == 0 or r.partial
+
+
+def test_discarded_scenario_returns_a_clean_error(world):
+    schema, _ = world
+    ctx, p = fork(schema)
+    c = connect(schema=schema)
+    try:
+        scenarios.discard(c, p, ctx.id)
+    finally:
+        c.close()
+    r = go(schema, ctx, days=1)
+    assert r.partial and r.last_error and ("ScenarioNotFound" in r.last_error or "ScenarioLimit" in r.last_error)
+
+
+def test_sim_slots_are_shared_and_bounded(monkeypatch):
+    from sim import limits
+    monkeypatch.setenv("AMARH_SCN_MAX_SIM_JOBS", "2")
+    limits._sem = None
+    assert limits.acquire_sim_slot(0) and limits.acquire_sim_slot(0) and not limits.acquire_sim_slot(0)
+    limits.release_sim_slot()
+    assert limits.acquire_sim_slot(0)
+    limits.release_sim_slot(); limits.release_sim_slot()
+    limits._sem = None

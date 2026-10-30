@@ -59,6 +59,7 @@ class AgentContext:
     scn: ScenarioCtx | None = None                   # the run's ACTIVE scenario (never set from model input)
     scn_name: str = ""
     scenario_ids: list = field(default_factory=list)  # every scenario this run opened, in order
+    on_finish: object = None                         # optional callable run before the run's scenarios are expired
     _conn: object = None
 
     def __post_init__(self):
@@ -81,8 +82,8 @@ class AgentContext:
 
     @property
     def agent_principal(self) -> Principal:
-        p = self.principal
-        return Principal(p.role, f"agent:{p.role}", p.region, p.approves)
+        from engine.actions import make_agent_principal
+        return make_agent_principal(self.principal)
 
     @property
     def sid(self) -> int:

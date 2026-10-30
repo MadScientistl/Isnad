@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -28,6 +29,7 @@ import psycopg
 from engine.actions import ApprovalRequired, CriteriaFailed, PermissionDenied, execute
 from engine.actions.core import SIM
 from engine.db.principal import Principal
+from engine.scenarios import ScenarioLimit, ScenarioNotFound
 
 from .runner import _canon, digest_line
 from .world import World
@@ -49,6 +51,7 @@ class WhatIfResult:
     skipped: list[str] = field(default_factory=list)
     stats: dict = field(default_factory=dict)
     last_error: str | None = None
+    partial: bool = False         # stopped early (deadline reached, scenario gone or limit hit)
 
 
 def max_days() -> int:
@@ -91,12 +94,12 @@ def start_time(conn, ctx, epoch: datetime = EPOCH) -> datetime:
 
 
 def run(conn_factory, scenario_ctx, *, days, seed, injections=(), ontology=None, schema=None, dsn=None,
-        principal: Principal | None = None, epoch: datetime = EPOCH, kpi_principal: Principal | None = None
-        ) -> WhatIfResult:
+        principal: Principal | None = None, epoch: datetime = EPOCH, kpi_principal: Principal | None = None,
+        deadline: float | None = None) -> WhatIfResult:
     """Run a what-if in `scenario_ctx`. `conn_factory()` returns a fresh owner-side connection (the caller's
     job runner passes `lambda: connect(dsn, schema=schema)`); `schema`/`dsn` are accepted for symmetry and used
     only when `conn_factory` is None. `principal`/`kpi_principal`: whose RLS the returned KPIs use (default
-    admin). Raises ValueError for days outside 1..AMARH_SCN_SIM_MAX_DAYS or a bad injection."""
+    admin). `deadline` = time.monotonic() value after which the run stops cleanly with `partial=True`. Raises ValueError for days outside 1..AMARH_SCN_SIM_MAX_DAYS or a bad injection."""
     cap = max_days()
     days = float(days)
     if not 0 < days <= cap:
@@ -122,7 +125,7 @@ def run(conn_factory, scenario_ctx, *, days, seed, injections=(), ontology=None,
         specs = _normalise(injections, start_h)
 
         sha = hashlib.sha256()
-        state = {"actions": 0, "err": None}
+        state = {"actions": 0, "err": None, "stop": False, "partial": False}
 
         def rollback():
             try:
@@ -137,6 +140,11 @@ def run(conn_factory, scenario_ctx, *, days, seed, injections=(), ontology=None,
             except (psycopg.OperationalError, psycopg.InterfaceError):
                 rollback()
                 raise
+            except (ScenarioLimit, ScenarioNotFound) as e:      # row cap hit or the scenario expired / was discarded
+                rollback()
+                state["err"] = f"{name} at {valid_at.isoformat()}: {type(e).__name__}: {e}"
+                state["stop"] = True
+                return None
             except (ValueError, PermissionDenied, CriteriaFailed, ApprovalRequired, psycopg.Error) as e:
                 rollback()
                 state["err"] = f"{name} at {valid_at.isoformat()}: {e}"
@@ -161,17 +169,45 @@ def run(conn_factory, scenario_ctx, *, days, seed, injections=(), ontology=None,
 
         h = start_h
         while h < end_h:
+            if deadline is not None and time.monotonic() >= deadline:
+                state["partial"] = True
+                state["err"] = state["err"] or "stopped: the run's time budget was exhausted"
+                break
             h += 1
-            w.env.run(until=h + 0.5)
-            set_clock(h)
+            try:
+                w.env.run(until=h + 0.5)
+                if state["stop"]:
+                    state["partial"] = True
+                    break
+                set_clock(h)
+            except (ScenarioLimit, ScenarioNotFound, LookupError) as e:
+                rollback()
+                state["err"] = f"{type(e).__name__}: {e}"
+                state["partial"] = True
+                break
+            except psycopg.Error as e:
+                rollback()
+                state["err"] = f"database error: {str(e).splitlines()[0] if str(e) else type(e).__name__}"[:300]
+                state["partial"] = True
+                break
         sim_now = epoch + timedelta(hours=h)
         from engine import kpis as kpis_mod
-        k = kpis_mod.compute(conn, kp, scenario_id=sid)
-        conn.commit()
+        try:
+            k = kpis_mod.compute(conn, kp, scenario_id=sid)
+            conn.commit()
+        except (ScenarioLimit, ScenarioNotFound, LookupError, psycopg.Error) as e:
+            rollback()
+            k = {}
+            state["partial"] = True
+            state["err"] = state["err"] or f"kpis unavailable: {type(e).__name__}"
+            _ = e
         return WhatIfResult(digest=sha.hexdigest(), actions=state["actions"], kpis=k, sim_now=sim_now,
                             injections=[{**s, "target": None if s["target"] is None else str(s["target"])}
                                         for s in specs],
-                            skipped=list(w.skipped), stats=dict(w.stats), last_error=state["err"])
+                            skipped=list(w.skipped), stats=dict(w.stats), last_error=state["err"], partial=state["partial"])
+    except (ScenarioLimit, ScenarioNotFound, LookupError) as e:     # expired / discarded / row cap: clean error, no crash
+        return WhatIfResult(digest="", actions=0, kpis={}, sim_now=epoch, last_error=f"{type(e).__name__}: {e}",
+                            partial=True)
     finally:
         try:
             conn.close()

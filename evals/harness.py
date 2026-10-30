@@ -89,6 +89,7 @@ class Run:
     fp_before: str = ""
     scenario_ids: list = field(default_factory=list)
     base_seq: int = 0
+    scn_overrides: list = field(default_factory=list)   # override rows captured when the run ended
 
     # ---- views over the events
     def calls(self):
@@ -158,6 +159,13 @@ def run_agent(world: World, role: str, prompt: str, mode: str = "mock", plan: st
     ctx = AgentContext(principal, comp(), world.factory, pipeline=world.pipeline,
                        caps=Caps.for_role(comp().model.roles[role], **cap_kw))
     base = _max_seq(world)
+    captured: list = []
+
+    def _capture():       # the run's unreferenced scenarios are purged when it ends; keep what the checks need
+        captured.extend(admin_rows(world, "SELECT o.scenario_id, o.kind, o.type, o.key_a FROM scenario_override o "
+                                          "JOIN scenario s ON s.id = o.scenario_id WHERE s.run_id = %s",
+                                   [ctx.run_id]))
+    ctx.on_finish = _capture
     mem, db = MemorySink(), DbSink(world.factory, principal)
     tee = TeeSink(db, mem)
     fp_before = world.fingerprint()
@@ -176,6 +184,7 @@ def run_agent(world: World, role: str, prompt: str, mode: str = "mock", plan: st
                "p.dry_run, p.expires_at, p.run_id, p.scenario_id, a.decision FROM proposal p LEFT JOIN approval a "
                "ON a.proposal_id = p.id WHERE p.run_id = %s ORDER BY p.seq", [ctx.run_id])
     r.base_seq = base
+    r.scn_overrides = captured
     r.scenario_ids = [int(x["id"]) for x in admin_rows(
         world, "SELECT id FROM scenario WHERE run_id = %s ORDER BY id", [ctx.run_id])]
     r.executions = _exec_rows(world, base)
@@ -232,11 +241,63 @@ def _merge_conflict_hook(run: Run, cl, out: dict) -> None:
     out["merge_exec"] = [e["name"] for e in _exec_rows(run.world, 0) if e["source"] == "scenario_merge"]
 
 
+def _merge_rows(world, sql_after: int, scn_run_id: str) -> tuple[list, list]:
+    ex = admin_rows(world, "SELECT seq, name, actor, source, status, on_behalf_of, scenario_id, origin_action_id FROM "
+                           "audit_event WHERE seq > %s AND scenario_id = 0 AND status = 'executed' ORDER BY seq",
+                    [sql_after])
+    pr = admin_rows(world, "SELECT p.id, p.action, p.proposer, p.proposer_role, p.on_behalf_of, p.origin_action_id, "
+                           "p.run_id, a.decision FROM proposal p LEFT JOIN approval a ON a.proposal_id = p.id "
+                           "WHERE p.origin_action_id IS NOT NULL AND p.rationale LIKE 'Merged from scenario%%' "
+                           "ORDER BY p.seq")
+    return ex, pr
+
+
+def _merge_hook(run: Run, cl, out: dict) -> None:
+    """The scenario OWNER merges the agent's scenario through the API: agent work must come back as proposals."""
+    sid = run.scenario_ids[0]
+    agent_exec = [e for e in _exec_rows(run.world, 0) if e["scenario_id"] == sid and e["status"] == "executed"
+                  and (str(e["actor"]).startswith("agent:") or e["source"] == "agent")]
+    seq0 = _max_seq(run.world)
+    pre_props = {str(x["id"]) for x in admin_rows(run.world, "SELECT id FROM proposal")}
+    fp_pre = run.world.fingerprint()
+    r = cl.post(f"/scenarios/{sid}/merge", json={"comment": "eval merge"}, headers=H(run.role))
+    ex, pr = _merge_rows(run.world, seq0, run.run_id)
+    new = [x for x in pr if str(x["id"]) not in pre_props]
+    out["merge_agent"] = {"status": r.status_code, "body": _short(r), "scenario_agent_execs": len(agent_exec),
+                          "main_execs": [dict(e, origin_action_id=str(e["origin_action_id"])) for e in ex],
+                          "new_proposals": [{k: (str(v) if v is not None else None) for k, v in x.items()} for x in new],
+                          "fp": (fp_pre, run.world.fingerprint()),
+                          "origin_ids": sorted(str(e["action_id"]) for e in _agent_action_ids(run, sid))}
+
+
+def _agent_action_ids(run, sid):
+    return admin_rows(run.world, "SELECT action_id FROM audit_event WHERE scenario_id = %s AND status = 'executed' "
+                                 "AND (actor LIKE 'agent:%%' OR source = 'agent')", [sid])
+
+
+def _approve_merged_hook(run: Run, cl, out: dict) -> None:
+    m = out.get("merge_agent") or {}
+    props = m.get("new_proposals") or []
+    out["merged_owner_approve"], out["merged_admin_approve"] = [], []
+    for pp in props:
+        r = cl.post(f"/proposals/{pp['id']}/approve", json={}, headers=H(run.role))
+        out["merged_owner_approve"].append({"status": r.status_code, "body": _short(r)})
+    out["merged_after_owner"] = [_proposal_execs(run.world, pp["id"]) for pp in props]
+    for pp in props:
+        r = cl.post(f"/proposals/{pp['id']}/approve", json={"comment": "ok"}, headers=H("admin"))
+        out["merged_admin_approve"].append({"status": r.status_code, "body": _short(r)})
+    out["merged_execs"] = [_proposal_execs(run.world, pp["id"]) for pp in props]
+
+
 def run_post_hooks(run: Run, hooks: list) -> dict:
     if not hooks:
         return {}
     cl = api_client(run.world)
     out: dict = {}
+    if "merge_agent" in hooks and run.scenario_ids:
+        _merge_hook(run, cl, out)
+        if "approve_merged" in hooks:
+            _approve_merged_hook(run, cl, out)
     if "merge_conflict" in hooks and run.scenario_ids:
         _merge_conflict_hook(run, cl, out)
     if not run.proposals:

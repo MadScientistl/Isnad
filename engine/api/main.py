@@ -1679,10 +1679,16 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
     # `sim.whatif.run` is the Simulation role's entry point; until it exists a job ends in error "whatif not available".
     sim_jobs: dict[str, dict] = {}
     sim_lock = threading.Lock()
-    MAX_SIM_JOBS = int(os.environ.get("AMARH_SCN_MAX_SIM_JOBS", "2"))
+    from sim import limits as sim_limits
     app.state.sim_jobs = sim_jobs
 
     def sim_worker(job_id: str, sid: int, p: Principal, days: int, seed: int, injections: list[dict]):
+        try:
+            _sim_worker_body(job_id, sid, p, days, seed, injections)
+        finally:
+            sim_limits.release_sim_slot()
+
+    def _sim_worker_body(job_id: str, sid: int, p: Principal, days: int, seed: int, injections: list[dict]):
         try:
             try:
                 import importlib
@@ -1732,13 +1738,19 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
             running = [v for v in sim_jobs.values() if v["status"] == "running"]
             if any(v["scenario_id"] == sid for v in running):
                 raise ApiError(409, "simulation_running", "a simulation is already running in this scenario")
-            if len(running) >= MAX_SIM_JOBS:
+            if not sim_limits.acquire_sim_slot(0):
                 raise ApiError(429, "too_many_requests", "too many simulations are running")
             sim_jobs[job_id] = {"status": "running", "scenario_id": sid, "user": p.user, "t0": time.time(),
                                 "sim_now": None, "digest": None, "actions": None, "error": None}
-        threading.Thread(target=sim_worker, name=f"whatif-{job_id[:6]}", daemon=True, args=(
-            job_id, sid, p, body.days, body.seed, [i.model_dump(mode="json", exclude_none=True) for i in body.injections])
-        ).start()
+        try:
+            threading.Thread(target=sim_worker, name=f"whatif-{job_id[:6]}", daemon=True, args=(
+                job_id, sid, p, body.days, body.seed,
+                [i.model_dump(mode="json", exclude_none=True) for i in body.injections])).start()
+        except Exception:  # noqa: BLE001
+            sim_limits.release_sim_slot()
+            with sim_lock:
+                sim_jobs.pop(job_id, None)
+            raise
         return {"job_id": job_id}
 
     @app.get("/scenarios/{sid}/simulate/{job_id}")

@@ -611,12 +611,9 @@ def propose_action(ctx, conn, a: ProposeIn, call_id) -> Result:
                                     separators=(",", ":")).encode()).hexdigest()
     ev = [e.model_dump() for e in a.evidence]
     sid = ctx.sid
-    # DEVIATION (see report): the engine lets only the scenario owner (the launching human) or an admin write a
-    # scenario, and an `agent:<role>` principal is neither, so with an active scenario the proposal is stored
-    # through the launching human's identity (proposer = launcher, on_behalf_of = launcher). The launcher still
-    # cannot approve it (decide() refuses proposer / on_behalf_of), it executes only on main after a human
-    # approves, and the evidence scenario is recorded.
-    who = ctx.principal if sid else ctx.agent_principal
+    # Proposer is always `agent:<role>` with on_behalf_of = launcher (also inside a scenario: the database lets
+    # the agent identity write its launcher's scenarios; the launcher cannot approve, see engine.decide).
+    who = ctx.agent_principal
     pid = propose(conn, a.action, dict(a.params), who, a.rationale, valid_at=ctx.now(),
                   source="agent", run_id=ctx.run_id, tool_trace=list(ctx.trace), ontology=ctx.comp,
                   on_behalf_of=ctx.principal.user, evidence=ev, idempotency_key=key, scenario_id=sid)
@@ -645,7 +642,7 @@ def _need_scenario(ctx) -> None:
 
 def _refresh_scn(ctx, conn) -> None:
     """Re-read the active scenario (its clock moves after a what-if run). Same server-side resolver as the API."""
-    ctx.scn = scn_svc.resolve(conn, ctx.principal, ctx.scn.id)
+    ctx.scn = scn_svc.resolve(conn, ctx.agent_principal, ctx.scn.id)
 
 
 def _scn_info(ctx) -> dict:
@@ -657,10 +654,10 @@ def scenario_open(ctx, conn, a: ScenarioOpenIn, call_id) -> Result:
     if len(ctx.scenario_ids) >= _per_run_cap():
         raise ToolError(f"scenario limit reached: at most {_per_run_cap()} scenarios per run")
     try:
-        d = scn_svc.create(conn, ctx.principal, a.name, run_id=ctx.run_id, ontology=ctx.comp)
+        d = scn_svc.create(conn, ctx.agent_principal, a.name, run_id=ctx.run_id, ontology=ctx.comp)
     except scn_svc.ScenarioLimit as e:
         raise ToolError(f"scenario limit reached: {e}"[:300]) from None
-    ctx.scn = scn_svc.resolve(conn, ctx.principal, d["id"])
+    ctx.scn = scn_svc.resolve(conn, ctx.agent_principal, d["id"])
     ctx.scn_name = d["name"]
     ctx.scenario_ids.append(d["id"])
     return Result({"scenario_id": d["id"], "name": d["name"], "owner": d["owner_user"],
@@ -691,7 +688,7 @@ def _diff_view(diff: list, limit: int = 25) -> dict:
 def scenario_compare(ctx, conn, a: ScenarioCompareIn, call_id) -> Result:
     _need_scenario(ctx)
     try:
-        res = scn_svc.compare(conn, ctx.principal, ctx.sid, 0, ontology=ctx.comp)
+        res = scn_svc.compare(conn, ctx.agent_principal, ctx.sid, 0, ontology=ctx.comp)
     except scn_svc.ScenarioNotFound:
         raise ToolError("scenario not available") from None
     k = res["kpis"]
@@ -705,9 +702,9 @@ def scenario_apply(ctx, conn, a: ScenarioApplyIn, call_id) -> Result:
     _need_scenario(ctx)
     check_action(ctx, a.action)
     _check_action_params(ctx, a.action, a.params)
-    # Executed through the launching human's identity (owner of the scenario) with source='agent' and the run id;
-    # the agent allowlist and role.actions were enforced just above (intersection), RLS/criteria by the engine.
-    res = execute(conn, a.action, dict(a.params), ctx.principal, valid_at=ctx.now(), source="agent",
+    # Executed as `agent:<role>` on behalf of the launcher, source='agent', run id; the allowlist is enforced above
+    # and role.actions/RLS/criteria again by the engine with the agent principal.
+    res = execute(conn, a.action, dict(a.params), ctx.agent_principal, valid_at=ctx.now(), source="agent",
                   run_id=ctx.run_id, tool_trace=list(ctx.trace), ontology=ctx.comp, scenario_id=ctx.sid)
     for t, ids in (res.created or {}).items():
         for i in ([ids] if not isinstance(ids, (list, tuple, set)) else ids):
@@ -738,14 +735,23 @@ def scenario_simulate(ctx, conn, a: ScenarioSimulateIn, call_id) -> Result:
         inj.append(d)
     seed = ctx.sid
     spawned = []
+    from sim import limits as sim_limits       # one slot pool shared with the API job registry
+    if not sim_limits.acquire_sim_slot(0.0):
+        raise ToolError("too many simulations are running right now; try again later")
 
     def factory():                      # every connection the simulation opens is closed when it returns
         c = ctx.conn_factory()
         spawned.append(c)
         return c
+    # stop cleanly before the run's wall-clock cap (leave a little time to report)
+    left = ctx.remaining_s() - 2.0
+    if left <= 0:
+        sim_limits.release_sim_slot()
+        raise ToolError("not enough time left in this run for a simulation")
+    deadline = time.monotonic() + left
     try:
         r = whatif.run(factory, ctx.scn, days=a.days, seed=seed, injections=inj, ontology=ctx.comp,
-                       principal=ctx.principal, kpi_principal=ctx.principal)
+                       principal=ctx.principal, kpi_principal=ctx.principal, deadline=deadline)
     except ValueError as e:
         raise ToolError(f"simulation refused: {str(e)[:200]}") from None
     finally:
@@ -754,11 +760,13 @@ def scenario_simulate(ctx, conn, a: ScenarioSimulateIn, call_id) -> Result:
                 c.close()
             except Exception:  # noqa: BLE001
                 pass
+        sim_limits.release_sim_slot()
     _refresh_scn(ctx, conn)
     kp = kpis_mod.compute(conn, ctx.principal, ctx.sid)    # always under the caller's RLS, not the sim's view
     conn.rollback()                                       # read-only: leave no open transaction behind
     return Result({"scenario_id": ctx.sid, "days": a.days, "injections": inj, "digest": r.digest,
                    "actions_simulated": int(r.actions), "sim_now": _j(r.sim_now), "kpis": _j(kp),
+                   "partial": bool(getattr(r, "partial", False)), "last_error": getattr(r, "last_error", None),
                    "note": "Simulated inside your scenario only; call scenario_compare for the before/after."})
 
 
