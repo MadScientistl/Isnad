@@ -169,20 +169,86 @@ METRICS = {
     "exposure_suppliers": _exposure_suppliers,
 }
 
+# Built-in (hand-written SQL) metrics and what each one reads: (object types, link types, (Type, prop) pairs).
+# A built-in is offered for an ontology only when all of it exists there; anything else comes from the
+# ontology's `kpis:` block.
+_NEEDS = {
+    "value_at_risk": (("Shipment", "Port"), ("ships_via",), (("Shipment", "cargo_value"), ("Shipment", "status"),
+                                                              ("Port", "status"))),
+    "delay_hours_total": (("Shipment",), (), (("Shipment", "delay_hours"),)),
+    "shipments_delayed": (("Shipment",), (), (("Shipment", "status"),)),
+    "shipments_in_transit": (("Shipment",), (), (("Shipment", "status"),)),
+    "ports_closed": (("Port",), (), (("Port", "status"),)),
+    "invoices_flagged": (("Invoice",), (), (("Invoice", "status"),)),
+    "extra_cost": (("Shipment", "Supplier"), (), (("Shipment", "extra_cost"), ("Supplier", "price_index"))),
+    "exposure_shipments": (("Shipment", "Port"), ("ships_via",), (("Shipment", "status"), ("Port", "status"))),
+    "exposure_suppliers": (("Shipment", "Port", "Invoice", "Supplier"),
+                           ("ships_via", "invoices_for", "billed_by", "supplies"),
+                           (("Shipment", "status"), ("Port", "status"))),
+}
 
-def compute(conn, principal, scenario_id: int = 0, as_of_valid: datetime | None = None) -> dict:
-    """All KPIs for main (scenario_id 0) or a scenario, as the caller sees the world."""
+
+def _model(ontology):
+    """The Ontology to compute for. None = the process default (legacy callers and tests)."""
+    if ontology is None:
+        from engine.actions.core import _load
+        return _load(None)
+    return getattr(ontology, "model", ontology)
+
+
+def _builtin_ok(m, key) -> bool:
+    types, links, props = _NEEDS[key]
+    return (all(t in m.object_types for t in types) and all(l in m.link_types for l in links)
+            and all(p in {x.name for x in m.object_types[t].properties} for t, p in props))
+
+
+def metric_keys(ontology=None) -> tuple[str, ...]:
+    """KPI keys available for the ontology: applicable built-ins (fixed order) then declared KPIs."""
+    m = _model(ontology)
+    keys = [k for k in KPI_KEYS if _builtin_ok(m, k)]
+    keys += [k for k in getattr(m, "kpis", {}) if k not in keys]
+    return tuple(keys)
+
+
+def _declared(m, key):
+    def fn(conn, sid, as_of):
+        from engine.compiler import kpi_sql
+        k = m.kpis[key]
+        q = _Q(sid, as_of, conn)
+        rel = q.obj(k.type)
+        v = _scalar(conn, q, kpi_sql(m, k, rel))
+        return int(v) if k.agg == "count" else float(v)
+    return fn
+
+
+def _metric_fn(m, key):
+    # a built-in wins over a declared KPI of the same key (same definition, tested SQL)
+    if key in METRICS and _builtin_ok(m, key):
+        return METRICS[key]
+    if key in getattr(m, "kpis", {}):
+        return _declared(m, key)
+    raise KeyError(key)
+
+
+def compute(conn, principal, scenario_id: int = 0, as_of_valid: datetime | None = None, ontology=None) -> dict:
+    """All KPIs for main (scenario_id 0) or a scenario, as the caller sees the world.
+    `ontology` (Ontology or CompiledOntology) selects the KPI set; an ontology without KPIs gives ``{}``."""
     if type(scenario_id) is not int or scenario_id < 0:
         raise ValueError("scenario_id must be a non-negative int")
+    m = _model(ontology)
+    keys = metric_keys(m)
+    if not keys:
+        return {}
     with _scope(conn, principal, scenario_id):
-        return {k: METRICS[k](conn, scenario_id, as_of_valid) for k in KPI_KEYS}
+        return {k: _metric_fn(m, k)(conn, scenario_id, as_of_valid) for k in keys}
 
 
 def series(conn, principal, scenario_id: int, metric: str, from_: datetime, to: datetime,
-           step_hours: float = 24.0) -> dict:
+           step_hours: float = 24.0, ontology=None) -> dict:
     """``{metric, points: [{t, v}]}``: one KPI evaluated at each step from `from_` to `to` (inclusive)."""
-    if metric not in METRICS:
-        raise ValueError(f"metric must be one of {list(KPI_KEYS)}")
+    m = _model(ontology)
+    if metric not in metric_keys(m):
+        raise ValueError(f"metric must be one of {list(metric_keys(m))}")
     if step_hours <= 0:
         raise ValueError("step_hours must be positive")
     from_, to = bt._utc(from_), bt._utc(to)
@@ -194,6 +260,42 @@ def series(conn, principal, scenario_id: int, metric: str, from_: datetime, to: 
     times = [from_ + timedelta(hours=step_hours * i) for i in range(n)]
     if times[-1] < to:
         times.append(to)
+    fn = _metric_fn(m, metric)
     with _scope(conn, principal, scenario_id):
-        pts = [{"t": t.astimezone(UTC).isoformat(), "v": METRICS[metric](conn, scenario_id, t)} for t in times]
+        pts = [{"t": t.astimezone(UTC).isoformat(), "v": fn(conn, scenario_id, t)} for t in times]
     return {"metric": metric, "points": pts}
+
+
+def declared(conn, principal, scenario_id: int = 0, as_of_valid: datetime | None = None, ontology=None) -> dict:
+    """Only the KPIs declared in the ontology's ``kpis:`` block (cheap aggregates; no hand-written metrics)."""
+    m = _model(ontology)
+    keys = tuple(getattr(m, "kpis", {}))
+    if not keys:
+        return {}
+    with _scope(conn, principal, scenario_id):
+        return {k: _declared(m, k)(conn, scenario_id, as_of_valid) for k in keys}
+
+
+def object_counts(conn, ontology, types, scenario_id: int = 0, as_of=None) -> dict[str, int]:
+    """{Type: visible object count} (caller must be scoped; masked/RLS views)."""
+    out = {}
+    for t in types:
+        q = _Q(scenario_id, as_of, conn)
+        out[t] = int(_scalar(conn, q, f"SELECT count(*) FROM {q.obj(t)} x"))
+    return out
+
+
+def enum_counts(conn, ontology, spec: dict[str, list[str]], scenario_id: int = 0, as_of=None) -> dict:
+    """{Type: {prop: {value: n}}} for the enum properties listed in `spec` ({Type: [prop,...]}); every declared
+    enum value is present (zero filled)."""
+    m = _model(ontology)
+    out: dict = {}
+    for t, props in spec.items():
+        ot = m.object_types[t]
+        for pn in props:
+            pr = next(x for x in ot.properties if x.name == pn)
+            q = _Q(scenario_id, as_of, conn)
+            got = {k: int(c) for k, c in conn.execute(
+                f'SELECT x."{pn}", count(*) FROM {q.obj(t)} x GROUP BY x."{pn}"', q.params).fetchall()}
+            out.setdefault(t, {})[pn] = {v: got.get(v, 0) for v in pr.enum}
+    return out

@@ -169,3 +169,42 @@ def test_graph_too_large_is_disclosed_only_to_owner_and_admin(cl, mk, monkeypatc
     assert "object" not in shared.text and "limit" not in shared.text
     q = cl.post("/sparql", json={"query": "SELECT * WHERE { ?s ?p ?o } LIMIT 1"}, headers=H("finance_analyst", sid))
     assert q.status_code == 403 and q.json()["code"] == "graph_unavailable"
+
+
+def test_injection_target_hidden_equals_missing(cl, mk, monkeypatch):
+    """Phase 6 fix: the what-if world is built from the full world, so the API checks that each injection
+    target is visible to the caller; a hidden target is answered exactly like a missing one."""
+    def run(factory, ctx, *, days, seed, injections):
+        return types.SimpleNamespace(digest="d", actions={}, kpis={}, sim_now=datetime(2026, 2, 1, tzinfo=UTC))
+    monkeypatch.setitem(sys.modules, "sim.whatif", types.SimpleNamespace(run=run))
+    made = cl.post("/objects/Invoice", headers=H("admin"), json={"ref": "INV-HID", "amount": 10.0, "status": "open"})
+    assert made.status_code == 201, made.text
+    inv = [made.json()]
+    port = cl.get("/objects/Port?limit=1", headers=H("planner")).json()[0]["id"]
+    assert cl.get(f"/objects/Invoice/{inv[0]['id']}", headers=H("planner")).status_code == 404   # hidden
+    sid = mk("planner")
+    hidden = cl.post(f"/scenarios/{sid}/simulate", headers=H("planner"),
+                     json={"days": 1, "injections": [{"kind": "invoice_anomaly", "target": inv[0]["id"]}]})
+    missing = cl.post(f"/scenarios/{sid}/simulate", headers=H("planner"),
+                      json={"days": 1, "injections": [{"kind": "invoice_anomaly", "target": str(uuid.uuid4())}]})
+    assert hidden.status_code == missing.status_code == 422
+    assert hidden.json() == missing.json() and hidden.json()["code"] == "invalid"
+    ok = cl.post(f"/scenarios/{sid}/simulate", headers=H("planner"),
+                 json={"days": 1, "injections": [{"kind": "port_closure", "target": port}]})
+    assert ok.status_code == 202, ok.text
+    # the injection kind decides the target type: a port id is not a valid shipment_delay target
+    wrong = cl.post(f"/scenarios/{sid}/simulate", headers=H("planner"),
+                    json={"days": 1, "injections": [{"kind": "shipment_delay", "target": port}]})
+    assert wrong.status_code == 422
+
+
+def test_types_is_additive_and_flags_volatile_geo(cl):
+    t = cl.get("/types", headers=H("planner")).json()
+    assert {"namespace", "classes", "objectTypes", "linkTypes", "role"} <= set(t)      # generated-client shape
+    by = {o["name"]: o for o in t["objectTypes"]}
+    assert by["Shipment"]["geo"] and by["Port"]["geo"] and not by["Invoice"]["geo"]
+    assert by["Shipment"]["volatile"] and not by["Port"]["volatile"]
+    vol = {p["name"] for p in by["Shipment"]["properties"] if p["volatile"]}
+    assert vol == {"position", "progress"}
+    assert {x["link"] for x in by["Shipment"]["links"]["out"]} >= {"ships_via", "ships_from", "operated_by"}
+    assert t["sim"] is True and "shipments_delayed" in t["kpis"]

@@ -147,25 +147,26 @@ _MAX_PARTIAL_PATHS = 50_000   # search budget per inferred edge
 _sem_cache: dict = {}
 
 
-def link_semantics(yaml_path=None) -> dict[str, tuple[str, bool]]:
+def link_semantics(source=None) -> dict[str, tuple[str, bool]]:
     """{inferred link name -> (base link, reversed)} for every link name the reasoner can infer.
 
     A transitive link L maps to (L, False); an inverse name I of L maps to (I -> (L, True)).
     `support` paths in inferred_support are ordered along the BASE link (src of L first), so
     for a reversed name the path runs dst -> src of the inferred edge.
-    """
-    from engine.sync.store import DEFAULT_YAML
+
+    `source`: a SyncConfig, an Ontology / CompiledOntology, a YAML path, or None (the legacy
+    supply-chain default; a running app always passes its own ontology)."""
+    from engine.sync.store import DEFAULT_YAML, semantics_of
+    if getattr(source, "semantics", None) is not None:
+        return source.semantics
+    if hasattr(source, "link_types"):
+        return semantics_of(source)
+    if hasattr(source, "model"):
+        return semantics_of(source.model)
     from engine.compiler import compile_ontology
-    p = str(yaml_path or DEFAULT_YAML)
+    p = str(source or DEFAULT_YAML)
     if p not in _sem_cache:
-        m = compile_ontology(p).model
-        sem: dict[str, tuple[str, bool]] = {}
-        for l in m.link_types.values():
-            if l.transitive:
-                sem[l.name] = (l.name, False)
-            if l.inverse:
-                sem[l.inverse] = (l.name, True)
-        _sem_cache[p] = sem
+        _sem_cache[p] = semantics_of(compile_ontology(p).model)
     return _sem_cache[p]
 
 

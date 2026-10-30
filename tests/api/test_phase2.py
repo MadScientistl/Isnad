@@ -129,7 +129,7 @@ def test_summary_shape_and_as_of(world):
     c = world["client"]
     s = c.get("/stats/summary", params={"as_of": T(3, 3, 12).isoformat()}, headers=H).json()
     assert set(s) == {"as_of", "shipments", "ports", "invoices", "value_at_risk", "delay_hours_total",
-                      "open_events"}
+                      "open_events", "counts", "enums", "kpis"}   # legacy keys + the generic shape
     assert set(s["shipments"]) == {"planned", "in_transit", "delayed", "arrived"}
     assert set(s["ports"]) == {"open", "closed"} and set(s["invoices"]) == {"open", "approved", "paid", "flagged"}
     assert s["shipments"]["in_transit"] == 1 and s["ports"]["closed"] == 1

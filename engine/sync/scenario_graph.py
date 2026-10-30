@@ -148,8 +148,7 @@ def cache_info() -> dict:
 
 
 def _cfg_of(comp) -> SyncConfig:
-    m = comp.model
-    return SyncConfig(m.namespace, tuple(m.object_types), tuple(m.link_types))
+    return SyncConfig.from_ontology(comp)
 
 
 # --------------------------------------------------------------------------- build
@@ -207,7 +206,7 @@ def _build(ctx: ScenarioCtx, comp, dsn: str | None, schema: str | None) -> Scena
         stats = None
         if err is None:
             try:
-                stats = write_support(oc, store, cfg.namespace, data_version=dv, scenario_id=ctx.id)
+                stats = write_support(oc, store, cfg.namespace, cfg, data_version=dv, scenario_id=ctx.id)
             except psycopg.errors.UndefinedTable:
                 stats = None
         oc.commit()

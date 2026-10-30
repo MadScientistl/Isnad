@@ -52,7 +52,6 @@ log = logging.getLogger("isnad.api")
 
 DEFAULT_ONTOLOGY = "ontology/supply_chain.yaml"
 HIDDEN = ("valid_during", "recorded_during", "scenario_id", "action_id")
-GEO_TYPES = ("Port", "Warehouse", "Shipment")
 SPEEDS = ("paused", "1", "6", "24")
 METRICS = ("shipments_in_transit", "shipments_delayed", "ports_closed", "invoices_flagged",
            "value_at_risk")
@@ -309,13 +308,13 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
                agent_model_factory: Any = None) -> FastAPI:
     """`runner` / `pipeline`: optional injected doubles. `pipeline=False` disables sync entirely.
     `agent_model_factory(principal) -> model client` (tests inject MockModel; default: Anthropic, needs a key)."""
-    path = ontology_path or os.environ.get("ISNAD_ONTOLOGY", DEFAULT_ONTOLOGY)
+    path = ontology_path or os.environ.get("ISNAD_ONTOLOGY", DEFAULT_ONTOLOGY)  # CLI default only
     from pathlib import Path as _Path
     schema = schema or os.environ.get("ISNAD_SCHEMA")
     comp = compile_ontology(path)
     om = comp.model
     models = comp.pydantic_models()
-    cfg = SyncConfig.from_yaml(path)
+    cfg = SyncConfig.from_ontology(comp)   # namespace, types, link semantics, ttl/shapes: all from this ontology
 
     state = {"runner": runner, "runner_failed": False,
              "pipeline": pipeline if pipeline is not None else
@@ -355,7 +354,7 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
                 kwargs={"conn_factory": lambda: connect(dsn, schema=schema), "ontology": comp})
             th.start()
             worker["stop"], worker["thread"] = stop, th
-        if os.environ.get("ISNAD_SIM_AUTOSTART", "0") == "1":
+        if os.environ.get("ISNAD_SIM_AUTOSTART", "0") == "1" and om.sim is not None:
             try:
                 get_runner().start()
             except HTTPException:
@@ -484,7 +483,12 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
                 return None
         return p
 
+    def sim_unavailable() -> ApiError:
+        return ApiError(404, "sim_unavailable", "this ontology has no simulation")
+
     def get_runner():
+        if om.sim is None:  # the runner is never constructed for an ontology without a `sim:` block
+            raise sim_unavailable()
         if state["runner"] is None and not state["runner_failed"]:
             try:
                 from sim.runner import SimRunner
@@ -593,16 +597,34 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
 
     @app.get("/types")
     def types(p: Principal = Depends(get_principal)):
+        """Ontology metadata the UI builds its pages from. Additive over the generated client's TypesResponse:
+        per type `geo` (has a point/linestring property), `volatile` (some property changes every tick),
+        `links` (`out`/`in`: link names with the other end), and `volatile` per property."""
+        geo = set(om.geo_types)
+        out_l: dict[str, list] = {t: [] for t in om.object_types}
+        in_l: dict[str, list] = {t: [] for t in om.object_types}
+        for l in om.link_types.values():
+            if l.src in out_l:
+                out_l[l.src].append({"link": l.name, "to": l.dst, "cardinality": l.cardinality})
+            if l.dst in in_l:
+                in_l[l.dst].append({"link": l.name, "from": l.src, "cardinality": l.cardinality})
         return {
+            "name": om.name,
             "namespace": om.namespace,
             "classes": {c.name: {"extends": c.extends} for c in om.classes.values()},
-            "objectTypes": [{"name": t.name, "properties": [
-                {"name": pr.name, "type": pr.type, "required": pr.required, "enum": list(pr.enum)}
-                for pr in t.properties]} for t in om.object_types.values()],
+            "objectTypes": [{"name": t.name, "label": t.name, "geo": t.name in geo,
+                             "volatile": any(pr.volatile for pr in t.properties),
+                             "properties": [
+                                 {"name": pr.name, "type": pr.type, "required": pr.required, "enum": list(pr.enum),
+                                  "volatile": pr.volatile} for pr in t.properties],
+                             "links": {"out": out_l[t.name], "in": in_l[t.name]}}
+                            for t in om.object_types.values()],
             "linkTypes": [{"name": l.name, "from": l.src, "to": l.dst, "cardinality": l.cardinality,
                            "required": l.required, "transitive": l.transitive, "inverse": l.inverse}
                           for l in om.link_types.values()],
             "role": p.role,
+            "kpis": {k: {"description": v.description, "expr": v.expr} for k, v in om.kpis.items()},
+            "sim": om.sim is not None,
         }
 
     @app.get("/me")
@@ -955,6 +977,8 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
         if name in ("create_link", "end_link"):
             verb = "linked" if name == "create_link" else "unlinked"
             return f"{pr.get('link')}: {n('src')} {verb} {n('dst')}"
+        if name == "import_dataset":
+            return "Dataset imported"
         if name == "seed":
             return "Demo data seeded"
         if name == "reset":
@@ -994,13 +1018,17 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
             "params": mask_params(p, r["name"], r["params"]), "summary": summarize(r, nm)} for r in rows])
 
     # ------------------------------------------------------------ geo
+    # types that can be the far end of a Shipment's ships_from/ships_to (a `location` point property)
+    geo_endpoint_types = tuple(t for t in ("Port", "Warehouse") if t in om.object_types
+                               and any(pr.name == "location" and pr.type == "point"
+                                       for pr in om.object_types[t].properties))
     @app.get("/geo/{type}")
     def geo(type: str, bbox: str | None = None, as_of: str | None = None,
             p: Principal = Depends(get_principal), scn: ScenarioCtx | None = Depends(get_scenario),
             conn=Depends(rdb)):
         sid = scn.id if scn else 0
-        if type not in GEO_TYPES:
-            raise HTTPException(404, f"/geo supports {list(GEO_TYPES)}, got '{type}'")
+        if type not in om.geo_types:
+            raise HTTPException(404, f"/geo supports {list(om.geo_types)}, got '{type}'")
         otype(type)
         t = parse_ts(as_of)
         col = geo_col(type, conn)
@@ -1016,12 +1044,15 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
             params = [w, s_, e, n]
         rows = bt.list_objects(conn, type, t, None, sid, where=where, params=params)
         ends: dict[str, dict[str, list | None]] = {}
-        if type == "Shipment" and rows and sid:
+        # Shipment origin/destination enrichment: only when the ontology has those links and located endpoints
+        enrich = (type == "Shipment" and "ships_from" in om.link_types and "ships_to" in om.link_types
+                  and bool(geo_endpoint_types))
+        if enrich and rows and sid:
             ids = {r["id"] for r in rows}
             for link, key in (("ships_from", "origin"), ("ships_to", "destination")):
                 dst = {l["src"]: l["dst"] for l in bt.list_links(conn, link, t, None, sid) if l["src"] in ids}
                 locs: dict[Any, list] = {}
-                for ft in ("Port", "Warehouse"):
+                for ft in geo_endpoint_types:
                     for o in bt.list_objects(conn, ft, t, None, sid, where="id = ANY(%s)",
                                              params=[list(set(dst.values()))]):
                         loc = o.get("location")
@@ -1030,14 +1061,14 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
                 for src_, d_ in dst.items():
                     if d_ in locs:
                         ends.setdefault(str(src_), {})[key] = list(locs[d_])
-        elif type == "Shipment" and rows:
+        elif enrich and rows:
             ids = [r["id"] for r in rows]
+            union = " UNION ALL ".join(
+                f"SELECT id, location AS loc FROM {_o(ft)} WHERE {_vt('', T_ASOF)}" for ft in geo_endpoint_types)
             for link, key in (("ships_from", "origin"), ("ships_to", "destination")):
                 with conn.cursor() as cur:
                     cur.execute(
-                        f"SELECT l.src, ST_X(g.loc), ST_Y(g.loc) FROM link_{link} l JOIN ("
-                        f"SELECT id, location AS loc FROM {_o('Port')} WHERE {_vt('', T_ASOF)} UNION ALL "
-                        f"SELECT id, location FROM {_o('Warehouse')} WHERE {_vt('', T_ASOF)}) g ON g.id = l.dst "
+                        f"SELECT l.src, ST_X(g.loc), ST_Y(g.loc) FROM link_{link} l JOIN ({union}) g ON g.id = l.dst "
                         f"WHERE {_vt('l', T_ASOF)} AND l.src = ANY(%(ids)s::uuid[]) AND g.loc IS NOT NULL",
                         {"t": t, "ids": ids})
                     for src, x, y in cur.fetchall():
@@ -1047,33 +1078,56 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
             props = {k: v for k, v in r.items()
                      if k not in HIDDEN and k not in ("changed_by", col, "id")}
             props = {"id": r["id"], "type": type, **props}
-            if type == "Shipment":
+            if enrich:
                 e = ends.get(str(r["id"]), {})
                 props["origin"], props["destination"] = e.get("origin"), e.get("destination")
             feats.append({"type": "Feature", "id": r["id"], "geometry": r[col], "properties": props})
         return jsonable_encoder({"type": "FeatureCollection", "features": feats})
 
     # ------------------------------------------------------------ stats
+    # The legacy supply-chain summary keys (and the hand-written value_at_risk SQL) stay available when the
+    # ontology has the types/properties they read.
+    legacy_stats = kpis._builtin_ok(om, "value_at_risk") and kpis._builtin_ok(om, "invoices_flagged") \
+        and "Event" in om.object_types and any(pr.name == "ended" for pr in om.object_types["Event"].properties)
+
     @app.get("/stats/summary")
     def stats_summary(as_of: str | None = None, p: Principal = Depends(get_principal),
                       scn: ScenarioCtx | None = Depends(get_scenario), conn=Depends(rdb)):
+        """`{as_of, counts: {Type: n}, enums: {Type: {prop: {value: n}}}, kpis: {key: number}}` for the types the
+        caller can read (masked enum properties are omitted), plus the legacy supply-chain keys when the ontology
+        has those types."""
         t = parse_ts(as_of)
-        prm = {"t": t}
+        sid = scn.id if scn else 0
+        role = om.roles[p.role]
+        readable = [n for n in om.object_types if role.can_read(n)]
+        enum_spec = {}
+        for n in readable:
+            masked = set(role.types[n].mask)
+            ps = [pr.name for pr in om.object_types[n].properties if pr.type == "enum" and pr.name not in masked]
+            if ps:
+                enum_spec[n] = ps
+        res: dict[str, Any] = {
+            "as_of": _iso(t) if t else "live",
+            "counts": kpis.object_counts(conn, om, readable, sid, t),
+            "enums": kpis.enum_counts(conn, om, enum_spec, sid, t),
+            "kpis": kpis.declared(conn, p, sid, t, ontology=om),
+        }
+        if not legacy_stats:
+            return res
         if scn is not None:  # scenario-effective numbers (same shape), read through the overlay views
-            sid = scn.id
-
             def counts_s(type_: str, col: str, keys: tuple[str, ...]) -> dict[str, int]:
                 got = kpis.counts(conn, type_, col, sid, t)
                 return {k: got.get(k, 0) for k in keys}
-            return {
-                "as_of": _iso(t) if t else "live",
+            res.update({
                 "shipments": counts_s("Shipment", "status", ("planned", "in_transit", "delayed", "arrived")),
                 "ports": counts_s("Port", "status", ("open", "closed")),
                 "invoices": counts_s("Invoice", "status", ("open", "approved", "paid", "flagged")),
                 "value_at_risk": kpis.METRICS["value_at_risk"](conn, sid, t),
                 "delay_hours_total": kpis.METRICS["delay_hours_total"](conn, sid, t),
                 "open_events": kpis.open_events(conn, sid, t),
-            }
+            })
+            return res
+        prm = {"t": t}
 
         def counts(type_: str, col: str, keys: tuple[str, ...]) -> dict[str, int]:
             out = dict.fromkeys(keys, 0)
@@ -1082,12 +1136,11 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
                 if k in out:
                     out[k] = c
             return out
-        res = {
-            "as_of": _iso(t) if t else "live",
+        res.update({
             "shipments": counts("Shipment", "status", ("planned", "in_transit", "delayed", "arrived")),
             "ports": counts("Port", "status", ("open", "closed")),
             "invoices": counts("Invoice", "status", ("open", "approved", "paid", "flagged")),
-        }
+        })
         row = conn.execute(
             f"SELECT {_var_sql(T_ASOF)}, "
             f"(SELECT coalesce(sum(delay_hours), 0)::float8 FROM {_o('Shipment')} x WHERE {_vt('x', T_ASOF)}), "
@@ -1099,11 +1152,11 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
     def stats_series(metric: str, from_: str | None = Query(None, alias="from"), to: str | None = None,
                      step_hours: float = Query(24, gt=0), p: Principal = Depends(get_principal),
                      scn: ScenarioCtx | None = Depends(get_scenario), conn=Depends(rdb)):
-        if scn is not None:
-            if metric not in kpis.METRICS:
-                raise HTTPException(422, f"metric must be one of {list(kpis.METRICS)}")
-        elif metric not in METRICS:
-            raise HTTPException(422, f"metric must be one of {list(METRICS)}")
+        keys = list(kpis.metric_keys(om))
+        legacy = scn is None and legacy_stats and metric in METRICS
+        if scn is not None or not legacy:
+            if metric not in keys:
+                raise HTTPException(422, f"metric must be one of {keys}")
         hi, lo = parse_ts(to, "to"), parse_ts(from_, "from")
         if hi is None:
             hi = (scn.clock if scn is not None and scn.clock else None) or get_state_now()
@@ -1113,9 +1166,9 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
             raise HTTPException(422, "'from' must not be after 'to'")
         if (hi - lo) / timedelta(hours=step_hours) > MAX_SERIES_POINTS:
             raise HTTPException(422, f"too many points (max {MAX_SERIES_POINTS}); raise step_hours")
-        if scn is not None:
+        if not legacy:  # scenarios, and declared / non-legacy KPIs on main
             try:
-                res = kpis.series(conn, p, scn.id, metric, lo, hi, step_hours)
+                res = kpis.series(conn, p, scn.id if scn else 0, metric, lo, hi, step_hours, ontology=om)
             except ValueError as e:
                 raise HTTPException(422, str(e))
             return {"metric": metric, "points": [{"t": x["t"], "v": x["v"]} for x in res["points"]]}
@@ -1657,11 +1710,14 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
         return {"status": "merged", **res}
 
     @app.get("/scenarios/{sid}/series")
-    def scenario_series(sid: int, metric: str = "value_at_risk", step_hours: float = Query(24, gt=0),
+    def scenario_series(sid: int, metric: str | None = None, step_hours: float = Query(24, gt=0),
                         from_: str | None = Query(None, alias="from"), to: str | None = None,
                         p: Principal = Depends(get_principal), conn=Depends(wconn)):
-        if metric not in kpis.METRICS:
-            raise ApiError(422, "invalid", f"metric must be one of {list(kpis.METRICS)}")
+        keys = list(kpis.metric_keys(om))
+        if metric is None and keys:
+            metric = "value_at_risk" if "value_at_risk" in keys else keys[0]
+        if metric not in keys:
+            raise ApiError(422, "invalid", f"metric must be one of {keys}")
         hi, lo = parse_ts(to, "to"), parse_ts(from_, "from")
         try:
             info = scenarios.get(conn, p, sid)
@@ -1669,7 +1725,7 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
                 raise ScenarioNotFound(f"scenario {sid} not found")
             hi = hi or info["clock"] or get_state_now()
             lo = lo or hi - timedelta(days=30)
-            return jsonable_encoder(kpis.series(conn, p, sid, metric, lo, hi, step_hours))
+            return jsonable_encoder(kpis.series(conn, p, sid, metric, lo, hi, step_hours, ontology=om))
         except LookupError as e:  # scenario closed / invisible while we worked
             scn_error(conn, ScenarioNotFound(str(e)))
         except Exception as e:  # noqa: BLE001
@@ -1719,8 +1775,33 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
                 sim_jobs[job_id].update(status="error",
                                         error=str(e)[:200] if isinstance(e, (RuntimeError, ValueError)) else type(e).__name__)
 
+    # injection kind -> the object type its target must be (the simulated world is built from the FULL world, so
+    # the caller's own visibility is checked here: a hidden target is indistinguishable from a missing one)
+    INJECT_TARGET_TYPE = {"port_closure": "Port", "shipment_delay": "Shipment", "supplier_delay": "Supplier",
+                          "price_shock": "Supplier", "invoice_anomaly": "Invoice"}
+
+    def check_injection_targets(conn, p: Principal, sid: int, injections) -> None:
+        targets = [(i.kind, i.target) for i in injections if i.target is not None]
+        if not targets:
+            return
+        try:
+            ctx = scenarios.resolve(conn, p, sid)
+            with read_scope(conn, p, ctx):
+                for kind, target in targets:
+                    typ = INJECT_TARGET_TYPE.get(kind)
+                    if typ not in om.object_types or bt.get_object(conn, typ, target, scenario_id=sid) is None:
+                        raise ApiError(422, "invalid", "injection target not found")
+        except ApiError:
+            conn.rollback()
+            raise
+        except Exception as e:  # noqa: BLE001
+            scn_error(conn, e)
+        conn.rollback()
+
     @app.post("/scenarios/{sid}/simulate", status_code=202)
     def simulate_scenario(sid: int, body: SimulateBody, p: Principal = Depends(get_principal), conn=Depends(wconn)):
+        if om.sim is None:
+            raise sim_unavailable()
         max_days = int(os.environ.get("ISNAD_SCN_SIM_MAX_DAYS", "90"))
         if not 1 <= body.days <= max_days:
             raise ApiError(422, "invalid", f"days must be 1..{max_days}")
@@ -1731,6 +1812,7 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
             scn_error(conn, e)
         if p.role != "admin" and info["owner_user"] != p.user:
             raise ApiError(403, "permission_denied", "only the owner or an admin can simulate in a scenario")
+        check_injection_targets(conn, p, sid, body.injections)
         job_id = uuid4().hex
         with sim_lock:
             for j in [k for k, v in sim_jobs.items() if v["status"] != "running" and time.time() - v["t0"] > 3600]:
@@ -1755,6 +1837,8 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
 
     @app.get("/scenarios/{sid}/simulate/{job_id}")
     def simulate_status(sid: int, job_id: str, p: Principal = Depends(get_principal), conn=Depends(wconn)):
+        if om.sim is None:
+            raise sim_unavailable()
         try:
             scenarios.resolve(conn, p, sid)
         except Exception as e:  # noqa: BLE001
@@ -1772,7 +1856,7 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
                "actions": j["actions"] if mine else None, "kpis": None, "error": j["error"]}
         if j["status"] == "done":  # KPIs are recomputed for THIS viewer (RLS), never copied from the starter's view
             try:
-                out["kpis"] = kpis.compute(conn, p, sid)
+                out["kpis"] = kpis.compute(conn, p, sid, ontology=om)
             except Exception as e:  # noqa: BLE001
                 scn_error(conn, e)
         return jsonable_encoder(out)

@@ -1,0 +1,103 @@
+version: 1
+name: Library
+namespace: https://example.org/lib#
+kpis:
+  books_on_loan: {description: Books currently on loan, expr: "count(Book, where status = 'on_loan')"}
+  total_pages: {description: Pages over all books, expr: "sum(Book.pages)"}
+classes:
+  Place: {}
+  Branch: {extends: Place}
+objectTypes:
+  Branch: {properties: {name: "string!", city: string, location: point}}
+  Book:
+    properties:
+      title: "string!"
+      pages: int
+      status: {enum: [available, on_loan, lost]}
+  Member: {properties: {name: "string!", email: string}}
+  Loan:
+    properties:
+      due: timestamp
+      state: {enum: [open, returned]}
+linkTypes:
+  held_at:     {from: Book, to: Branch, cardinality: many-to-one}
+  loan_of:     {from: Loan, to: Book, cardinality: many-to-one}
+  borrowed_by: {from: Loan, to: Member, cardinality: many-to-one}
+  recommends:  {from: Book, to: Book, cardinality: many-to-many, transitive: true, inverse: recommended_by}
+roles:
+  librarian:
+    description: Librarian. Runs loans; member e-mail addresses are masked.
+    types:
+      Book: {read: true, write: true}
+      Branch: {read: true}
+      Member: {read: true, mask: [email]}
+      Loan: {read: true, write: true}
+    links: [held_at, loan_of, borrowed_by, recommends]
+    actions: [create_object, update_object, create_link, end_link, checkout_book, return_book, lose_book]
+    agent:
+      allowlist: [checkout_book, lose_book]
+      tools: [query_objects, traverse, find_paths, impact_analysis, get_history, as_of, diff, propose_action, scenario_open, scenario_apply, scenario_compare]
+      instructions: "Focus on books and loans. Propose lose_book only with evidence."
+  reader:
+    description: Reader. Sees books and branches only.
+    types:
+      Book: {read: true}
+      Branch: {read: true}
+    links: [held_at]
+    actions: []
+  admin:
+    description: Administrator. Full access, approves every approval-gated action.
+    types: all
+    links: all
+    actions: all
+    approves: all
+actions:
+  create_object:
+    description: Create an object of any type (generic).
+    params: {type: "string!", id: uuid, props: string!}
+    roles: [librarian, admin]
+    function: create_object
+  update_object:
+    description: Replace properties of an object.
+    params: {type: "string!", id: "uuid!", props: string!}
+    roles: [librarian, admin]
+    function: update_object
+  delete_object:
+    description: End an object's validity.
+    params: {type: "string!", id: "uuid!"}
+    roles: [admin]
+    function: delete_object
+  create_link:
+    description: Create a link between two objects.
+    params: {link: "string!", src: "uuid!", dst: "uuid!"}
+    roles: [librarian, admin]
+    function: create_link
+  end_link:
+    description: End a link between two objects.
+    params: {link: "string!", src: "uuid!", dst: "uuid!"}
+    roles: [librarian, admin]
+    function: end_link
+  checkout_book:
+    description: Lend a book out.
+    params: {book: "uuid(Book)!"}
+    roles: [librarian, admin]
+    bind: {bk: {type: Book, id: $book}}
+    criteria:
+      - {expr: "bk.status == 'available'", message: "Book is not available"}
+    rules:
+      - modify: {type: Book, id: $book, set: {status: on_loan}}
+  return_book:
+    description: Take a book back.
+    params: {book: "uuid(Book)!"}
+    roles: [librarian, admin]
+    bind: {bk: {type: Book, id: $book}}
+    rules:
+      - modify: {type: Book, id: $book, set: {status: available}}
+  lose_book:
+    description: Write a book off as lost (needs approval by an admin).
+    params: {book: "uuid(Book)!", reason: string}
+    roles: [librarian, admin]
+    approval: {required: true, approvers: [admin]}
+    bind: {bk: {type: Book, id: $book}}
+    rules:
+      - modify: {type: Book, id: $book, set: {status: lost}}

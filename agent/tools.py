@@ -83,7 +83,7 @@ class Filter(_In):
 
 
 class QueryObjectsIn(_In):
-    type: str = Field(description="object type name, e.g. Shipment")
+    type: str = Field(description="object type name (see the ontology summary)")
     filters: list[Filter] = Field(default_factory=list, max_length=8)
     order_by: str | None = None
     desc: bool = False
@@ -140,7 +140,7 @@ class RunFunctionIn(_In):
 
 
 class Evidence(_In):
-    ref: str = Field(description="ref of a fact returned by an earlier tool call of THIS run, e.g. Port:<uuid>")
+    ref: str = Field(description="ref of a fact returned by an earlier tool call of THIS run, e.g. <Type>:<uuid>")
     claim: str = Field(max_length=500)
     kind: Literal["asserted", "inferred"]
     tool_call_id: str = Field(description="the tool_call_id of the result that contained the ref")
@@ -265,7 +265,7 @@ def _require_visible(conn, id_: UUID):
         raise ToolError("not found")
 
 
-def _inferred_info(conn, edges, sid: int = 0) -> dict:
+def _inferred_info(conn, edges, sid: int = 0, cfg=None) -> dict:
     """edge -> (rule, support) for inferred edges. Reads inferred_support under the caller's RLS, which only
     exposes derivations whose every node the caller can see (D6)."""
     edges = list(dict.fromkeys(edges))
@@ -279,7 +279,7 @@ def _inferred_info(conn, edges, sid: int = 0) -> dict:
     sup = {}
     for l, s, d, _n, support in rows:
         sup.setdefault((s, l, d), [str(x) for x in support])
-    sem = link_semantics()
+    sem = link_semantics(cfg)
     out = {}
     for e in edges:
         base, rev = sem.get(e[1], (e[1], False))
@@ -288,8 +288,8 @@ def _inferred_info(conn, edges, sid: int = 0) -> dict:
     return out
 
 
-def _edge_dicts(conn, asserted, inferred, sid: int = 0):
-    info = _inferred_info(conn, inferred, sid)
+def _edge_dicts(conn, asserted, inferred, sid: int = 0, cfg=None):
+    info = _inferred_info(conn, inferred, sid, cfg)
     out = [{"ref": _eref(l, s, d), "src": str(s), "link": l, "dst": str(d)} for s, l, d in asserted]
     for s, l, d in inferred:
         rule, support = info[(s, l, d)]
@@ -299,7 +299,7 @@ def _edge_dicts(conn, asserted, inferred, sid: int = 0):
 
 
 def _nodes(ctx, conn, ids, as_of=None):
-    infos = V.node_infos(conn, list(ids), as_of=as_of, model=ctx.model, scenario=ctx.scn)
+    infos = V.node_infos(conn, list(ids), as_of=as_of, model=ctx.model, scenario=ctx.scn, cfg=ctx.cfg)
     return [{"ref": _oref(i["type"], i["id"]), **i} for i in (infos.get(str(x)) for x in ids) if i]
 
 
@@ -383,7 +383,7 @@ def _bfs(ctx, conn, center, depth, include_inferred, link_types, as_of=None):
     try:
         return V.bfs(conn, center, depth, pipeline=_pipe(ctx, conn), as_of=as_of, include_inferred=include_inferred,
                      link_types=link_types, max_nodes=100, max_fanout=25, is_admin=_is_admin(ctx),
-                     deadline=_deadline(ctx), scenario=ctx.scn)
+                     deadline=_deadline(ctx), scenario=ctx.scn, cfg=ctx.cfg)
     except V.NotVisible:
         raise ToolError("not found") from None
 
@@ -392,7 +392,7 @@ def traverse(ctx, conn, a: TraverseIn, call_id) -> Result:
     start = _uuid(a.start_id, "start_id")
     res = _bfs(ctx, conn, start, a.depth, a.include_inferred, _links(ctx, a.link_types))
     data = {"start": str(start), "nodes": _nodes(ctx, conn, res.order),
-            "edges": _edge_dicts(conn, [(s, l, d) for s, l, d in res.edges], res.inferred, ctx.sid),
+            "edges": _edge_dicts(conn, [(s, l, d) for s, l, d in res.edges], res.inferred, ctx.sid, ctx.cfg),
             "inferred_available": res.inferred_available}
     return Result(data, truncated=res.truncated)
 
@@ -403,11 +403,11 @@ def find_paths(ctx, conn, a: FindPathsIn, call_id) -> Result:
         paths = V.find_paths(conn, src, dst, max_hops=a.max_hops, pipeline=_pipe(ctx, conn),
                              include_inferred=a.include_inferred, link_types=_links(ctx, a.link_types),
                              max_paths=a.max_paths, is_admin=_is_admin(ctx), deadline=_deadline(ctx),
-                             scenario=ctx.scn)
+                             scenario=ctx.scn, cfg=ctx.cfg)
     except V.NotVisible:
         raise ToolError("not found") from None
     ids = list(dict.fromkeys(n for p in paths for n, _l, _d in p))
-    asserted = set(V.visible_edges(conn, ids, scenario=ctx.scn)) if ids else set()
+    asserted = set(V.visible_edges(conn, ids, scenario=ctx.scn, cfg=ctx.cfg)) if ids else set()
     edges, out = {}, []
     for p in paths:
         hops = []
@@ -419,7 +419,7 @@ def find_paths(ctx, conn, a: FindPathsIn, call_id) -> Result:
                          "link": link, "inferred": inf})
         out.append({"nodes": [str(n) for n, _l, _d in p], "hops": hops})
     data = {"paths": out, "nodes": _nodes(ctx, conn, ids),
-            "edges": _edge_dicts(conn, [e for e, i in edges.items() if not i], [e for e, i in edges.items() if i], ctx.sid)}
+            "edges": _edge_dicts(conn, [e for e, i in edges.items() if not i], [e for e, i in edges.items() if i], ctx.sid, ctx.cfg)}
     return Result(data, truncated=len(paths) >= a.max_paths)
 
 
@@ -455,7 +455,7 @@ def impact_analysis(ctx, conn, a: ImpactIn, call_id) -> Result:
                  "basis": "inferred" if via[i][1] else "asserted"} for i in impacted_ids if str(i) in infos]
     used = list(dict.fromkeys(via[i] for i in impacted_ids))
     data = {"start": str(start), "direction": a.direction, "impacted": impacted,
-            "edges": _edge_dicts(conn, [e for e, inf in used if not inf], [e for e, inf in used if inf], ctx.sid),
+            "edges": _edge_dicts(conn, [e for e, inf in used if not inf], [e for e, inf in used if inf], ctx.sid, ctx.cfg),
             "note": "impact flows: affects src->dst, ships_via dst->src, supplies src->dst (inferred supplies is transitive)"}
     return Result(data, truncated=res.truncated)
 
@@ -483,7 +483,7 @@ def _snapshot(ctx, conn, type_, id_, at, neighbours):
         raise ToolError("include_neighbours is not available inside a scenario")
     try:
         res = V.bfs(conn, id_, 1, as_of=at, include_inferred=False, max_nodes=100, max_fanout=25,
-                    is_admin=_is_admin(ctx), deadline=_deadline(ctx))
+                    is_admin=_is_admin(ctx), deadline=_deadline(ctx), cfg=ctx.cfg)
     except V.NotVisible:
         return None, [], [], False
     return row, res.order, res.edges, res.truncated
@@ -619,11 +619,19 @@ def propose_action(ctx, conn, a: ProposeIn, call_id) -> Result:
                   on_behalf_of=ctx.principal.user, evidence=ev, idempotency_key=key, scenario_id=sid)
     with conn.transaction():
         with scoped(conn, ctx.principal, ctx.scn):
-            row = conn.execute("SELECT dry_run, expires_at FROM proposal WHERE id=%s", [pid]).fetchone()
-    dry, exp = (row or (None, None))
+            row = conn.execute(
+                "SELECT p.dry_run, p.expires_at, a.decision, (p.expires_at < clock_timestamp()) "
+                "FROM proposal p LEFT JOIN approval a ON a.proposal_id = p.id WHERE p.id=%s", [pid]).fetchone()
+    dry, exp, decision, expired = (row or (None, None, None, False))
+    # an idempotent re-propose returns the existing proposal: report its TRUE state, not always pending
+    status = {"approved": "approved", "rejected": "rejected"}.get(decision) or (
+        "expired" if expired else "pending_approval")
     info = {"proposal_id": str(pid), "action": a.action, "params": _j(a.params)}
-    data = {**info, "status": "pending_approval", "dry_run": _j(dry), "expires_at": _j(exp),
-            "note": "Nothing was executed. A human with approval rights must approve this proposal."}
+    note = {"pending_approval": "Nothing was executed. A human with approval rights must approve this proposal.",
+            "approved": "This proposal was already approved and decided; nothing new was proposed.",
+            "rejected": "This proposal was already rejected; nothing new was proposed.",
+            "expired": "This proposal has expired; nothing new was proposed."}[status]
+    data = {**info, "status": status, "dry_run": _j(dry), "expires_at": _j(exp), "note": note}
     if sid:
         data["note"] += (" Its dry run is the real action inside your scenario plus the KPI impact "
                          "(dry_run.impact: before = main, after = scenario); present both to the human.")
@@ -719,6 +727,8 @@ def scenario_apply(ctx, conn, a: ScenarioApplyIn, call_id) -> Result:
 
 def scenario_simulate(ctx, conn, a: ScenarioSimulateIn, call_id) -> Result:
     _need_scenario(ctx)
+    if getattr(ctx.model, "sim", None) is None:
+        raise ToolError("what-if simulation is not available for this ontology")
     try:
         import importlib
         whatif = importlib.import_module("sim.whatif")   # lazy: the simulation package is optional here
@@ -762,7 +772,7 @@ def scenario_simulate(ctx, conn, a: ScenarioSimulateIn, call_id) -> Result:
                 pass
         sim_limits.release_sim_slot()
     _refresh_scn(ctx, conn)
-    kp = kpis_mod.compute(conn, ctx.principal, ctx.sid)    # always under the caller's RLS, not the sim's view
+    kp = kpis_mod.compute(conn, ctx.principal, ctx.sid, ontology=ctx.comp)    # always under the caller's RLS, not the sim's view
     conn.rollback()                                       # read-only: leave no open transaction behind
     return Result({"scenario_id": ctx.sid, "days": a.days, "injections": inj, "digest": r.digest,
                    "actions_simulated": int(r.actions), "sim_now": _j(r.sim_now), "kpis": _j(kp),
@@ -809,7 +819,7 @@ TOOLS: dict[str, ToolSpec] = {t.name: t for t in [
              "approval, main unchanged) to test it before proposing it.", ScenarioApplyIn, scenario_apply,
              own_tx=True),
     ToolSpec("scenario_simulate", "Run the simulation forward inside the active scenario (days<=14), optionally "
-             "with injected events (port_closure, shipment_delay, supplier_delay, price_shock, invoice_anomaly).",
+             "with injected events (the injection kinds are listed in the input schema).",
              ScenarioSimulateIn, scenario_simulate, own_tx=True),
     ToolSpec("scenario_compare", "Compare the active scenario with main: KPIs (main, scenario, delta) and a summary "
              "of changed objects, for what your role may see.", ScenarioCompareIn, scenario_compare, own_tx=True),

@@ -35,7 +35,6 @@ log = logging.getLogger("isnad.scenarios")
 TERMINAL = ("merged", "discarded", "expired")
 EVENT_KINDS = ("simulated", "proposal")  # kinds an API layer may record (created/terminal ones are ours)
 REPLAY_SOURCES = ("api", "agent", "ui")
-VOLATILE = core.VOLATILE_PROPS
 _SELECT = (
     "SELECT s.id, s.name, s.owner_user, s.owner_role, s.parent_id, s.base_recorded, s.base_sim_time, "
     "s.shared_roles, s.run_id, s.created_at, s.expires_at, st.clock, st.data_version, st.override_rows, "
@@ -335,7 +334,7 @@ def compare(conn, principal, a: int, b: int = 0, *, limit: int = 500, ontology=N
             ctx = scenario_admin.ctx_of(conn, sid) if sid else None
             with scoped(conn, principal, ctx):
                 sides[tag] = _read_side(conn, klist, sid)
-                kp[tag] = kpis.compute(conn, principal, sid)
+                kp[tag] = kpis.compute(conn, principal, sid, ontology=ontology)
     conn.commit()
     diff = []
     for k in klist:
@@ -396,7 +395,7 @@ def _conflicts(conn, model, principal_role: str, owner_role: str, overrides: lis
             if cur is None:
                 bad("the object no longer exists in main (or is no longer visible to you)")
                 continue
-            hide = _NOISE | VOLATILE | _masked(model, principal_role, typ) | _masked(model, owner_role, typ)
+            hide = _NOISE | core._volatile(model, typ) | _masked(model, principal_role, typ) | _masked(model, owner_role, typ)
             was = {k: v for k, v in (base.get("props") or {}).items() if k not in hide}
             now = {k: v for k, v in cur.items() if k not in hide}
             changed = sorted(k for k in set(was) | set(now) if was.get(k) != now.get(k))

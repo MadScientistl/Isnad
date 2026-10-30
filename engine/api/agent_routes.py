@@ -218,7 +218,7 @@ def mount(app, *, comp, get_principal, connect_fn, get_pipeline, model_factory=N
             return cur.fetchone()
         return read(p, fn)
 
-    def fetch_events(p: Principal, run_id: str, after: int = 0) -> list[dict]:
+    def fetch_events(p: Principal, run_id: str, after: int = 0, limit: int | None = None) -> list[dict]:
         def fn(cur):
             cur.execute("SELECT seq AS dbseq, kind, payload, tokens_in, tokens_out, cost_usd, at "
                         "FROM agent_run_event WHERE run_id = %s ORDER BY seq", [run_id])
@@ -228,6 +228,8 @@ def mount(app, *, comp, get_principal, connect_fn, get_pipeline, model_factory=N
             pl = dict(r["payload"] or {})
             seq = int(pl.pop("seq", r["dbseq"]))
             if seq > after:
+                if limit is not None and len(out) >= limit:
+                    break
                 out.append(_jsonable({"seq": seq, "kind": r["kind"], "payload": pl, "tokens_in": r["tokens_in"],
                                       "tokens_out": r["tokens_out"], "cost_usd": float(r["cost_usd"]),
                                       "at": r["at"]}))
@@ -349,11 +351,18 @@ def mount(app, *, comp, get_principal, connect_fn, get_pipeline, model_factory=N
         return [run_json(r) for r in read(p, fn)]
 
     @app.get("/agent/runs/{run_id}")
-    def get_run(run_id: str, p: Principal = Depends(get_principal)):
+    def get_run(run_id: str, after: int = Query(0, ge=0), limit: int = Query(500, ge=1),
+                p: Principal = Depends(get_principal)):
+        """Events are paged by `seq`: `?after=<seq>&limit=<n>` (default 500, capped at 2000). `next` is the seq to
+        pass as `after` for the following page, or null when this page is the last one."""
         rid, row = visible_run(p, run_id)
         if row is None:
             return NOT_FOUND()
-        return {"run": run_json(row), "events": fetch_events(p, rid)}
+        limit = min(limit, 2000)
+        evs = fetch_events(p, rid, after, limit + 1)
+        more = len(evs) > limit
+        evs = evs[:limit]
+        return {"run": run_json(row), "events": evs, "next": evs[-1]["seq"] if more and evs else None}
 
     @app.post("/agent/runs/{run_id}/cancel")
     def cancel_run(run_id: str, p: Principal = Depends(get_principal)):
