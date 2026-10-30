@@ -1,11 +1,13 @@
 """Generic FastAPI app over a compiled ontology. Run: uvicorn engine.api.main:app
 
-Identity: every request carries `x-role`; the role maps to a `Principal(role, 'demo-<role>', region)`
+Identity (auth off, the default): every request carries `x-role`; the role maps to a `Principal(role, 'demo-<role>', region)`
 (there is no real login in v1, but nothing below this seam trusts the client). Unknown roles and the
 system role `sim` are refused (403); a missing header is refused unless ISNAD_DEFAULT_ROLE names a role
 (a documented dev switch, unset by default). Reads run inside `scoped(conn, principal)` (Postgres RLS +
 masked `rd_*` views decide what exists for the caller; hidden == missing, 404 never 403). All mutations go
 through `engine.actions.execute / propose / decide / rollback` with the caller's principal.
+With ISNAD_AUTH=1 identity comes only from a signed bearer token (`engine.auth`): `x-role`, `x-user` and
+ISNAD_DEFAULT_ROLE are ignored, and only /health and /auth/* (plus OPTIONS preflight) need no token.
 """
 from __future__ import annotations
 
@@ -64,9 +66,9 @@ _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$")
 class ApiError(Exception):
     """An error with a JSON body `{code, detail, ...}` (rendered by the app's exception handler)."""
 
-    def __init__(self, status: int, code: str, detail: str, **extra):
+    def __init__(self, status: int, code: str, detail: str, *, headers: dict[str, str] | None = None, **extra):
         super().__init__(detail)
-        self.status, self.body = status, {"code": code, "detail": detail, **extra}
+        self.status, self.body, self.headers = status, {"code": code, "detail": detail, **extra}, headers
 
 
 def map_error(e: Exception) -> ApiError | None:
@@ -250,6 +252,11 @@ class SimulateBody(BaseModel):
     injections: list[InjectionBody] = Field(default=[], max_length=MAX_INJECTIONS)
 
 
+class LoginBody(BaseModel):
+    user: str = Field(max_length=128)
+    password: str = Field(max_length=1024)
+
+
 class _BodyLimit:
     """ASGI middleware: requests above MAX_BODY_BYTES are answered 413 `{code: body_too_large}` (declared
     Content-Length is checked up front; streamed bodies are counted)."""
@@ -372,13 +379,13 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
     app = FastAPI(title="Isnad ontology API", lifespan=lifespan)
     app.add_middleware(_BodyLimit, max_bytes=MAX_BODY_BYTES)
     app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-                       allow_methods=["*"], allow_headers=["*"])
+                       allow_methods=["*"], allow_headers=["*", "Authorization"])
     app.state.ontology = comp
     app.state.runtime = state
 
     @app.exception_handler(ApiError)
     async def _api_error(_: Request, e: ApiError):
-        return JSONResponse(e.body, status_code=e.status)
+        return JSONResponse(e.body, status_code=e.status, headers=e.headers)
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(_: Request, e: RequestValidationError):
@@ -389,8 +396,49 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
         return JSONResponse({"code": "invalid", "detail": errs}, status_code=422)
 
     # ---------------------------------------------------------- identity + connections
-    def get_principal(x_role: str | None = Header(default=None)) -> Principal:
-        """The single identity seam. Unknown role / `sim` / missing header => 403."""
+    # Auth (Phase 6, W2): ISNAD_AUTH=1 -> signed bearer tokens; a refusal to configure it is a refusal to start.
+    from engine import auth as auth_mod
+    auth_svc = auth_mod.AuthService(set(om.roles)) if auth_mod.enabled() else None
+    app.state.auth = auth_svc
+    UNAUTH_HEADERS = {"WWW-Authenticate": "Bearer"}
+
+    def unauthenticated() -> ApiError:
+        return ApiError(401, "unauthenticated", "authentication required", headers=UNAUTH_HEADERS)
+
+    def bearer_token(request: Request) -> str | None:
+        h = request.headers.get("authorization") or ""
+        scheme, _, tok = h.partition(" ")
+        return tok.strip() if scheme.lower() == "bearer" and tok.strip() else None
+
+    def authenticate_request(request: Request, *, allow_ticket: bool = True):
+        """Auth on: (Identity, token payload|None) from the Bearer header, else (GET /agent/runs only) a one-time
+        stream ticket. `x-role`, `x-user` and ISNAD_DEFAULT_ROLE are never consulted."""
+        tok = bearer_token(request)
+        if tok is not None:
+            r = auth_svc.authenticate(tok)
+            if r is None:
+                raise unauthenticated()
+            return r
+        ticket = request.query_params.get("ticket")
+        if allow_ticket and ticket and request.method == "GET":
+            ident = auth_svc.redeem_ticket(ticket, request.url.path)
+            if ident is not None:
+                return ident, None
+        raise unauthenticated()
+
+    def get_principal(request: Request, x_role: str | None = Header(default=None)) -> Principal:
+        """The single identity seam. Auth off: `x-role` (unknown role / `sim` / missing => 403). Auth on: the
+        bearer token's user and role (missing / invalid / expired => 401); headers are ignored."""
+        if auth_svc is not None:
+            cached = getattr(request.state, "principal", None)
+            if cached is not None:
+                return cached
+            ident, _ = authenticate_request(request)
+            if ident.role == "sim" or ident.role not in om.roles:
+                raise unauthenticated()
+            pr = make_principal(ident.role, ident.user, comp)
+            request.state.principal = pr
+            return pr
         role = x_role or os.environ.get("ISNAD_DEFAULT_ROLE") or None
         if not role:
             raise ApiError(403, "role_required", "x-role header required")
@@ -640,9 +688,53 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
                 "approves": [n for n in om.actions if om.role_can_approve(p.role, n)]}
 
     @app.get("/roles")
-    def roles():
+    def roles(request: Request):
+        if auth_svc is not None:   # one user, one role: no switching
+            ident, _ = authenticate_request(request, allow_ticket=False)
+            r = om.roles.get(ident.role)
+            return [] if r is None or ident.role == "sim" else [
+                {"role": ident.role, "description": r.description, "region": r.region, "user": ident.user}]
         return [{"role": n, "description": r.description, "region": r.region, "user": f"demo-{n}"}
                 for n, r in om.roles.items() if n != "sim"]
+
+    # ---------------------------------------------------------- auth endpoints (unauthenticated except as noted)
+    def require_auth_on():
+        if auth_svc is None:
+            raise ApiError(404, "auth_disabled", "authentication is not enabled")
+
+    @app.get("/auth/config")
+    def auth_config():
+        return {"enabled": auth_svc is not None}
+
+    @app.post("/auth/login")
+    def auth_login(body: LoginBody, request: Request):
+        require_auth_on()
+        ip = request.client.host if request.client else "unknown"   # the socket peer; proxy headers are not trusted
+        try:
+            return auth_svc.login(body.user, body.password, ip)
+        except auth_mod.LoginFailed:
+            raise ApiError(401, "invalid_credentials", "invalid user or password", headers=UNAUTH_HEADERS) from None
+        except auth_mod.Throttled as t:
+            raise ApiError(429, "rate_limited", "too many attempts, try again later", retry_after=t.retry_after,
+                           headers={"Retry-After": str(t.retry_after)}) from None
+
+    @app.post("/auth/logout")
+    def auth_logout(request: Request):
+        require_auth_on()
+        _, pl = authenticate_request(request, allow_ticket=False)
+        auth_svc.logout(pl)
+        return {"ok": True}
+
+    @app.post("/auth/stream-ticket")
+    def auth_stream_ticket(request: Request):
+        """One-time, 60 s ticket for `GET /agent/runs/...?ticket=` (clients that cannot set headers)."""
+        require_auth_on()
+        ident, _ = authenticate_request(request, allow_ticket=False)
+        try:
+            return {"ticket": auth_svc.issue_ticket(ident), "expires_in": auth_mod.service.TICKET_TTL_S}
+        except auth_mod.Throttled as t:
+            raise ApiError(429, "rate_limited", "too many open tickets", retry_after=t.retry_after,
+                           headers={"Retry-After": str(t.retry_after)}) from None
 
     # ---------------------------------------------------------- objects
     @app.get("/objects/{type}")
@@ -1636,6 +1728,22 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
     # ------------------------------------------------------------ scenarios (Phase 5)
     from engine.api import ontology_routes
     app.include_router(ontology_routes.make_router(get_principal, wconn))
+
+    # Optional ingest router (admin only, written by another module; absent module => nothing mounted).
+    if auth_svc is not None or os.environ.get("ISNAD_ALLOW_IMPORT", "0") == "1":
+        try:
+            from engine.api import ingest_routes
+
+            def _ingest_model():
+                try:
+                    return app.state.agent_model_factory(make_principal("admin", "ingest", comp))
+                except Exception:  # noqa: BLE001
+                    return None
+
+            app.include_router(ingest_routes.make_router(get_principal, wconn, ontology=om, schema_name=schema,
+                                                        model_factory=_ingest_model))
+        except ImportError:
+            pass
 
     def scn_error(conn, e: Exception):
         fail(conn, e)

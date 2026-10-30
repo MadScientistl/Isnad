@@ -459,7 +459,8 @@ WRITE_RE = re.compile(r"\bbt\.(write_object|write_link|delete_object|end_link|bu
 
 
 def test_only_engine_writes_instance_data():
-    allowed = ("engine/db/", "engine/actions/", "engine/api/seed.py", "engine/ingest/importer.py")
+    allowed = ("engine/db/", "engine/actions/", "engine/api/seed.py", "engine/ingest/importer.py",
+               "engine/ingest/validate.py")  # validate.py loads only into its own gen_* scratch schema
     offenders = []
     for top in ("engine", "sim"):
         for f in (ROOT / top).rglob("*.py"):
