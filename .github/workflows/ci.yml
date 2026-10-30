@@ -31,6 +31,8 @@ jobs:
         run: uv run python -m engine.compiler ontology/supply_chain.yaml build/ --sdk sdk/
       - name: Tests (no live model calls)
         run: uv run pytest -q -m "not live"
+        env:
+          AMARH_SIM_MAX_SECONDS: "150"  # shared runners are slower than a dev machine (local bound: 60 s)
       - name: Mock evals, three seeds (hard guardrails gate the build)
         run: uv run python -m evals --mode mock --seeds 1,2,3 --md
       - name: Upload eval reports

@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -51,7 +52,8 @@ def test_thirty_days_completes_and_measure(base):
         assert base["stats"].get(k, 0) > 0, k
     print(f"\n30 sim days: {base['actions']} actions in {base['wall']:.1f}s "
           f"= {base['actions'] / base['wall']:.0f} actions/s; stats={base['stats']}")
-    assert base["wall"] < 60
+    # 60 s on a developer machine; shared CI runners are slower (set AMARH_SIM_MAX_SECONDS there)
+    assert base["wall"] < float(os.environ.get("AMARH_SIM_MAX_SECONDS", "60"))
 
 
 def test_determinism(db, base):
