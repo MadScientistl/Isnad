@@ -13,3 +13,5 @@ bench/work/
 workspaces/*
 !workspaces/demo_*/
 var/ingest/
+var/log/
+evals/ontogen/results/report_*
