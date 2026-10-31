@@ -202,11 +202,20 @@ export interface TypesInfo extends Omit<TypesResponse, "objectTypes"> { objectTy
 
 /* ------------------------------------------------------------------ auth ------------------------------------------------------------------ */
 export const authApi = {
+  /** `{enabled}`: true when the server runs with ISNAD_AUTH=1 (login screen instead of the role switcher). */
+  config: () => req<{ enabled: boolean }>("/auth/config", { home: true, scenario: "main" }),
   login: async (user: string, password: string): Promise<AuthSession> => {
-    const r = await req<AuthSession>("/auth/login", { method: "POST", body: { user, password }, home: true });
+    const r = await req<AuthSession>("/auth/login", { method: "POST", body: { user, password }, home: true, scenario: "main" });
     setAuth(r); return r;
   },
-  logout: () => setAuth(null),
+  /** Revokes the token server side (best effort), then forgets it. */
+  logout: async () => {
+    const had = auth;
+    setAuth(null);
+    if (had) { try { await fetch(`${HOME_BASE}/auth/logout`, { method: "POST", headers: { authorization: `Bearer ${had.token}` } }); } catch { /* offline */ } }
+  },
+  /** One-time ticket for GET streams that cannot send headers. The UI streams with fetch + Authorization, so this is only a fallback. */
+  streamTicket: () => req<{ ticket: string; expires_in: number }>("/auth/stream-ticket", { method: "POST", home: true, scenario: "main" }),
 };
 
 /* ------------------------------------------------------------------ workspaces ------------------------------------------------------------------ */
@@ -238,14 +247,25 @@ export interface ValidationReport { ok: boolean; checks: ValidationCheck[]; stat
 /** engine.versioning.diff: kinds are objectTypes, properties (Type.prop), linkTypes, actions, roles, functions, webhooks. */
 export interface OntologyDiff { added: Record<string, string[]>; removed: Record<string, string[]>; changed: Record<string, Record<string, Record<string, [unknown, unknown]>>>; breaking: string[]; sensitive: string[] }
 export interface ProposalRow { id: string; seq: number; parent_id: string | null; kind: "baseline" | "model" | "repair" | "edit"; model: string | null; cost_usd: number | null; created_at: string; created_by?: string; ok?: boolean | null }
-export interface IngestSessionInfo { id: string; source_kind: string; source_name: string; source_sha256: string; created_at: string; created_by?: string }
+export interface IngestSessionInfo { id: string; source_kind: string; source_name: string; source_sha256: string; created_at: string; created_by?: string; slug?: string; workspace?: string }
 export interface IngestSession { session: IngestSessionInfo; profile: Profile; proposals: ProposalRow[] }
 export interface ProposalDetail { id: string; kind?: ProposalRow["kind"]; session_id?: string; seq?: number; cost_usd?: number | null; model?: string | null; proposal: ProposalDoc; yaml: string; mapping: unknown; validation: ValidationReport | null; diff: OntologyDiff }
-export interface JobEvent { t?: string; kind?: string; message?: string; [k: string]: unknown }
-export interface ImportResult { workspace?: string; slug?: string; schema?: string; counts?: Record<string, number>; links?: Record<string, number>; dropped_links?: Record<string, number> | number; already_imported?: boolean; api_base?: string | null; seconds?: number }
-export interface IngestJob { status: "queued" | "running" | "done" | "error"; events: (JobEvent | string)[]; proposal_id?: string | null; cost_usd?: number | null; result?: ImportResult | null; error?: string | null; progress?: number | null }
+/** Job event as the server sends it: {seq, kind, payload}; `t`/`message` are kept for older producers (mock). */
+export interface JobEvent { seq?: number; t?: string; kind?: string; message?: string; payload?: Record<string, unknown> | null; [k: string]: unknown }
+/** engine.ingest.importer.ImportResult.to_dict(): counts are {objects:{Type:n}, links:{link:n}}, drops are per link / per type. */
+export interface ImportResult {
+  slug?: string; schema?: string; action_id?: string; decision_id?: string; proposal_id?: string; ontology_hash?: string;
+  counts?: { objects?: Record<string, number>; links?: Record<string, number> };
+  dropped_links?: Record<string, { unresolved?: number; duplicate?: number }>; dropped_objects?: Record<string, number>;
+  rows?: number; seconds?: number; already_imported?: boolean; imported_at?: string | null; api_base?: string | null;
+}
+export interface JobError { code?: string; detail?: string; [k: string]: unknown }
+export interface IngestJob {
+  id?: string; kind?: string; status: "queued" | "running" | "done" | "failed" | "cancelled"; events: (JobEvent | string)[]; proposal_id?: string | null;
+  cost_usd?: number | null; result?: ImportResult | null; error?: JobError | string | null;
+}
 export type ItemEdit = { path: string; action: "accept" | "reject" | "edit"; value?: unknown };
-export interface Decision { id: string; proposal_id: string; decision: "approved" | "rejected"; approver: string; comment: string | null; at: string }
+export interface Decision { decision_id: string; proposal_id: string; decision: "approved" | "rejected"; approver: string; slug?: string }
 
 /** Uploads the file as a raw body with progress (XMLHttpRequest: fetch has no upload progress). Mock mode simulates progress. */
 export function uploadFile(file: File, onProgress: (frac: number) => void, signal?: AbortSignal): Promise<{ session_id: string; profile_summary?: Record<string, unknown> }> {
@@ -283,15 +303,16 @@ export const ingestApi = {
   sources: () => req<IngestSource[]>("/ingest/sources", H),
   profileSource: (name: string) => req<{ session_id: string }>(`/ingest/sources/${encodeURIComponent(name)}/profile`, { method: "POST", ...H }),
   session: async (id: string): Promise<IngestSession> => {
+    // the server returns the session fields flat, plus profile, profile_summary and proposals
     const r = await req<any>(`/ingest/sessions/${id}`, H);
     const session: IngestSessionInfo = r.session ?? r;
     return { session, profile: r.profile ?? r.session?.profile, proposals: r.proposals ?? [] };
   },
-  createProposal: (sid: string, mode: "baseline" | "model") => req<{ job_id: string }>(`/ingest/sessions/${sid}/proposals`, { method: "POST", body: { mode }, ...H }),
+  createProposal: (sid: string, mode: "baseline" | "model") => req<{ job_id: string; proposal_id?: string }>(`/ingest/sessions/${sid}/proposals`, { method: "POST", body: { mode }, ...H }),
   job: (id: string) => req<IngestJob>(`/ingest/jobs/${id}`, H),
   proposal: (id: string) => req<ProposalDetail>(`/ingest/proposals/${id}`, H),
   repair: (id: string) => req<{ job_id: string }>(`/ingest/proposals/${id}/repair`, { method: "POST", ...H }),
-  patchItems: (id: string, items: ItemEdit[]) => req<{ id?: string; proposal_id?: string }>(`/ingest/proposals/${id}/items`, { method: "PATCH", body: { items }, ...H }),
+  patchItems: (id: string, items: ItemEdit[]) => req<{ id: string }>(`/ingest/proposals/${id}/items`, { method: "PATCH", body: { items }, ...H }),
   approve: (id: string, comment: string) => req<Decision>(`/ingest/proposals/${id}/approve`, { method: "POST", body: { comment }, ...H }),
   runImport: (decisionId: string) => req<{ job_id: string }>(`/ingest/decisions/${decisionId}/import`, { method: "POST", ...H }),
   workspaces: () => req<WorkspaceInfo[]>("/workspaces", H),

@@ -36,12 +36,13 @@ def test_messy_supply_cassette_good_merges_denormalised_carrier(env):
     assert rep.stats["dropped_links"]            # the dataset has dangling references; counted, not hidden
 
 
-def test_messy_supply_baseline_fails_on_name_collision(env):
+def test_messy_supply_baseline_has_no_name_collision(env):
+    """The baseline used to emit link `origin_port` next to property `origin_port` (one RDF predicate, thousands of SHACL
+    violations); link names are now kept distinct from property names."""
     with env.open(DATASETS / "messy_supply") as src:
         prof = env.profile(src)
         rep = validate(prof, env.baseline(prof), src)
-    names = {c["name"] for c in rep.checks if not c["ok"]}
-    assert "name_collisions" in names and not rep.ok
+    assert rep.check("name_collisions")["ok"] and rep.check("shacl_conforms")["ok"] and rep.ok
 
 
 def test_injection_dataset_is_data_only(env):

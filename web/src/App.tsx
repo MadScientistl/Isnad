@@ -27,7 +27,7 @@ function useParts(): string[] {
 }
 
 function Shell() {
-  const { role, setRole, me, meError, scenario, roles, rolesLoaded, auth, logout, needLogin, workspaces, workspace, switchWorkspace, epoch } = useApp();
+  const { role, setRole, me, meError, scenario, roles, rolesLoaded, auth, authEnabled, logout, needLogin, workspaces, workspace, switchWorkspace, epoch } = useApp();
   const parts = useParts();
   const page = parts[0] ?? "";
   const section = SECTIONS.includes(page) ? page : "";
@@ -47,7 +47,7 @@ function Shell() {
           {workspaces && workspaces.length > 0 && (
             <label>Workspace <select value={workspace} onChange={(e) => switchWorkspace(e.target.value)} aria-label="Workspace">
               {wsList.map((w) => <option key={w.slug} value={w.slug} disabled={!w.ok} title={w.ok ? undefined : "No API is running for this workspace"}>{w.label}{w.ok ? "" : " (not running)"}</option>)}</select></label>)}
-          {auth ? <span className="mesum"><span title="Signed in">{auth.user}</span><button onClick={logout}>Sign out</button></span>
+          {auth || authEnabled ? <span className="mesum">{auth && <span title="Signed in">{auth.user}</span>}<button onClick={logout}>Sign out</button></span>
             : <label>Role <select value={role} onChange={(e) => setRole(e.target.value)} disabled={!rolesLoaded}>
               {!roles.some((r) => r.role === role) && <option value={role}>{role}</option>}
               {roles.map((r) => <option key={r.role} value={r.role} title={r.description || undefined}>{r.role}</option>)}</select></label>}
@@ -82,9 +82,9 @@ function Toasts() {
 
 function Gate() {
   const { needLogin, me, meError } = useApp();
-  if (needLogin) return <Login />;
   const seen = useRef(false);
   if (me || meError) seen.current = true;
+  if (needLogin) return <Login />;
   if (!seen.current) return <div className="boot"><Spinner label="Connecting" /></div>;
   return <Shell />;
 }

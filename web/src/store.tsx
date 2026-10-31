@@ -10,7 +10,7 @@ export const DEFAULT_WS = "default";
 interface Ctx {
   role: string; setRole: (r: string) => void; me: Me | null; meError: string | null;
   roles: RoleInfo[]; rolesLoaded: boolean; types: TypesInfo | null; typesError: string | null; reloadTypes: () => void;
-  auth: AuthSession | null; needLogin: boolean; login: (user: string, password: string) => Promise<void>; logout: () => void;
+  auth: AuthSession | null; authEnabled: boolean | null; needLogin: boolean; login: (user: string, password: string) => Promise<void>; logout: () => void;
   workspaces: WorkspaceInfo[] | null; workspace: string; switchWorkspace: (slug: string) => void; reloadWorkspaces: () => void; epoch: number;
   simAvailable: boolean | null;
   asOf: Date | null; setAsOf: (d: Date | null) => void;
@@ -23,6 +23,7 @@ const C = createContext<Ctx | null>(null);
 export function AppProvider({ children }: { children: ReactNode }) {
   const [auth, setAuthS] = useState<AuthSession | null>(() => getAuth());
   const [needLogin, setNeedLogin] = useState(false);
+  const [authEnabled, setAuthEnabled] = useState<boolean | null>(null);
   const [epoch, setEpoch] = useState(0);
   const [role, setRoleS] = useState(() => auth?.role ?? (ls("role", "admin") === "analyst" ? "planner" : ls("role", "admin")));
   const [me, setMe] = useState<Me | null>(null);
@@ -46,6 +47,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [wsSlug, setWsSlug] = useState(() => ls("isnad.workspace", DEFAULT_WS));
   useEffect(() => { const t = setTimeout(() => setAsOfQ(asOf ? asOf.toISOString() : undefined), 250); return () => clearTimeout(t); }, [asOf]);
   const authTok = auth?.token ?? "";
+  // the server says whether logins are required (ISNAD_AUTH=1): login screen instead of the role switcher
+  useEffect(() => {
+    let live = true;
+    authApi.config().then((c) => { if (!live) return; setAuthEnabled(!!c.enabled); if (c.enabled && !getAuth()) setNeedLogin(true); }, () => { if (live) setAuthEnabled(false); });
+    return () => { live = false; };
+  }, [epoch]);
   useEffect(() => {
     let live = true; setSimAvailable(null);
     let h: ReturnType<typeof setInterval> | undefined;
@@ -93,7 +100,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     const a = await authApi.login(user, password);
     applyRole(a.role); setRoleS(a.role); setAuthS(a); setNeedLogin(false);
   }, []);
-  const logout = useCallback(() => { authApi.logout(); setAuthS(null); setNeedLogin(true); setMe(null); }, []);
+  const logout = useCallback(() => { void authApi.logout(); setAuthS(null); setNeedLogin(true); setMe(null); }, []);
   const setScenario = useCallback((id: number | null) => {
     setScenarioHeader(id); try { if (id) localStorage.setItem("scenario", String(id)); else localStorage.removeItem("scenario"); } catch { /* ignore */ }
     setScenarioS(id); if (!id) setScenarioInfo(null);
@@ -122,7 +129,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     addEventListener("isnad-scenario-gone", f); return () => removeEventListener("isnad-scenario-gone", f);
   }, [scenario, setScenario]);
   const refreshScenario = useCallback(() => setScnTick((n) => n + 1), []);
-  const v = useMemo(() => ({ role, setRole, me, meError, roles, rolesLoaded, types, typesError, reloadTypes, auth, needLogin, login, logout, workspaces, workspace, switchWorkspace, reloadWorkspaces, epoch, simAvailable, asOf, setAsOf, asOfQ, sim, simError, setSim, scenario, scenarioInfo, setScenario, refreshScenario }), [role, setRole, me, meError, roles, rolesLoaded, types, typesError, reloadTypes, auth, needLogin, login, logout, workspaces, workspace, switchWorkspace, reloadWorkspaces, epoch, simAvailable, asOf, asOfQ, sim, simError, scenario, scenarioInfo, setScenario, refreshScenario]);
+  const v = useMemo(() => ({ role, setRole, me, meError, roles, rolesLoaded, types, typesError, reloadTypes, auth, authEnabled, needLogin, login, logout, workspaces, workspace, switchWorkspace, reloadWorkspaces, epoch, simAvailable, asOf, setAsOf, asOfQ, sim, simError, setSim, scenario, scenarioInfo, setScenario, refreshScenario }), [role, setRole, me, meError, roles, rolesLoaded, types, typesError, reloadTypes, auth, authEnabled, needLogin, login, logout, workspaces, workspace, switchWorkspace, reloadWorkspaces, epoch, simAvailable, asOf, asOfQ, sim, simError, scenario, scenarioInfo, setScenario, refreshScenario]);
   return <C.Provider value={v}>{children}</C.Provider>;
 }
 

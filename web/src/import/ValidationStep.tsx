@@ -18,7 +18,7 @@ export default function ValidationStep({ det, rounds, onOpen, onRepaired, onNext
   const repair = async () => {
     setBusy(true); setErr(undefined);
     try { setJobId((await ingestApi.repair(det.id)).job_id); }
-    catch (e) { setBusy(false); setErr(e instanceof ApiError && e.status === 409 ? `No repair rounds left: ${e.text}. Edit the proposal by hand instead.` : errMsg(e)); }
+    catch (e) { setBusy(false); setErr(e instanceof ApiError && (e.status === 503 || e.code === "agent_unavailable") ? "Automatic repair needs a model API key and this server has none. Go back to the Review step and edit the proposal by hand, or open an earlier round below." : e instanceof ApiError && e.status === 409 ? `No repair rounds left: ${e.text}. Edit the proposal by hand instead.` : errMsg(e)); }
   };
   const failed = v?.checks.filter((c) => !c.ok) ?? [];
   const repairs = rounds.filter((r) => r.kind === "repair").length;

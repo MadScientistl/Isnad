@@ -4,7 +4,8 @@ import { toast, useApp } from "../store";
 import { ErrorBanner, Trunc } from "../ui";
 import { JobLog, errMsg, useJob } from "./common";
 
-const sum = (o?: Record<string, number> | number) => (typeof o === "number" ? o : Object.values(o ?? {}).reduce((a, b) => a + b, 0));
+type Drops = Record<string, { unresolved?: number; duplicate?: number }>;
+const dropsOf = (o?: Drops) => Object.values(o ?? {}).reduce((a, d) => a + (d.unresolved ?? 0) + (d.duplicate ?? 0), 0);
 
 export default function ApproveStep({ det, comment, setComment, decisionId, setDecisionId }: {
   det: ProposalDetail; comment: string; setComment: (c: string) => void; decisionId?: string; setDecisionId: (d: string) => void;
@@ -22,14 +23,22 @@ export default function ApproveStep({ det, comment, setComment, decisionId, setD
     setBusy(true); setErr(undefined);
     try {
       let d = decisionId;
-      if (!d) { d = (await ingestApi.approve(det.id, comment.trim())).id; setDecisionId(d); }
+      if (!d) { d = (await ingestApi.approve(det.id, comment.trim())).decision_id; setDecisionId(d); }
       setJobId((await ingestApi.runImport(d)).job_id);
-    } catch (e) { setBusy(false); setErr(e instanceof ApiError && e.code === "comment_required" ? "A comment is required because this proposal grants permissions." : errMsg(e)); }
+    } catch (e) {
+      setBusy(false);
+      setErr(!(e instanceof ApiError) ? errMsg(e)
+        : e.code === "comment_required" ? "A comment is required because this proposal grants permissions."
+        : e.code === "self_approval" ? "You uploaded this source, and with login on the approver must be a different admin. Ask another admin to open this proposal and approve it, or sign in as one."
+        : e.code === "already_decided" ? "This proposal was already approved. Open the Validation step to see its decision, or start over."
+        : e.code === "validation_failed" ? "Only a proposal that passes validation can be approved. Go back to the Validation step."
+        : errMsg(e));
+    }
   };
-  const slug = result?.slug ?? result?.workspace;
+  const slug = result?.slug;
   const ws = slug ? workspaces?.find((w) => w.slug === slug) : undefined;
   const dropped = result?.dropped_links;
-  const droppedN = sum(dropped as Record<string, number> | number | undefined);
+  const droppedN = dropsOf(dropped) + Object.values(result?.dropped_objects ?? {}).reduce((a, b) => a + b, 0);
   return (
     <div>
       <section className="card"><h3>Summary</h3>
@@ -50,16 +59,17 @@ export default function ApproveStep({ det, comment, setComment, decisionId, setD
           {needComment && <span className="small muted"> Add a comment first.</span>}</p>
       </section>}
       {jobId && !result && <JobLog job={job} error={error} title="Importing" />}
+      {jobId && !result && (job?.status === "failed" || job?.status === "cancelled" || error) && <p><button onClick={() => { setJobId(null); setBusy(false); }}>Try again</button> <span className="small muted">The approval is kept; retrying only re-runs the import.</span></p>}
       {result && <section className="card" role="status" aria-label="Import result"><h3>Imported {result.already_imported ? <span className="chip info">already imported</span> : <span className="chip ok">done</span>}</h3>
         <p>Workspace <b>{slug}</b>{result.schema ? <> (schema <code className="ref">{result.schema}</code>)</> : null}{result.seconds ? <span className="muted small"> in {result.seconds.toFixed(1)} s</span> : null}</p>
         <div className="tablewrap"><table><thead><tr><th>Object type</th><th>Rows</th></tr></thead><tbody>
-          {Object.entries(result.counts ?? {}).map(([k, n]) => <tr key={k}><td><Trunc max={40}>{k}</Trunc></td><td>{n.toLocaleString()}</td></tr>)}
-          {!Object.keys(result.counts ?? {}).length && <tr><td colSpan={2} className="muted">No rows reported.</td></tr>}</tbody></table></div>
+          {Object.entries(result.counts?.objects ?? {}).map(([k, n]) => <tr key={k}><td><Trunc max={40}>{k}</Trunc></td><td>{n.toLocaleString()}</td></tr>)}
+          {!Object.keys(result.counts?.objects ?? {}).length && <tr><td colSpan={2} className="muted">No rows reported.</td></tr>}</tbody></table></div>
         <div className="tablewrap"><table><thead><tr><th>Link</th><th>Loaded</th><th>Dropped (unresolved)</th></tr></thead><tbody>
-          {Object.entries(result.links ?? {}).map(([k, n]) => { const d = typeof dropped === "object" ? dropped?.[k] ?? 0 : 0; return <tr key={k}><td><Trunc max={40}>{k}</Trunc></td><td>{n.toLocaleString()}</td><td className={d ? "bad-t" : ""}>{d.toLocaleString()}</td></tr>; })}</tbody></table></div>
+          {Object.entries(result.counts?.links ?? {}).map(([k, n]) => { const d = (dropped?.[k]?.unresolved ?? 0) + (dropped?.[k]?.duplicate ?? 0); return <tr key={k}><td><Trunc max={40}>{k}</Trunc></td><td>{n.toLocaleString()}</td><td className={d ? "bad-t" : ""}>{d.toLocaleString()}</td></tr>; })}</tbody></table></div>
         {droppedN > 0 && <div className="warnbox" role="alert"><b>{droppedN.toLocaleString()} link{droppedN === 1 ? "" : "s"} were dropped</b> because an endpoint was missing in the data. They are counted in the audit event and the import report, never skipped silently.</div>}
         <p>{ws?.api_base || result.api_base ? <button className="cta" onClick={() => switchWorkspace(slug!)}>Open workspace {slug}</button>
-          : <span className="warnbox">No API is running for this workspace yet. Start one with its ontology (<code className="ref">workspaces/{slug}/ontology.yaml</code>) and it appears in the workspace picker.</span>}
+          : <span className="warnbox">No API is running for this workspace yet. Start one with <code className="ref">scripts/serve_workspace.sh {slug} 8001</code>, then reload this page: it appears in the workspace picker.</span>}
           {" "}<a className="lnk" href="#/ontology">Back to the ontology manager</a></p>
       </section>}
     </div>

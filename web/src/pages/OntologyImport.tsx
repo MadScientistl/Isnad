@@ -17,7 +17,7 @@ const clear = () => { try { sessionStorage.removeItem(KEY); } catch { /* ignore 
 
 /** Ontology import wizard: Source, Profile, Proposal, Review, Validation, Approve and import. Admin only; state survives a reload. */
 export default function OntologyImport({ parts: _parts }: { parts: string[] }) {
-  const { role } = useApp();
+  const { role, authEnabled } = useApp();
   const [st, setSt] = useState<WizardState>(load);
   useEffect(() => save(st), [st]);
   const go = useCallback((patch: Partial<WizardState>) => setSt((s) => ({ ...s, ...patch })), []);
@@ -30,7 +30,7 @@ export default function OntologyImport({ parts: _parts }: { parts: string[] }) {
   }, [st]);
   const det = usePolled<ProposalDetail | null>(() => (st.pid ? ingestApi.proposal(st.pid) : Promise.resolve(null)), [st.pid]);
   const sess = usePolled(() => (st.sid ? ingestApi.session(st.sid) : Promise.resolve(null)), [st.sid, st.pid]);
-  if (role !== "admin") return <div className="page"><EmptyState title="Ontology import is for admins">Switch to the admin role to import data and propose an ontology.</EmptyState></div>;
+  if (role !== "admin") return <div className="page"><EmptyState title="Ontology import is for admins">{authEnabled ? `You are signed in with the ${role} role. Ask an administrator to import data or to propose an ontology.` : "Switch to the admin role to import data and propose an ontology."}</EmptyState></div>;
   const needDet = st.step === "review" || st.step === "validation" || st.step === "approve";
   const restart = () => { clear(); setSt({ step: "source" }); };
   return (

@@ -116,3 +116,23 @@ def test_postgres_bad_dsn_error_has_no_secret():
     with pytest.raises(SourceError) as e:
         open_source("postgres", dsn="postgresql://user:topsecretpw@127.0.0.1:1/none", name="x")
     assert "topsecretpw" not in str(e.value)
+
+
+def test_baseline_link_names_never_collide_with_property_names(tmp_path):
+    """A link and a property share one RDF predicate; the FK column `boss` must not yield both a property and a link `boss`."""
+    db = tmp_path / "c.db"
+    c = sqlite3.connect(db)
+    c.executescript("""
+    CREATE TABLE dept (did INTEGER PRIMARY KEY, title TEXT);
+    CREATE TABLE emp (eid INTEGER PRIMARY KEY, boss INTEGER REFERENCES dept(did), name TEXT);
+    INSERT INTO dept VALUES (1,'A'),(2,'B');
+    INSERT INTO emp VALUES (1,1,'x'),(2,2,'y');
+    """)
+    c.commit()
+    c.close()
+    with open_source("sqlite", db) as s:
+        prop = baseline_proposal(profile_source(s))
+    props = {p["name"] for t in prop["objectTypes"] for p in t["properties"]}
+    links = [l["name"] for l in prop["linkTypes"]]
+    assert links and not (set(links) & props)
+    assert len(set(links)) == len(links)

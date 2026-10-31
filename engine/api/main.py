@@ -261,12 +261,20 @@ class _BodyLimit:
     """ASGI middleware: requests above MAX_BODY_BYTES are answered 413 `{code: body_too_large}` (declared
     Content-Length is checked up front; streamed bodies are counted)."""
 
-    def __init__(self, app, max_bytes: int):
-        self.app, self.max = app, max_bytes
+    def __init__(self, app, max_bytes: int, _upload_inner: bool = False):
+        self.app, self.max, self._inner = app, max_bytes, _upload_inner
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
+        if scope.get("path") == "/ingest/uploads" and not self._inner:
+            # raw uploads have their own limit (ISNAD_MAX_UPLOAD_BYTES, enforced by the route with its own error code);
+            # 1 MiB of slack lets the route see an over-limit body and answer `too_large`
+            try:
+                up = int(os.environ.get("ISNAD_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
+            except ValueError:
+                up = 20 * 1024 * 1024
+            return await _BodyLimit(self.app, max(self.max, up + 1024 * 1024), True)(scope, receive, send)
         too_big = False
         try:
             cl = int(dict(scope["headers"]).get(b"content-length", b"0") or 0)
@@ -514,6 +522,13 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
         raise ae from e
 
     # ---------------------------------------------------------- runtime pieces
+    def _outbox_empty() -> bool:
+        c = connect(dsn, schema=schema)
+        try:
+            return c.execute("SELECT NOT EXISTS (SELECT 1 FROM graph_outbox)").fetchone()[0]
+        finally:
+            c.close()
+
     def get_pipeline():
         p = state["pipeline"]
         if p is False:
@@ -523,6 +538,8 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
                 from engine.sync.pipeline import SyncPipeline
                 p = state["pipeline"] = SyncPipeline(dsn=dsn, schema=schema, cfg=cfg)
                 with plock:  # first use: mirror what is already in Postgres, then reason once
+                    if _outbox_empty():  # bulk-loaded schema (imported workspace): no outbox rows, build from the views
+                        p.rebuild()
                     p.sync()
                     p.maybe_reason(force=True)
             except Exception as e:  # noqa: BLE001

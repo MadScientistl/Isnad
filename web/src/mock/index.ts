@@ -310,8 +310,10 @@ export function installMock(base: string) {
     w.__mockLog.push({ method, path: u.pathname, query: Object.fromEntries(u.searchParams), role, body, ws: wsSlug });
     if (w.__mockLog.length > 500) w.__mockLog.splice(0, 250);
     await new Promise((r) => setTimeout(r, 30));
+    if (pathname === "/auth/config") return json(200, { enabled: MOCK_AUTH });
     if (pathname === "/auth/login") return json(...ing.login(body));
-    if (MOCK_AUTH) { if (!tok) return json(401, { detail: { code: "unauthenticated", detail: "login required" } }); role = tok.role; }
+    if (pathname === "/auth/logout") return json(200, { ok: true });
+    if (MOCK_AUTH) { if (!tok) return json(401, { code: "unauthenticated", detail: "authentication required" }); role = tok.role; }
     curRole = role ?? "admin";
     if (wm) {
       let world = wsWorlds.get(wsSlug);

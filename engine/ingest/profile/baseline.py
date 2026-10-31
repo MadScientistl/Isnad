@@ -19,6 +19,7 @@ def baseline_proposal(profile: dict) -> dict:
     fks = [f for f in profile["fks"] if f["declared"] or f["confidence"] >= 0.6]
     notes: list[str] = []
     incoming: dict[str, int] = {}
+    fk_cols = {f["from"] for f in fks}   # reference columns stay plain strings/ints (an enum of ids is not a vocabulary)
     for f in fks:
         incoming[f["to"]] = incoming.get(f["to"], 0) + 1
 
@@ -43,7 +44,7 @@ def baseline_proposal(profile: dict) -> dict:
         props, taken = [], set()
         keyset = set(key)
         for c in t["columns"]:
-            ptype, transform = _prop_type(c)
+            ptype, transform = _prop_type(c, enum_ok=c["id"] not in fk_cols)
             if isinstance(ptype, dict):
                 mapping = {}
                 used: set[str] = set()
@@ -61,7 +62,22 @@ def baseline_proposal(profile: dict) -> dict:
         object_types.append({"name": t["ident"], "label": clean_text(t["name"], 64), "extends": None, "key": key,
                              "source_table": tid, "properties": props})
 
+    # A link and a property share one RDF predicate (namespace + name): link names must never equal any property name.
+    prop_names = {p["name"] for ot in object_types for p in ot["properties"]}
     link_types, taken_links = [], set()
+
+    def link_name(base: str, owner: str = "") -> str:
+        if owner and safe_link(base) in taken_links:   # same stem on several tables: qualify with the owning type
+            base = f"{owner.lower()}_{base}"
+        n = safe_link(base, taken_links)
+        if n in prop_names or base in prop_names:
+            taken_links.discard(n)
+            n = safe_link(f"{safe_link(base)[:34]}_link", taken_links)
+            while n in prop_names:
+                taken_links.discard(n)
+                n = safe_link(f"{n[:34]}_rel", taken_links)
+        return n
+
     for f in fks:
         ft, tt = f["from"].split(".")[0], f["to"].split(".")[0]
         if ft not in obj_tables or tt not in obj_tables:
@@ -69,7 +85,7 @@ def baseline_proposal(profile: dict) -> dict:
         fcol = _col(profile, f["from"])
         stem = "_".join(textsim.stem(fcol["name"]))
         base = stem or f"{obj_tables[ft][0]['ident']}_to_{obj_tables[tt][0]['ident']}"
-        link_types.append({"name": safe_link(base, taken_links), "from": obj_tables[ft][0]["ident"],
+        link_types.append({"name": link_name(base, obj_tables[ft][0]["ident"]), "from": obj_tables[ft][0]["ident"],
                            "to": obj_tables[tt][0]["ident"], "cardinality": f["cardinality"], "inverse": None,
                            "transitive": False, "required": False,
                            "source": {"kind": "fk", "from_col": f["from"], "to_type_key": f["to"]}})
@@ -82,7 +98,7 @@ def baseline_proposal(profile: dict) -> dict:
             ta, tb = a["to"].split(".")[0], b["to"].split(".")[0]
             if ta in obj_tables and tb in obj_tables:
                 base = f"{textsim.stem(_col(profile, a['from'])['name']) and '_'.join(textsim.stem(_col(profile, a['from'])['name'])) or obj_tables[ta][0]['ident']}_{'_'.join(textsim.stem(_col(profile, b['from'])['name'])) or obj_tables[tb][0]['ident']}"
-                link_types.append({"name": safe_link(base, taken_links), "from": obj_tables[ta][0]["ident"],
+                link_types.append({"name": link_name(base), "from": obj_tables[ta][0]["ident"],
                                    "to": obj_tables[tb][0]["ident"], "cardinality": "many-to-many", "inverse": None,
                                    "transitive": False, "required": False,
                                    "source": {"kind": "join_table", "table": t["id"], "src_col": a["from"], "dst_col": b["from"]}})
@@ -105,7 +121,7 @@ def baseline_proposal(profile: dict) -> dict:
     }
 
 
-def _prop_type(c: dict):
+def _prop_type(c: dict, enum_ok: bool = True):
     t = c["type"]
     if t == "geojson":
         gt = next((n.split("=", 1)[1] for n in c["notes"] if n.startswith("geojson_type=")), "")
@@ -114,7 +130,7 @@ def _prop_type(c: dict):
         if gt == "LineString":
             return "linestring", "geojson"
         return "string", "none"
-    if c["enum_candidate"] and t == "string" and len(c["enum_candidate"]) >= 2:
+    if enum_ok and c["enum_candidate"] and t == "string" and len(c["enum_candidate"]) >= 2:
         return {"enum": list(c["enum_candidate"])}, "none"
     if t == "timestamp":
         return "timestamp", f"timestamp:{c['format'] or 'iso8601'}"

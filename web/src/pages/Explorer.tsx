@@ -40,7 +40,7 @@ export default function ExplorerPage({ parts }: { parts: string[] }) {
         {types.loading && !types.data && <Spinner label="Loading types" />}
         {types.data && !types.data.objectTypes.length && <EmptyState title="No object types">This ontology defines no object types yet.</EmptyState>}
         {types.data?.objectTypes.map((t) => (
-          <a key={t.name} href={`#/${t.name}`} className={t.name === type ? "on" : ""}>{t.name}<span className="muted">{counts.data?.[t.name] ?? "..."}</span></a>
+          <a key={t.name} href={`#/${t.name}`} className={t.name === type ? "on" : ""}>{t.name}<span className="muted">{counts.data?.[t.name] === undefined ? "..." : counts.data[t.name] >= 1000 ? "1000+" : counts.data[t.name]}</span></a>
         ))}
       </nav>
       <main className="main">

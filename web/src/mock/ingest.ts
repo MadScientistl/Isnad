@@ -6,7 +6,7 @@
 type Json = Record<string, any>;
 type R = [number, unknown];
 const ok = (d: unknown, s = 200): R => [s, d];
-const fail = (s: number, code: string, detail: string, extra: Json = {}): R => [s, { detail: { code, detail, ...extra } }];
+const fail = (s: number, code: string, detail: string, extra: Json = {}): R => [s, { code, detail, ...extra }];
 const iso = (ms: number) => new Date(ms).toISOString();
 let seq = 0;
 const nid = (p: string) => `${p}${(++seq).toString(16).padStart(4, "0")}0000-0000-4000-8000-${String(seq).padStart(12, "0")}`;
@@ -135,14 +135,15 @@ function addProposal(sid: string, kind: string, parent: Prop | null, doc: Json, 
   const p: Prop = { id: nid("c0"), session_id: sid, seq: s.props.length + 1, parent_id: parent?.id ?? null, kind, model, cost_usd: cost, created_at: iso(nowMs()), doc, validation: validate(doc) };
   props.set(p.id, p); s.props.push(p.id); return p;
 }
-const sessionOut = (s: Sess) => ({ session: s.info, profile: s.profile, proposals: s.props.map((id) => { const p = props.get(id)!; return { id: p.id, seq: p.seq, parent_id: p.parent_id, kind: p.kind, model: p.model, cost_usd: p.cost_usd, created_at: p.created_at, ok: p.validation.ok }; }) });
+const sessionOut = (s: Sess) => ({ ...s.info, profile: s.profile, proposals: s.props.map((id) => { const p = props.get(id)!; return { id: p.id, seq: p.seq, parent_id: p.parent_id, kind: p.kind, model: p.model, cost_usd: p.cost_usd, created_at: p.created_at, ok: p.validation.ok }; }) });
 const propOut = (p: Prop) => ({ id: p.id, kind: p.kind, session_id: p.session_id, seq: p.seq, cost_usd: p.cost_usd, model: p.model, proposal: p.doc, yaml: yamlOf(p.doc), mapping: { version: 1, profile_hash: p.doc.profile_hash, types: {} }, validation: p.validation, diff: diffOf(p.doc) });
 function jobOut(j: Job): Json {
   const done = Math.min(j.steps.length, Math.floor((nowMs() - j.t0) / j.per));
   const finished = done >= j.steps.length;
   if (finished && j.fn && !j.result) j.result = j.fn();
-  const events = j.steps.slice(0, done).map((m, i) => ({ t: iso(j.t0 + (i + 1) * j.per), kind: "progress", message: m }));
-  return { status: finished ? "done" : done ? "running" : "queued", events, proposal_id: finished ? j.proposal_id ?? null : null, cost_usd: finished ? j.cost : null, result: finished ? j.result ?? null : null, error: null, progress: done / j.steps.length };
+  const events: Json[] = j.steps.slice(0, done).map((m, i) => ({ seq: i + 1, kind: "progress", payload: { message: m } }));
+  if (finished) events.push({ seq: events.length + 1, kind: "finished", payload: { status: "done", error: null } });
+  return { id: j.id, kind: "mock", status: finished ? "done" : done ? "running" : "queued", events, proposal_id: finished ? j.proposal_id ?? null : null, cost_usd: finished ? j.cost ?? 0 : 0, result: finished ? j.result ?? (j.proposal_id ? { proposal_id: j.proposal_id } : null) : null, error: null };
 }
 
 /* JSON-pointer edit of the proposal document (accept = no-op, reject = remove from its array / mark optional, edit = set). */
@@ -226,11 +227,11 @@ export function route(method: string, path: string, q: URLSearchParams, body: an
   }
   if ((m = path.match(/^\/ingest\/proposals\/([\w-]+)\/approve$/)) && method === "POST") {
     const p = props.get(m[1]); if (!p) return fail(404, "not_found", "Unknown proposal.");
-    if (!p.validation.ok) return fail(422, "validation_failed", "Validation failed; repair or edit the proposal first.");
+    if (!p.validation.ok) return fail(409, "validation_failed", "only a proposal that passes validation can be approved");
     const sens = diffOf(p.doc).sensitive;
     if (sens.length && !String(body?.comment ?? "").trim()) return fail(422, "comment_required", "This proposal grants permissions; a comment is required.", { sensitive: sens });
-    const d = { id: nid("d0"), proposal_id: p.id, decision: "approved", approver: "user:admin", comment: body?.comment ?? null, at: iso(nowMs()) };
-    decisions.set(d.id, { ...d, proposal: p }); return ok(d, 201);
+    const d = { decision_id: nid("d0"), proposal_id: p.id, decision: "approved", approver: "demo-admin", slug: "mock" };
+    decisions.set(d.decision_id, { ...d, proposal: p }); return ok(d, 201);
   }
   if ((m = path.match(/^\/ingest\/decisions\/([\w-]+)\/import$/)) && method === "POST") {
     const d = decisions.get(m[1]); if (!d) return fail(404, "not_found", "Unknown decision.");
@@ -247,8 +248,8 @@ export function route(method: string, path: string, q: URLSearchParams, body: an
           wsNames[u] = { Station: names.t1 ?? "Station", Bike: names.t2 ?? "Bike", Trip: names.t3 ?? "Trip" };
           workspaceRoles[u] = d.proposal.doc.roles.map((r: Json) => ({ role: r.name, description: r.description }));
         }
-        return { slug: u, schema: `ws_${u}`, counts: { [names.t1 ?? "Station"]: 120, [names.t2 ?? "Bike"]: 800, [names.t3 ?? "Trip"]: 15200 }, links: { bike_at: 776, trip_bike: 15200, trip_start: 15188, trip_end: 14136 },
-          dropped_links: { bike_at: 24, trip_start: 12, trip_end: 1064 }, already_imported: !!exists, api_base: `${HOST}/__ws/${u}`, seconds: 3.6 };
+        return { slug: u, schema: `ws_${u}`, rows: 16120, counts: { objects: { [names.t1 ?? "Station"]: 120, [names.t2 ?? "Bike"]: 800, [names.t3 ?? "Trip"]: 15200 }, links: { bike_at: 776, trip_bike: 15200, trip_start: 15188, trip_end: 14136 } },
+          dropped_links: { bike_at: { unresolved: 24, duplicate: 0 }, trip_start: { unresolved: 12, duplicate: 0 }, trip_end: { unresolved: 1064, duplicate: 0 } }, dropped_objects: {}, already_imported: !!exists, api_base: `${HOST}/__ws/${u}`, seconds: 3.6 };
       } };
     jobs.set(j.id, j); return ok({ job_id: j.id }, 202);
   }

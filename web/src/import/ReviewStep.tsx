@@ -65,10 +65,17 @@ export default function ReviewStep({ det, comment, setComment, onApplied, onNext
   const sensitiveTouched = changes.some(([p]) => p.startsWith("/roles/"));
   const apply = async () => {
     setBusy(true); setErr(undefined);
-    const items: ItemEdit[] = changes.map(([path, d]) => ({ path, action: d.action, ...(d.action === "edit" ? { value: d.value } : {}) }));
+    // The server applies items in order and list elements are addressed by index: edits first (they never shift indices),
+    // then rejects from the highest index down, so one reject cannot move the target of another.
+    const nums = (p: string) => p.split("/").filter(Boolean).map((x) => (/^\d+$/.test(x) ? Number(x) : -1));
+    const cmp = (a: string, b: string) => { const x = nums(a), y = nums(b); for (let i = 0; i < Math.min(x.length, y.length); i++) if (x[i] !== y[i]) return y[i] - x[i]; return y.length - x.length; };
+    const items: ItemEdit[] = [
+      ...changes.filter(([, d]) => d.action === "edit").map(([path, d]) => ({ path, action: d.action, value: d.value }) as ItemEdit),
+      ...changes.filter(([, d]) => d.action === "reject").sort((a, b) => cmp(a[0], b[0])).map(([path]) => ({ path, action: "reject" }) as ItemEdit),
+    ];
     try {
       const r = await ingestApi.patchItems(det.id, items);
-      const nid = r.id ?? r.proposal_id;
+      const nid = r.id;
       if (!nid) throw new Error("The server did not return the new proposal.");
       toast(`Applied ${items.length} change${items.length === 1 ? "" : "s"}; re-validated`); setSub(new Map()); onApplied(nid);
     } catch (e) { setErr(errMsg(e)); } finally { setBusy(false); }

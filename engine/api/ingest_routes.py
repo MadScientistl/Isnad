@@ -163,8 +163,26 @@ def apply_items(prop: dict, items: list[dict]) -> dict:
             if isinstance(node, list) and k == len(node):
                 node.append(it.get("value"))
             else:
+                old_name = node.get("name") if (len(segs) == 3 and segs[0] == "objectTypes" and segs[2] == "name"
+                                                and isinstance(node, dict)) else None
                 node[k] = it.get("value")
+                if isinstance(old_name, str) and isinstance(it.get("value"), str) and old_name != it["value"]:
+                    _cascade_type_rename(out, old_name, it["value"])
     return out
+
+
+def _cascade_type_rename(prop: dict, old: str, new: str) -> None:
+    """Renaming an object type keeps the proposal consistent: links, actions, classes and `extends` follow the new name."""
+    for ot in prop.get("objectTypes", []):
+        if ot.get("extends") == old:
+            ot["extends"] = new
+    for lt in prop.get("linkTypes", []):
+        for end in ("from", "to"):
+            if lt.get(end) == old:
+                lt[end] = new
+    for a in prop.get("actions", []):
+        if a.get("type") == old:
+            a["type"] = new
 
 
 def check_edit_policy(old: dict, new: dict) -> None:
