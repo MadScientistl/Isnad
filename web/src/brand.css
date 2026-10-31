@@ -1,26 +1,30 @@
-/* Isnad brand tokens. Palette, type scale and radii follow humain.com (read from its live CSS, 2026-10-30). */
+/* Isnad brand tokens. Dark-first system from the Isnad brand kit: Deep Charcoal canvas, Lime Green accent, white text.
+   Type: Sora (headings, display, wordmark) and Inter (body, UI, labels). Arabic: Tajawal. */
 :root{
-  /* Core palette (HUMAIN names kept) */
-  --color-air:#00d49c;      /* primary */
-  --color-teal:#00ad92;     /* primary highlight / hover */
-  --color-aqua:#00879f;     /* secondary */
-  --color-deep:#006687;     /* secondary highlight */
-  --color-oasis:#d0f94a;    /* tertiary, CTA pills */
-  --color-oasis-soft:#edffb1;
-  --color-glacier:#c5ecff;  /* info tint */
-  --color-red:#b3261e;      /* error */
-  /* Neutrals */
-  --color-black:#000;--color-white:#fff;
-  --color-grey-100:#f5f5f5;--color-grey-200:#eee;--color-grey-300:#e0e0e0;--color-grey-400:#ccc;
-  --color-grey-500:#aaa;--color-grey-700:#666;--color-grey-900:#414141;
-  /* Gradients (always vertical, in oklab) */
-  --gradient-primary:linear-gradient(180deg in oklab,var(--color-oasis) 0%,var(--color-air) 55%,var(--color-aqua) 100%);
-  --gradient-secondary:linear-gradient(180deg in oklab,var(--color-oasis) 0%,var(--color-air) 100%);
-  --gradient-tertiary:linear-gradient(180deg in oklab,var(--color-oasis) 0%,var(--color-white) 100%);
-  /* Type: Optiker headings (uppercase), ABC Repro body, Tajawal Arabic. Licensed faces fall back to free ones. */
-  --font-heading:"Optiker","ABC Repro","Inter",system-ui,sans-serif;
-  --font-body:"ABC Repro","Inter",system-ui,-apple-system,"Segoe UI",sans-serif;
-  --font-arabic:"Tajawal","Janna LT",system-ui,sans-serif;
+  /* Core */
+  --color-lime:#d0f94a;       /* primary accent, interactive elements */
+  --color-charcoal:#02090b;   /* main background */
+  --color-white:#fff;
+  /* Extended palette */
+  --color-lime-200:#b7f53a;--color-lime-300:#8bdc2e;--color-lime-400:#5edb10;
+  --color-green-900:#0b1f1f;
+  --color-gray-200:#a7b3b1;--color-gray-400:#6b7a7a;--color-gray-700:#2a3736;
+  --color-red:#ff6b61;        /* error, destructive (lifted for contrast on charcoal) */
+  /* Surfaces and lines (derived from charcoal / green 900) */
+  --surface-1:#071013;--surface-2:#0c1a1c;--surface-3:#12262a;
+  --line-1:#1a2a2c;--line-2:#2a3736;
+  /* Gradients (lime glow on charcoal) */
+  --gradient-primary:linear-gradient(180deg,var(--color-lime) 0%,var(--color-lime-300) 100%);
+  --glow-lime:radial-gradient(60% 60% at 50% 0%,rgba(208,249,74,.14) 0%,rgba(208,249,74,0) 100%);
+  /* Type */
+  --font-heading:"Sora","Inter",system-ui,sans-serif;
+  --font-body:"Inter",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --font-arabic:"Tajawal",system-ui,sans-serif;
   --letter-tight:-.02em;
-  --radius-pill:999px;--radius-card:12px;--radius-ctl:8px;
+  --radius-pill:999px;--radius-card:14px;--radius-ctl:8px;
+  /* Legacy aliases (older rules still reference these names) */
+  --color-air:var(--color-lime);--color-teal:var(--color-lime-200);--color-aqua:var(--color-lime-300);--color-deep:var(--color-lime);
+  --color-oasis:var(--color-lime);--color-oasis-soft:rgba(208,249,74,.12);--color-glacier:#c5ecff;
+  --color-black:#000;--color-grey-100:var(--surface-2);--color-grey-200:var(--line-1);--color-grey-300:var(--line-2);
+  --color-grey-400:var(--color-gray-400);--color-grey-500:var(--color-gray-400);--color-grey-700:var(--color-gray-200);--color-grey-900:var(--color-gray-700);
 }

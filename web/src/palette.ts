@@ -1,5 +1,5 @@
 /** Deterministic per-type colours and shapes (no ontology-specific names): the same type set always gets the same look. */
-export const PALETTE = ["#0072B2", "#009E73", "#E69F00", "#CC79A7", "#56B4E9", "#D55E00", "#8c6d1f", "#4b5563", "#7b3fa0", "#00879f", "#b3261e", "#6b8e23"];
+export const PALETTE = ["#56B4E9", "#2fd0a0", "#E69F00", "#CC79A7", "#8fd0ff", "#ff8a5c", "#c9a227", "#9ca3af", "#b57bd9", "#4ec3d6", "#ff6b61", "#9bcf53"];
 export const SHAPES = ["circle", "square", "diamond", "tri"] as const;
 export type Shape = (typeof SHAPES)[number];
 export const CY_SHAPES = ["ellipse", "round-rectangle", "diamond", "triangle", "hexagon", "star", "rectangle", "pentagon"];

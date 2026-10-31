@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Project name: **Isnad** (renamed from Amarh; env vars `ISNAD_*`, DB role `isnad_app`, GUCs `isnad.*`, DSN db/user `isnad`; existing local Postgres volumes still hold the old `amarh` db, so recreate with `docker compose down -v`). Brand kit in `brand/` (`BRAND.md`, `tokens.css`, logos), based on humain.com; `web/src/brand.css` is a copy of `brand/tokens.css`, keep in sync.
+Project name: **Isnad** (renamed from Amarh; env vars `ISNAD_*`, DB role `isnad_app`, GUCs `isnad.*`, DSN db/user `isnad`; existing local Postgres volumes still hold the old `amarh` db, so recreate with `docker compose down -v`). Brand kit in `brand/` (`BRAND.md`, `tokens.css`, logos): dark charcoal + lime, Sora/Inter; the UI shell is a left rail plus a right-docked agent chat (`web/src/AgentDock.tsx`, Ctrl/Cmd+K; each message is an independent run), theme in `web/src/theme.css`; `web/src/brand.css` is a copy of `brand/tokens.css`, keep in sync.
 
 Open-source, Palantir Foundry/AIP-inspired ontology platform for one simulated use case (supply chain, geospatial events, finance ops). The full design and sources are in `RESEARCH.md`; read it before any work. This file holds the rules that apply every session.
 

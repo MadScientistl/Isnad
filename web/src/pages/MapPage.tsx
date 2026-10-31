@@ -19,8 +19,8 @@ const ALERT: RGBA = [213, 94, 0, 255];
 const DONE_STATUS = new Set(["arrived", "completed", "done", "delivered"]);
 const OSM_STYLE: maplibregl.StyleSpecification = {
   version: 8,
-  sources: { osm: { type: "raster", tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"], tileSize: 256, maxzoom: 19, attribution: "&copy; OpenStreetMap contributors" } },
-  layers: [{ id: "bg", type: "background", paint: { "background-color": "#dfe6ee" } }, { id: "osm", type: "raster", source: "osm" }],
+  sources: { osm: { type: "raster", tiles: ["https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"], tileSize: 256, maxzoom: 19, attribution: "&copy; OpenStreetMap contributors &copy; CARTO" } },
+  layers: [{ id: "bg", type: "background", paint: { "background-color": "#050d10" } }, { id: "osm", type: "raster", source: "osm" }],
 };
 
 interface Pt { id: string; type: string; name: string; pos: [number, number]; status: string; origin?: [number, number] | null; dest?: [number, number] | null; props: GeoFeature["properties"] }
@@ -95,7 +95,7 @@ export function MapView({ scn, changed, embedded, title }: { scn?: number | "mai
     const ov = overlay.current; if (!ov) return;
     const arcData = arcs === "off" ? [] : all.filter((s) => s.origin && s.dest && (arcs === "all" || (sel && sel.id === s.id)));
     const hl = changed ? all.filter((p) => changed.has(p.id)) : [];
-    const rgb = (t: string) => hexToRgba(styles[t]?.color ?? "#4b5563");
+    const rgb = (t: string) => hexToRgba(styles[t]?.color ?? "#9ca3af");
     const typeLayers = geoTypes.map((t) => {
       const st = styles[t];
       return new IconLayer<Pt>({ id: `t-${t}`, data: visible[t] ?? [], pickable: true, getPosition: (d) => d.pos, sizeUnits: "pixels", getSize: (d) => (sel?.id === d.id ? 22 : ALERT_STATUS.has(d.status) ? 22 : 17),
@@ -107,11 +107,11 @@ export function MapView({ scn, changed, embedded, title }: { scn?: number | "mai
     const labelled = geoTypes.flatMap((t) => ((visible[t]?.length ?? 0) <= 40 && !visible[t]?.some((p) => p.origin) ? visible[t] ?? [] : []));
     ov.setProps({
       layers: [
-        new GeoJsonLayer({ id: "shapes", data: shapeFeatures as any, stroked: true, filled: true, lineWidthUnits: "pixels", lineWidthMinPixels: 2, getLineColor: (f: any) => rgb(f.properties.__t), getFillColor: (f: any) => hexToRgba(styles[f.properties.__t]?.color ?? "#4b5563", 60) }),
+        new GeoJsonLayer({ id: "shapes", data: shapeFeatures as any, stroked: true, filled: true, lineWidthUnits: "pixels", lineWidthMinPixels: 2, getLineColor: (f: any) => rgb(f.properties.__t), getFillColor: (f: any) => hexToRgba(styles[f.properties.__t]?.color ?? "#9ca3af", 60) }),
         new ScatterplotLayer<Pt>({ id: "changed", data: hl, getPosition: (d) => d.pos, stroked: true, filled: true, radiusUnits: "pixels", lineWidthUnits: "pixels", getRadius: 17, lineWidthMinPixels: 3,
           getFillColor: [204, 31, 138, 50], getLineColor: [204, 31, 138, 255] }),
         new ArcLayer<Pt>({ id: "arcs", data: arcData, getSourcePosition: (d) => d.origin!, getTargetPosition: (d) => d.dest!, getWidth: (d) => (sel?.id === d.id ? 3 : 1.5),
-          getSourceColor: (d) => hexToRgba(styles[d.type]?.color ?? "#4b5563", 170), getTargetColor: (d) => hexToRgba(styles[d.type]?.color ?? "#4b5563", 170), updateTriggers: { getWidth: sel?.id } }),
+          getSourceColor: (d) => hexToRgba(styles[d.type]?.color ?? "#9ca3af", 170), getTargetColor: (d) => hexToRgba(styles[d.type]?.color ?? "#9ca3af", 170), updateTriggers: { getWidth: sel?.id } }),
         new ScatterplotLayer<Pt>({ id: "pulse", data: alerts, getPosition: (d) => d.pos, stroked: true, filled: false, radiusUnits: "pixels", lineWidthUnits: "pixels", lineWidthMinPixels: 2,
           getRadius: 14 + pulse * 16, getLineColor: [213, 94, 0, Math.round((1 - pulse) * 220)], updateTriggers: { getRadius: pulse, getLineColor: pulse } }),
         ...typeLayers,

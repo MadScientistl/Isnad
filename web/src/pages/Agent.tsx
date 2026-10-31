@@ -6,7 +6,7 @@ import { fmtT, usePolled, useApp } from "../store";
 import TranscriptView, { StatusChip } from "../Transcript";
 import { compareHref } from "../scenarios";
 
-const EXAMPLES: Record<string, string[]> = {
+export const EXAMPLES: Record<string, string[]> = {
   planner: ["Which shipments are exposed if the closed port stays closed? Propose a reroute or delay where it is justified.", "Which open events could affect shipments in transit?"],
   finance_analyst: ["Find suspicious invoices and flag the ones with clear anomalies.", "Which open invoices are unflagged but score high on anomalies?"],
   regional_ops_lead: ["What are the risks at EMEA ports right now?", "Which EMEA ports have open events that justify a closure?"],
@@ -14,7 +14,7 @@ const EXAMPLES: Record<string, string[]> = {
 };
 
 /** Subscribe to a run: replays stored events then live, reconnecting from the last seq. */
-function useRunStream(runId: string | null) {
+export function useRunStream(runId: string | null) {
   const [t, setT] = useState<Transcript>(emptyTranscript());
   const [conn, setConn] = useState<"idle" | "open" | "retry">("idle");
   const [error, setError] = useState<string>();
@@ -28,7 +28,7 @@ function useRunStream(runId: string | null) {
   return { t, conn, error };
 }
 
-function StatusBar({ t, cfg, caps, running, onCancel, cancelling, startedAt }: { t: Transcript; cfg?: AgentConfig; caps?: AgentConfig["caps"]; running: boolean; onCancel?: () => void; cancelling?: boolean; startedAt?: number }) {
+export function StatusBar({ t, cfg, caps, running, onCancel, cancelling, startedAt }: { t: Transcript; cfg?: AgentConfig; caps?: AgentConfig["caps"]; running: boolean; onCancel?: () => void; cancelling?: boolean; startedAt?: number }) {
   const c = caps ?? cfg?.caps;
   const [now, setNow] = useState(Date.now());
   useEffect(() => { if (!running) return; const h = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(h); }, [running]);
@@ -47,7 +47,7 @@ function StatusBar({ t, cfg, caps, running, onCancel, cancelling, startedAt }: {
   );
 }
 
-function ConfigPanel({ cfg }: { cfg: AgentConfig }) {
+export function ConfigPanel({ cfg }: { cfg: AgentConfig }) {
   return (
     <details className="card agentcfg">
       <summary><b>Agent for {cfg.role}</b> acting as {cfg.user} · {cfg.tools.length} tools · {cfg.actions.length} proposable actions</summary>
@@ -66,62 +66,13 @@ function ConfigPanel({ cfg }: { cfg: AgentConfig }) {
   );
 }
 
-function Console() {
-  const { role } = useApp();
-  const cfg = usePolled(agentApi.config, [role]);
-  const [prompt, setPrompt] = useState("");
-  const [runId, setRunId] = useState<string | null>(null);
-  const [err, setErr] = useState<string>();
-  const [busy, setBusy] = useState(false);
-  const [cancelling, setCancelling] = useState(false);
-  const [startedAt, setStartedAt] = useState<number>();
-  const { t, conn, error } = useRunStream(runId);
-  const running = !!runId && !t.finished && !error;
-  const max = cfg.data?.limits.prompt_max_chars ?? 4000;
-  const start = async () => {
-    setBusy(true); setErr(undefined);
-    try { const r = await agentApi.start(prompt.trim()); setStartedAt(Date.now()); setCancelling(false); setRunId(r.run_id); }
-    catch (e) { setErr(startError(e)); } finally { setBusy(false); }
-  };
-  const cancel = async () => { if (!runId) return; setCancelling(true); try { await agentApi.cancel(runId); } catch (e) { setErr(startError(e)); setCancelling(false); } };
-  const unavailable = cfg.data && !cfg.data.available;
-  const noAgent = cfg.error && /no_agent|403/.test(cfg.error);
-  return (
-    <div className="page agentpage">
-      <h2>Agent console <a className="lnk small" href="#/agent/runs">run history</a></h2>
-      {noAgent ? <EmptyState title={`The ${role} role has no agent`}>Switch to a role that has an agent configured in the ontology.</EmptyState> : <ErrorBanner error={cfg.error} onRetry={cfg.reload} />}
-      {cfg.loading && !cfg.data && !cfg.error && <Spinner label="Loading agent configuration" />}
-      {cfg.data && <ConfigPanel cfg={cfg.data} />}
-      {unavailable && <div className="warnbox" role="alert">The agent is disabled: no model API key is configured on the server, so runs cannot start. Reading history still works.</div>}
-      <form className="promptbox" onSubmit={(e) => { e.preventDefault(); if (prompt.trim() && !running) start(); }}>
-        <label htmlFor="agent-prompt">Ask the {role} agent</label>
-        <textarea id="agent-prompt" rows={3} maxLength={max} value={prompt} onChange={(e) => setPrompt(e.target.value)} disabled={!!unavailable || running}
-          placeholder="Describe what to investigate. The agent reads as you and can only propose actions for approval." />
-        <div className="promptfoot">
-          <span className="muted small">{prompt.length}/{max}</span>
-          <button type="submit" className="primary" disabled={busy || running || !prompt.trim() || !!unavailable || !cfg.data}>{busy ? "Starting…" : "Run agent"}</button>
-        </div>
-        <div className="examples"><span className="muted small">Examples:</span> {(EXAMPLES[role] ?? []).map((x) => <button type="button" key={x} className="ex" disabled={running || !!unavailable} onClick={() => setPrompt(x)}>{x}</button>)}</div>
-      </form>
-      {err && <div className="err" role="alert">{err}</div>}
-      {error && <div className="err" role="alert">{error}</div>}
-      {runId && <>
-        <StatusBar t={t} cfg={cfg.data} running={running} onCancel={cancel} cancelling={cancelling} startedAt={startedAt} />
-        {conn === "retry" && <div className="warnbox">Connection lost, reconnecting…</div>}
-        <TranscriptView t={t} running={running} />
-        <p className="small"><a className="lnk" href={`#/agent/${runId}`}>Open run detail</a></p>
-      </>}
-    </div>
-  );
-}
-
 export function History() {
   const { role } = useApp();
   const q = usePolled(() => agentApi.runs(50), [role], 5000);
   return (
     <div className="page">
-      <h2>Agent runs <a className="lnk small" href="#/agent">console</a></h2>
-      <p className="muted small">Runs started by you as {role}.</p>
+      <h2>Agent runs</h2>
+      <p className="muted small">Runs started by you as {role}. Ask the agent from any page with the chat panel (Ctrl/Cmd+K).</p>
       <ErrorBanner error={q.error} onRetry={q.reload} />
       {q.loading && !q.data && !q.error && <Spinner label="Loading runs" />}
       {q.data && (q.data.length ? (
@@ -131,7 +82,7 @@ export function History() {
               <td className="prompt"><a className="lnk" href={`#/agent/${r.id}`}>{r.prompt.length > 90 ? r.prompt.slice(0, 90) + "…" : r.prompt}</a></td>
               <td><StatusChip s={r.status} /></td><td>{r.turns}</td><td>{r.tool_calls}</td><td>{r.tokens_in + r.tokens_out}</td><td>{money(r.cost_usd)}</td><td>{r.proposals}</td></tr>
           ))}</tbody></table>
-      ) : <EmptyState title="No runs yet" action={<a className="lnk" href="#/agent">Start one in the console</a>}>Agent runs you start are listed here with their tool trace and cost.</EmptyState>)}
+      ) : <EmptyState title="No runs yet" action={<button className="primary" onClick={() => dispatchEvent(new Event("isnad-dock-open"))}>Open the agent chat</button>}>Agent runs you start are listed here with their tool trace and cost.</EmptyState>)}
     </div>
   );
 }
@@ -190,5 +141,5 @@ function Detail({ id }: { id: string }) {
 export default function AgentPage({ parts }: { parts: string[] }) {
   if (parts[1] === "runs") return <History />;
   if (parts[1]) return <Detail id={parts[1]} />;
-  return <Console />;
+  return <History />;
 }

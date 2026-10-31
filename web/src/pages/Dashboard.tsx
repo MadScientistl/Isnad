@@ -11,11 +11,11 @@ import { Bar, EmptyState, ErrorBanner, Spinner, Trunc } from "../ui";
 echarts.use([LineChart, GridComponent, TooltipComponent, MarkLineComponent, CanvasRenderer]);
 
 const METRICS: { m: Metric; title: string; color: string; money?: boolean }[] = [
-  { m: "shipments_in_transit", title: "Shipments in transit", color: "#0072B2" },
+  { m: "shipments_in_transit", title: "Shipments in transit", color: "#6cc4ff" },
   { m: "shipments_delayed", title: "Shipments delayed", color: "#B07A00" },
   { m: "ports_closed", title: "Ports closed", color: "#D55E00" },
-  { m: "invoices_flagged", title: "Invoices flagged", color: "#CC79A7" },
-  { m: "value_at_risk", title: "Value at risk", color: "#7b3fa0", money: true },
+  { m: "invoices_flagged", title: "Invoices flagged", color: "#e79ac4" },
+  { m: "value_at_risk", title: "Value at risk", color: "#c79bff", money: true },
 ];
 const money = (v: number) => (v >= 1e6 ? `${(v / 1e6).toFixed(1)}M` : v >= 1e3 ? `${(v / 1e3).toFixed(0)}k` : String(Math.round(v)));
 
@@ -106,12 +106,12 @@ function MetricChart({ m, title, color, money: isMoney, from, to, marker, live, 
   const last = pts.length ? pts[pts.length - 1].v : null;
   useEffect(() => {
     chart.current?.setOption({
-      animation: false, color: [color], grid: { left: 46, right: 16, top: 14, bottom: 28 },
-      tooltip: { trigger: "axis", valueFormatter: (v: number) => (isMoney ? money(v) : String(v)) },
+      animation: false, color: [color], textStyle: { color: "#a7b3b1" }, grid: { left: 46, right: 16, top: 14, bottom: 28 },
+      tooltip: { trigger: "axis", backgroundColor: "#0c1a1c", borderColor: "#2a3736", textStyle: { color: "#fff" }, valueFormatter: (v: number) => (isMoney ? money(v) : String(v)) },
       xAxis: { type: "time", axisLabel: { fontSize: 10, hideOverlap: true } },
-      yAxis: { type: "value", minInterval: isMoney ? undefined : 1, axisLabel: { fontSize: 10, formatter: (v: number) => (isMoney ? money(v) : String(v)) }, splitLine: { lineStyle: { color: "#eceef2" } } },
+      yAxis: { type: "value", minInterval: isMoney ? undefined : 1, axisLabel: { fontSize: 10, formatter: (v: number) => (isMoney ? money(v) : String(v)) }, splitLine: { lineStyle: { color: "#1a2a2c" } } },
       series: [{ type: "line", step: isMoney ? false : "end", showSymbol: false, lineStyle: { width: 2 }, areaStyle: { opacity: 0.15 }, data: pts.map((p) => [p.t, p.v]),
-        markLine: { symbol: "none", silent: true, animation: false, lineStyle: { color: "#0f172a", type: "dashed", width: 1.5 }, label: { formatter: live ? "now" : "as of", position: "insideEndTop", fontSize: 10 }, data: [{ xAxis: marker }] } }],
+        markLine: { symbol: "none", silent: true, animation: false, lineStyle: { color: "#d0f94a", type: "dashed", width: 1.5 }, label: { formatter: live ? "now" : "as of", position: "insideEndTop", fontSize: 10 }, data: [{ xAxis: marker }] } }],
     }, true);
   }, [pts, color, isMoney, marker, live]);
   return (

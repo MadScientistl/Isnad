@@ -16,8 +16,11 @@ import OntologyManager from "./pages/OntologyManager";
 import OntologyImport from "./pages/OntologyImport";
 import { DEFAULT_WS } from "./store";
 import { Spinner } from "./ui";
+import AgentDock, { useDock } from "./AgentDock";
+import { Icon } from "./Icons";
 
-const NAV = [["dashboard", "Dashboard"], ["map", "Map"], ["graph", "Graph"], ["", "Explorer"], ["audit", "Audit"], ["approvals", "Approvals"], ["agent", "Agent"], ["scenarios", "Scenarios"], ["ontology", "Ontology"]] as const;
+const ICON: Record<string, string> = { dashboard: "dashboard", map: "map", graph: "graph", "": "explorer", audit: "audit", approvals: "approvals", "agent/runs": "agent", scenarios: "scenarios", ontology: "ontology" };
+const NAV = [["dashboard", "Dashboard"], ["map", "Map"], ["graph", "Graph"], ["", "Explorer"], ["audit", "Audit"], ["approvals", "Approvals"], ["agent/runs", "Agent runs"], ["scenarios", "Scenarios"], ["ontology", "Ontology"]] as const;
 const SECTIONS = ["map", "graph", "dashboard", "audit", "approvals", "agent", "scenarios", "ontology"];
 
 function useParts(): string[] {
@@ -31,15 +34,20 @@ function Shell() {
   const parts = useParts();
   const page = parts[0] ?? "";
   const section = SECTIONS.includes(page) ? page : "";
+  const dock = useDock();
   if (needLogin) return <Login />;
   const wsList = [{ slug: DEFAULT_WS, label: "Supply chain (default)", ok: true }, ...(workspaces ?? []).map((w) => ({ slug: w.slug, label: w.slug, ok: !!w.api_base }))];
   return (
-    <div className="shell">
-      <header className="top">
-        <h1><img src="/logo-mark.svg" alt="" />Isnad</h1>
+    <div className={`shell ${dock.open ? "dock-open" : ""}`}>
+      <aside className="rail">
+        <a className="brand" href="#/dashboard" aria-label="Isnad home"><img src="/logo-mark.svg" alt="" /><span>ISNAD</span></a>
         <nav className="topnav" aria-label="Pages">
-          {NAV.filter(([k]) => k !== "ontology" || role === "admin").map(([k, l]) => <a key={k} href={`#/${k}`} className={section === k ? "on" : ""} aria-current={section === k ? "page" : undefined}>{l}</a>)}
+          {NAV.filter(([k]) => k !== "ontology" || role === "admin").map(([k, l]) => { const on = (k === "agent/runs" ? "agent" : k) === section; return <a key={k} href={`#/${k}`} className={on ? "on" : ""} aria-current={on ? "page" : undefined}><Icon name={ICON[k]} /><span>{l}</span></a>; })}
         </nav>
+        <div className="railfoot">Every decision, traceable.</div>
+      </aside>
+      <div className="col">
+      <header className="top">
         <div className="role">
           {me && <span className="mesum" title={`user ${me.user}`}>{me.region ? <span className="chip info">region {me.region}</span> : null}
             {Object.entries(me.types).filter(([, t]) => t.masked.length || !t.read).map(([n, t]) => <span key={n} className="chip restricted" title={t.read ? `masked: ${t.masked.join(", ")}` : "no access"}>{n}{t.read ? ` -${t.masked.length}` : " ✕"}</span>)}</span>}
@@ -52,6 +60,7 @@ function Shell() {
               {!roles.some((r) => r.role === role) && <option value={role}>{role}</option>}
               {roles.map((r) => <option key={r.role} value={r.role} title={r.description || undefined}>{r.role}</option>)}</select></label>}
           <span className="chip badge" aria-label="Active role">{role}</span>
+          <button className="cta askbtn" onClick={() => dock.setOpen(!dock.open)} aria-pressed={dock.open}><Icon name="spark" size={15} /> Ask agent</button>
         </div>
       </header>
       <ScenarioBanner />
@@ -67,6 +76,8 @@ function Shell() {
         {page === "ontology" && (parts[1] === "import" ? <OntologyImport parts={parts} /> : <OntologyManager />)}
         {!section && <ExplorerPage parts={parts} />}
       </div>
+      </div>
+      <AgentDock open={dock.open} onClose={() => dock.setOpen(false)} />
     </div>
   );
 }
