@@ -31,7 +31,9 @@ from engine.db import bitemporal as bt
 from engine.db.principal import OWNER, Principal, ScenarioCtx, scoped
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_ONTOLOGY = ROOT / "ontology" / "supply_chain.yaml"
+# The ontology a bare call (ontology=None) uses: the process's ISNAD_ONTOLOGY, else the supply-chain demo.
+# A running app always passes its loaded ontology explicitly.
+DEFAULT_ONTOLOGY = Path(os.environ.get("ISNAD_ONTOLOGY") or ROOT / "ontology" / "supply_chain.yaml")
 SIM = Principal("sim", "system:sim", "")
 DENY_AUDIT_SOURCES = ("api", "agent")
 
@@ -40,7 +42,7 @@ _ontology_cache: dict[str, Any] = {}
 
 
 # ------------------------------------------------------------------- errors
-log = logging.getLogger("amarh.actions")
+log = logging.getLogger("isnad.actions")
 
 
 class PermissionDenied(Exception):
@@ -151,7 +153,7 @@ def _need_scn(conn, sid: int, *, write: bool) -> None:
     """Inside scoped(): the scenario must be open and visible (else NotFound); writing needs owner/admin."""
     if not sid:
         return
-    vis, wr = conn.execute("SELECT amarh_scenario_visible(%s), amarh_scenario_writable(%s)", [sid, sid]).fetchone()
+    vis, wr = conn.execute("SELECT isnad_scenario_visible(%s), isnad_scenario_writable(%s)", [sid, sid]).fetchone()
     if not vis:
         raise ScenarioNotFound(f"scenario {sid} not found")
     if write and not wr:
@@ -723,7 +725,7 @@ def _audit_denied(conn, model, pr: _P, name, params, valid_at, source, run_id, p
                 # identity, so the denial is written through the loader path with the scenario id set -- but only if
                 # the scenario is open and visible to the caller (never an audit row in a scenario they cannot see)
                 with scoped(conn, OWNER if pr.owner else pr.p, sctx):
-                    if not conn.execute("SELECT amarh_scenario_visible(%s)", [sid]).fetchone()[0]:
+                    if not conn.execute("SELECT isnad_scenario_visible(%s)", [sid]).fetchone()[0]:
                         raise ScenarioNotFound(f"scenario {sid} not found")
                 ident = OWNER
             else:
@@ -832,17 +834,17 @@ def dry_run(conn, name: str, params: dict, principal, *, valid_at: datetime, ont
         before = None
         if sid:
             with scoped(conn, principal):
-                before = kpis.compute(conn, principal, 0, valid_at)
+                before = kpis.compute(conn, principal, 0, valid_at, ontology=model)
         with scoped(conn, _who(principal, sid), sctx):
             _need_scn(conn, sid, write=True)
             c, clean = _pipeline(conn, model, a, params, pr, valid_at, aid, gate=False, sid=sid)
             # evaluated AT the action's valid time (SQL now() is the transaction start, before the write)
-            impact = _impact(before, kpis.compute(conn, principal, sid, valid_at)) if sid else None
+            impact = _impact(before, kpis.compute(conn, principal, sid, valid_at, ontology=model)) if sid else None
             return ActionResult(aid, c.changed, name, c.before, c.after, None, c.created, "dry_run", c.diff(),
                                 impact=impact)
 
 
-PROPOSAL_TTL_H = float(os.environ.get("AMARH_PROPOSAL_TTL_H", "24"))
+PROPOSAL_TTL_H = float(os.environ.get("ISNAD_PROPOSAL_TTL_H", "24"))
 
 
 def propose(conn, name: str, params: dict, principal, rationale: str | None = None, *, valid_at: datetime,
@@ -899,7 +901,7 @@ def _propose_open(conn, model, a, params, principal, pr, sctx, sid, pid, name, r
     else:
         # main side first: baseline KPIs and what approval would do on main (staleness base)
         with scoped(conn, principal):
-            before = kpis.compute(conn, principal, 0, valid_at)
+            before = kpis.compute(conn, principal, 0, valid_at, ontology=model)
             try:
                 _c0, main_preview, _ = _preview_run(conn, model, a, params, pr, valid_at, 0)
                 base_diff = main_preview["diff"]
@@ -908,7 +910,7 @@ def _propose_open(conn, model, a, params, principal, pr, sctx, sid, pid, name, r
         with scoped(conn, principal, sctx):
             _need_scn(conn, sid, write=True)
             clean, preview, after = _preview_run(conn, model, a, params, pr, valid_at, sid,
-                                                 with_kpis=lambda: kpis.compute(conn, principal, sid, valid_at))
+                                                 with_kpis=lambda: kpis.compute(conn, principal, sid, valid_at, ontology=model))
             preview["scenario_id"] = sid
             preview["impact"] = _impact(before, after)
             # review M6: the evidence the approver is shown; approval of a proposal whose evidence scenario kept
@@ -932,7 +934,7 @@ def _propose_open(conn, model, a, params, principal, pr, sctx, sid, pid, name, r
             [pid, name, _jdump(clean), proposer or pr.user, proposer_role or pr.role, rationale, _jdump(preview), run_id,
              None if tool_trace is None else _jdump(tool_trace), on_behalf_of, idempotency_key,
              None if evidence is None else _jdump(evidence),
-             _jdump(_base_versions(base_diff if base_diff is not None else [])),
+             _jdump(_base_versions(base_diff if base_diff is not None else [], model)),
              ttl * 3600, sid, origin_action_id])
         if sid:
             conn.execute("INSERT INTO scenario_event (scenario_id, kind, actor, payload) VALUES (%s,'proposal',%s,%s::jsonb)",
@@ -979,7 +981,7 @@ def decide(conn, proposal_id: UUID, principal, approve: bool, comment: str | Non
                     ev_sid = conn.execute("SELECT scenario_id FROM proposal WHERE id=%s", [proposal_id]).fetchone()[0]
                     seen = (dry or {}).get("scenario_data_version") if isinstance(dry, dict) else None
                     if ev_sid and seen is not None and conn.execute(
-                            "SELECT amarh_scenario_changed(%s, %s)", [ev_sid, seen]).fetchone()[0]:
+                            "SELECT isnad_scenario_changed(%s, %s)", [ev_sid, seen]).fetchone()[0]:
                         raise StaleProposal(["scenario"])
                 aid = uuid4()
                 res = None
@@ -990,7 +992,7 @@ def decide(conn, proposal_id: UUID, principal, approve: bool, comment: str | Non
                     res = _do_execute(conn, model, _action(model, action), params, pr, vt, aid, source=source,
                                       run_id=run_id, proposal_id=proposal_id, tool_trace=tool_trace,
                                       on_behalf_of=behalf or proposer, gate=False)
-                    changed = _stale_keys(base, res.diff)
+                    changed = _stale_keys(base, res.diff, model)
                     if changed:
                         raise StaleProposal(changed)
                 try:
@@ -1012,25 +1014,35 @@ def decide(conn, proposal_id: UUID, principal, approve: bool, comment: str | Non
         pass
 
 
-# Properties the simulation rewrites constantly; they must not make every proposal about a moving shipment
-# stale. TODO: declare as `volatile: true` in the YAML ontology instead of a constant.
-VOLATILE_PROPS = frozenset({"position", "progress"})
+# Properties that change on every tick (`volatile: true` in the YAML) must not make every proposal about a
+# moving object stale. Without a model (legacy callers) the supply-chain pair is assumed.
+_LEGACY_VOLATILE = frozenset({"position", "progress"})
+VOLATILE_PROPS = _LEGACY_VOLATILE   # kept for importers; the engine itself reads Property.volatile
 
 
-def _stable(snap):
-    return {k: v for k, v in snap.items() if k not in VOLATILE_PROPS} if isinstance(snap, dict) else snap
+def _volatile(model, type_: str | None) -> frozenset:
+    if model is None:
+        return _LEGACY_VOLATILE
+    ot = model.object_types.get(type_)
+    return frozenset(p.name for p in ot.properties if p.volatile) if ot is not None else frozenset()
 
 
-def _base_versions(diff) -> dict:
+def _stable(snap, model=None, type_=None):
+    vol = _volatile(model, type_)
+    return {k: v for k, v in snap.items() if k not in vol} if isinstance(snap, dict) else snap
+
+
+def _base_versions(diff, model=None) -> dict:
     """What a proposal was based on: the 'before' snapshot of every object/link the action touches."""
-    return {f"{d['kind']}:{d['type']}:{d['key']}": _stable(d["before"]) for d in diff}
+    return {f"{d['kind']}:{d['type']}:{d['key']}": _stable(d["before"], model, d["type"]) for d in diff}
 
 
-def _stale_keys(base, diff) -> list[str]:
+def _stale_keys(base, diff, model=None) -> list[str]:
     """Keys whose recorded base differs from what the approval run saw."""
     if not base:
         return []
-    now = {f"{d['kind']}:{d['type']}:{d['key']}": _stable(json.loads(json.dumps(d["before"], default=str)))
+    now = {f"{d['kind']}:{d['type']}:{d['key']}": _stable(json.loads(json.dumps(d["before"], default=str)),
+                                                         model, d["type"])
            for d in diff}
     changed = {k for k, b in base.items() if now.get(k, "<missing>") != b}
     # something that already existed at approval but was not part of the proposal (e.g. a link added since)

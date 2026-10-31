@@ -1,0 +1,7 @@
+cluster_id,cluster_name,zone_id
+CL1,Harbour,ZN1
+CL2,Old Town,ZN1
+CL3,University,ZN2
+CL4,Riverside,ZN2
+CL5,Hills,ZN3
+CL6,Airport,ZN3

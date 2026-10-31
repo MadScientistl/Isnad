@@ -47,14 +47,14 @@ def test_planner_tiny_question():
 
 
 # ---------------------------------------------------------------------------------------------------------
-# More live smoke tests (skipped without a key; tiny caps; a cheap model unless AMARH_EVAL_MODEL says otherwise).
+# More live smoke tests (skipped without a key; tiny caps; a cheap model unless ISNAD_EVAL_MODEL says otherwise).
 # They use the deterministic eval world and assert hard guardrails only, never model wording.
 # ---------------------------------------------------------------------------------------------------------
 TINY = dict(max_turns=6, max_tool_calls=8, max_output_tokens=3000, max_cost_usd=0.10, max_wall_s=60.0)
 
 
 def _live_model():
-    return AnthropicModel(os.environ.get("AMARH_EVAL_MODEL") or "claude-haiku-5-5", effort="low")
+    return AnthropicModel(os.environ.get("ISNAD_EVAL_MODEL") or "claude-haiku-5-5", effort="low")
 
 
 @pytest.fixture

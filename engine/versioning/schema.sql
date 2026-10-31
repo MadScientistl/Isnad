@@ -1,5 +1,5 @@
 -- Ontology versioning tables (Phase 5). Applied with the target schema first on search_path, after
--- governance.sql (needs amarh_app and amarh_append_only). Idempotent. Append-only, FORCE RLS, admin-only SELECT.
+-- governance.sql (needs isnad_app and isnad_append_only). Idempotent. Append-only, FORCE RLS, admin-only SELECT.
 
 CREATE TABLE IF NOT EXISTS ontology_version (
     id serial PRIMARY KEY,
@@ -8,9 +8,19 @@ CREATE TABLE IF NOT EXISTS ontology_version (
     yaml text NOT NULL,
     created_by text NOT NULL,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    source text NOT NULL CHECK (source IN ('startup', 'proposal', 'rollback')),
+    source text NOT NULL CHECK (source IN ('startup', 'proposal', 'rollback', 'import')),
     note text
 );
+-- Phase 6: a brand-new workspace schema starts with an 'import' version; widen the CHECK on existing schemas.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'ontology_version'::regclass
+                 AND conname = 'ontology_version_source_check' AND pg_get_constraintdef(oid) LIKE '%import%') THEN
+    ALTER TABLE ontology_version DROP CONSTRAINT IF EXISTS ontology_version_source_check;
+    ALTER TABLE ontology_version ADD CONSTRAINT ontology_version_source_check
+        CHECK (source IN ('startup', 'proposal', 'rollback', 'import'));
+  END IF;
+END $$;
 -- not UNIQUE: a rollback legitimately re-registers an older definition (see engine/versioning docstring)
 CREATE INDEX IF NOT EXISTS ontology_version_hash_idx ON ontology_version (hash);
 
@@ -46,25 +56,25 @@ DO $$
 DECLARE t text; p record; owner_role text := current_user;
 BEGIN
   FOREACH t IN ARRAY ARRAY['ontology_version','ontology_change_proposal','ontology_change_decision'] LOOP
-    EXECUTE format('DROP TRIGGER IF EXISTS amarh_no_update ON %I', t);
-    EXECUTE format('CREATE TRIGGER amarh_no_update BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION amarh_append_only()', t);
-    EXECUTE format('DROP TRIGGER IF EXISTS amarh_no_truncate ON %I', t);
-    EXECUTE format('CREATE TRIGGER amarh_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION amarh_append_only()', t);
-    EXECUTE format('GRANT INSERT, SELECT ON %I TO amarh_app', t);
+    EXECUTE format('DROP TRIGGER IF EXISTS isnad_no_update ON %I', t);
+    EXECUTE format('CREATE TRIGGER isnad_no_update BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION isnad_append_only()', t);
+    EXECUTE format('DROP TRIGGER IF EXISTS isnad_no_truncate ON %I', t);
+    EXECUTE format('CREATE TRIGGER isnad_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION isnad_append_only()', t);
+    EXECUTE format('GRANT INSERT, SELECT ON %I TO isnad_app', t);
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
     EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
     FOR p IN SELECT policyname FROM pg_policies WHERE schemaname = current_schema() AND tablename = t LOOP
       EXECUTE format('DROP POLICY %I ON %I', p.policyname, t);
     END LOOP;
     EXECUTE format('CREATE POLICY owner_all ON %I AS PERMISSIVE FOR ALL TO %I USING (true) WITH CHECK (true)', t, owner_role);
-    EXECUTE format('CREATE POLICY admin_sel ON %I FOR SELECT TO amarh_app USING (coalesce(current_setting(''amarh.role'', true), '''') = ''admin'')', t);
-    EXECUTE format('CREATE POLICY admin_ins ON %I FOR INSERT TO amarh_app WITH CHECK (coalesce(current_setting(''amarh.role'', true), '''') = ''admin'')', t);
+    EXECUTE format('CREATE POLICY admin_sel ON %I FOR SELECT TO isnad_app USING (coalesce(current_setting(''isnad.role'', true), '''') = ''admin'')', t);
+    EXECUTE format('CREATE POLICY admin_ins ON %I FOR INSERT TO isnad_app WITH CHECK (coalesce(current_setting(''isnad.role'', true), '''') = ''admin'')', t);
   END LOOP;
 END $$;
 
 DO $$ DECLARE s record; BEGIN
   FOR s IN SELECT c.relname FROM pg_class c WHERE c.relkind = 'S' AND c.relnamespace = current_schema()::regnamespace
            AND c.relname IN ('ontology_version_id_seq','ontology_change_decision_id_seq') LOOP
-    EXECUTE format('GRANT USAGE, SELECT ON SEQUENCE %I TO amarh_app', s.relname);
+    EXECUTE format('GRANT USAGE, SELECT ON SEQUENCE %I TO isnad_app', s.relname);
   END LOOP;
 END $$;

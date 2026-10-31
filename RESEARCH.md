@@ -156,6 +156,12 @@ Yes, an agent can do it with a human review gate. Pipeline:
 
 Related work: [RIGOR](https://arxiv.org/abs/2506.01232) (LLM builds OWL from relational schemas table by table with a judge LLM), Montage (human-in-the-loop schema-to-R2RML mapping), OntoGenix (CSV to OWL/RML; stale). None targets an operational Foundry-style ontology, so this part is ours.
 
+
+### Status after Phase 6 (built, changed from the design, remaining)
+**Built** (all on branch `phase-6`): (1) deterministic profiler for CSV/TSV/zip, SQLite and PostgreSQL (read-only, named sources only) with types, keys, uniqueness, declared and value-overlap-inferred foreign keys, enums, geo and time columns, cardinality, join tables; (2) Claude proposal agent with four tools (`get_profile`, `get_samples`, `check_proposal`, `submit_proposal`), strict `Proposal` schema, server-side namespace and templates, plus a no-model heuristic baseline; (3) validation loop in a throwaway schema (compile, DDL, sample load, keys, nulls, coercion, enums, link resolution, SHACL, reasoner, generated-code check) with structured repair feedback; (4) human review wizard (per-item edit/reject via new proposals, approve with comment) and ontology manager (versions, diff, proposals, rollback); (5) audited bulk import (one transaction, one `import_dataset` audit row, deterministic ids, hash-checked source) into a per-ontology Postgres schema served by its own API process; (6) engine and UI de-hardcoded from the supply-chain ontology; (7) README, one-command setup, scripted demo. Two datasets (messy supply chain, bike-share) plus an injection set are measured against hand-written references.
+**Changed from the design:** interfaces are not in the compiler, so they map to `classes`; roles are a fixed template, not model-invented; the model proposes ontology plus a column mapping, and YAML is produced only by deterministic code (`to_yaml`); one ontology per API process (workspace = schema + process) instead of a multi-ontology server; the first ontology version uses a new `import` source because `propose()` needs an existing version; SQL sources are named and server-configured, never client-supplied DSNs; imports are an owner-path bulk load audited as one execution, not row-by-row actions.
+**Remaining / unverified:** no live Claude run of the generator (quality numbers are for the heuristic baseline and scripted cassettes only); no PII masking or row filters in generated roles; hosted multi-process concerns (shared revocation, limits); MySQL/MSSQL/Excel sources; a UI list of past import sessions and a reject button.
+
 ## 9. Implementation design
 
 **Repository layout:** `ontology/` (YAML), `engine/` (compiler, object API, action engine, policy, audit, sync, reasoning), `sim/`, `agent/` (tools, approval queue, runner), `evals/`, `web/`, `sdk/`.
@@ -179,7 +185,7 @@ Related work: [RIGOR](https://arxiv.org/abs/2506.01232) (LLM builds OWL from rel
 3. **Governance and actions.** Roles, RLS, property masking, action engine, audit, outbox, multi-hop and inferred-edge permission test suite.
 4. **Agent.** Tools, approval inbox, execute-as-approver, allowlist, history tools.
 5. **Scenarios and evals.** What-if branches, dry-run previews, eval harness (including history and inference cases).
-6. **Auto-generation agent** and polish.
+6. **Auto-generation agent** and polish. *(Built on branch `phase-6`, see the status notes at the end of section 8.)*
 
 ## 11. Risks
 
@@ -194,7 +200,7 @@ Related work: [RIGOR](https://arxiv.org/abs/2506.01232) (LLM builds OWL from rel
 
 Resolved: Claude (API) is the agent model; v1 uses a UI role switcher (no real login). The backend still enforces permissions per request from the selected role, so real auth can be added later without changing the engine.
 
-Remaining: start Phase 1 now?
+Remaining (end of Phase 6): live Claude runs of the agent, scenario tools and ontology generator; real authentication (token auth exists, dormant); multi-ontology in one process; see CLAUDE.md "Known limitations after Phase 6".
 
 ## Appendix: Apache AGE (previously chosen, now dropped)
 

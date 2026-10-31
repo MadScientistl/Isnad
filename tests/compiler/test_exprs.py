@@ -103,7 +103,7 @@ def test_validate_filter_rejects(text, typ, frag):
 
 def test_filter_to_sql():
     sql = filter_to_sql(parse_filter("region = $region and status != 'closed'"), ONTO, "Port", "t")
-    assert sql == """((t."region" = NULLIF(current_setting('amarh.region', true), '')) AND (t."status" <> 'closed'))"""
+    assert sql == """((t."region" = NULLIF(current_setting('isnad.region', true), '')) AND (t."status" <> 'closed'))"""
     assert filter_to_sql(parse_filter("lat >= 3.5 or lat is null"), ONTO, "Port", "t") == '((t."lat" >= 3.5) OR (t."lat" IS NULL))'
     assert filter_to_sql(parse_filter("status in ('open','closed')"), ONTO, "Port", "p") == """(p."status" IN ('open', 'closed'))"""
     assert filter_to_sql(parse_filter("not region = 'EMEA'"), ONTO, "Port", "t") == """(NOT (t."region" = 'EMEA'))"""

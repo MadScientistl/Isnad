@@ -1,6 +1,6 @@
 """Anthropic Messages API client (streaming). The key comes only from ANTHROPIC_API_KEY and is never logged.
 
-Model: AMARH_AGENT_MODEL (default claude-sonnet-5-5). Sonnet 5.5: thinking is adaptive by default (parameter
+Model: ISNAD_AGENT_MODEL (default claude-sonnet-5-5). Sonnet 5.5: thinking is adaptive by default (parameter
 omitted), no sampling parameters, no forced tool_choice, effort set via output_config.
 """
 from __future__ import annotations
@@ -15,7 +15,7 @@ DEFAULT_MODEL = "claude-sonnet-5-5"
 class AnthropicModel:
     def __init__(self, model: str | None = None, *, effort: str = "medium", client=None):
         import anthropic
-        self.name = model or os.environ.get("AMARH_AGENT_MODEL") or DEFAULT_MODEL
+        self.name = model or os.environ.get("ISNAD_AGENT_MODEL") or DEFAULT_MODEL
         self.effort = effort
         if client is None:
             key = os.environ.get("ANTHROPIC_API_KEY")

@@ -1,4 +1,4 @@
-# Amarh: Problem and Solution Statements
+# Isnad: Problem and Solution Statements
 
 ## Problem statement
 
@@ -13,7 +13,7 @@ The result is that enterprise agent projects stall at read-only copilots. The pl
 
 ## Solution statement
 
-Amarh is an open-source, ontology-driven platform that makes it safe for enterprise agents to reason over operational data and to act on it under human control.
+Isnad is an open-source, ontology-driven platform that makes it safe for enterprise agents to reason over operational data and to act on it under human control.
 
 1. **One ontology as the single definition.** A YAML ontology compiles to the database schema, an OWL/SHACL semantic layer, the API and a TypeScript SDK. Agents and people work from the same typed model.
 2. **Reasoning over a semantic graph.** OWL 2 RL inference and multi-hop traversal give the agent indirect relationships (impact analysis), and every inferred fact is flagged and carries provenance, so asserted and inferred facts are never confused.
@@ -26,7 +26,7 @@ Outcome: an organisation can let agents investigate and recommend at machine spe
 
 ## Scope note
 
-Amarh is a simulated, local-first reference platform, not a production deployment. Known limits (no real login, view-level masking, trusted identity settings inside a scoped session, no live Claude API run yet) are in `docs/contracts.md`.
+Isnad is a simulated, local-first reference platform, not a production deployment. Known limits (no real login, view-level masking, trusted identity settings inside a scoped session, no live Claude API run yet) are in `docs/contracts.md`.
 
 ## Fit with HUMAIN Fabric
 
@@ -34,11 +34,11 @@ HUMAIN Fabric is described in press releases and marketplace listings as HUMAIN'
 
 Proposed fit (a design, not an integration that exists):
 
-- **Layering:** Fabric is the governed data and memory foundation. Amarh sits on top as the ontology and action layer: shared meaning, multi-hop reasoning, bitemporal history, role-scoped permissions, and propose-approve-execute with audit.
+- **Layering:** Fabric is the governed data and memory foundation. Isnad sits on top as the ontology and action layer: shared meaning, multi-hop reasoning, bitemporal history, role-scoped permissions, and propose-approve-execute with audit.
 - **Read path:** Fabric assets are mapped by the YAML ontology (or pulled over MCP) into typed objects and links in Postgres, then into the semantic graph.
 - **Write path:** approved actions leave through the outbox as webhooks or API calls to the system of record or Fabric. Agents never write directly into Fabric.
-- **MCP both ways:** Amarh would consume Fabric's MCP data, and expose its own tools (query, traverse, propose) as MCP so other agents, such as HUMAIN ONE's, can use them under the same permissions.
-- **Identity and governance:** enterprise SSO groups map to Amarh roles; Fabric governance and classification feed masking and row rules; Amarh adds per-edge filtering and audit.
+- **MCP both ways:** Isnad would consume Fabric's MCP data, and expose its own tools (query, traverse, propose) as MCP so other agents, such as HUMAIN ONE's, can use them under the same permissions.
+- **Identity and governance:** enterprise SSO groups map to Isnad roles; Fabric governance and classification feed masking and row rules; Isnad adds per-edge filtering and audit.
 - **Value for HUMAIN ONE:** automation of business functions gains shared meaning, indirect-impact analysis, history and an approval trail.
 
-Not built: a Fabric connector, an MCP client or server, SSO, and a live Claude API run. Today Amarh runs on simulated data.
+Not built: a Fabric connector, an MCP client or server, SSO, and a live Claude API run. Today Isnad runs on simulated data.

@@ -1,11 +1,13 @@
 """Generic FastAPI app over a compiled ontology. Run: uvicorn engine.api.main:app
 
-Identity: every request carries `x-role`; the role maps to a `Principal(role, 'demo-<role>', region)`
+Identity (auth off, the default): every request carries `x-role`; the role maps to a `Principal(role, 'demo-<role>', region)`
 (there is no real login in v1, but nothing below this seam trusts the client). Unknown roles and the
-system role `sim` are refused (403); a missing header is refused unless AMARH_DEFAULT_ROLE names a role
+system role `sim` are refused (403); a missing header is refused unless ISNAD_DEFAULT_ROLE names a role
 (a documented dev switch, unset by default). Reads run inside `scoped(conn, principal)` (Postgres RLS +
 masked `rd_*` views decide what exists for the caller; hidden == missing, 404 never 403). All mutations go
 through `engine.actions.execute / propose / decide / rollback` with the caller's principal.
+With ISNAD_AUTH=1 identity comes only from a signed bearer token (`engine.auth`): `x-role`, `x-user` and
+ISNAD_DEFAULT_ROLE are ignored, and only /health and /auth/* (plus OPTIONS preflight) need no token.
 """
 from __future__ import annotations
 
@@ -48,11 +50,10 @@ from engine.db.principal import Principal, ScenarioCtx, scoped
 from engine.sync import visibility as V
 from engine.sync.store import SyncConfig
 
-log = logging.getLogger("amarh.api")
+log = logging.getLogger("isnad.api")
 
 DEFAULT_ONTOLOGY = "ontology/supply_chain.yaml"
 HIDDEN = ("valid_during", "recorded_during", "scenario_id", "action_id")
-GEO_TYPES = ("Port", "Warehouse", "Shipment")
 SPEEDS = ("paused", "1", "6", "24")
 METRICS = ("shipments_in_transit", "shipments_delayed", "ports_closed", "invoices_flagged",
            "value_at_risk")
@@ -65,9 +66,9 @@ _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$")
 class ApiError(Exception):
     """An error with a JSON body `{code, detail, ...}` (rendered by the app's exception handler)."""
 
-    def __init__(self, status: int, code: str, detail: str, **extra):
+    def __init__(self, status: int, code: str, detail: str, *, headers: dict[str, str] | None = None, **extra):
         super().__init__(detail)
-        self.status, self.body = status, {"code": code, "detail": detail, **extra}
+        self.status, self.body, self.headers = status, {"code": code, "detail": detail, **extra}, headers
 
 
 def map_error(e: Exception) -> ApiError | None:
@@ -193,12 +194,12 @@ class InjectBody(BaseModel):
 
 
 MAX_TEXT = 4000          # comment / rationale / reason / note fields
-MAX_BODY_BYTES = int(os.environ.get("AMARH_MAX_BODY_BYTES", str(2 * 1024 * 1024)))
+MAX_BODY_BYTES = int(os.environ.get("ISNAD_MAX_BODY_BYTES", str(2 * 1024 * 1024)))
 MAX_INJECTIONS = 20
 
 
 def _sim_days_cap() -> int:
-    return int(os.environ.get("AMARH_SCN_SIM_MAX_DAYS", "90"))
+    return int(os.environ.get("ISNAD_SCN_SIM_MAX_DAYS", "90"))
 
 
 class ExecBody(BaseModel):
@@ -237,7 +238,7 @@ class MergeBody(BaseModel):
 
 class InjectionBody(BaseModel):
     """One what-if injection. Bounds (review L4): finite numbers only; magnitude in (0, 100]; times within the
-    simulated horizon (AMARH_SCN_SIM_MAX_DAYS); target is a UUID (validated by pydantic)."""
+    simulated horizon (ISNAD_SCN_SIM_MAX_DAYS); target is a UUID (validated by pydantic)."""
     kind: Literal["port_closure", "shipment_delay", "supplier_delay", "price_shock", "invoice_anomaly"]
     target: UUID | None = None
     at_h: float | None = Field(default=None, ge=0, le=24 * 365, allow_inf_nan=False)
@@ -251,16 +252,29 @@ class SimulateBody(BaseModel):
     injections: list[InjectionBody] = Field(default=[], max_length=MAX_INJECTIONS)
 
 
+class LoginBody(BaseModel):
+    user: str = Field(max_length=128)
+    password: str = Field(max_length=1024)
+
+
 class _BodyLimit:
     """ASGI middleware: requests above MAX_BODY_BYTES are answered 413 `{code: body_too_large}` (declared
     Content-Length is checked up front; streamed bodies are counted)."""
 
-    def __init__(self, app, max_bytes: int):
-        self.app, self.max = app, max_bytes
+    def __init__(self, app, max_bytes: int, _upload_inner: bool = False):
+        self.app, self.max, self._inner = app, max_bytes, _upload_inner
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
+        if scope.get("path") == "/ingest/uploads" and not self._inner:
+            # raw uploads have their own limit (ISNAD_MAX_UPLOAD_BYTES, enforced by the route with its own error code);
+            # 1 MiB of slack lets the route see an over-limit body and answer `too_large`
+            try:
+                up = int(os.environ.get("ISNAD_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
+            except ValueError:
+                up = 20 * 1024 * 1024
+            return await _BodyLimit(self.app, max(self.max, up + 1024 * 1024), True)(scope, receive, send)
         too_big = False
         try:
             cl = int(dict(scope["headers"]).get(b"content-length", b"0") or 0)
@@ -309,17 +323,17 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
                agent_model_factory: Any = None) -> FastAPI:
     """`runner` / `pipeline`: optional injected doubles. `pipeline=False` disables sync entirely.
     `agent_model_factory(principal) -> model client` (tests inject MockModel; default: Anthropic, needs a key)."""
-    path = ontology_path or os.environ.get("AMARH_ONTOLOGY", DEFAULT_ONTOLOGY)
+    path = ontology_path or os.environ.get("ISNAD_ONTOLOGY", DEFAULT_ONTOLOGY)  # CLI default only
     from pathlib import Path as _Path
-    schema = schema or os.environ.get("AMARH_SCHEMA")
+    schema = schema or os.environ.get("ISNAD_SCHEMA")
     comp = compile_ontology(path)
     om = comp.model
     models = comp.pydantic_models()
-    cfg = SyncConfig.from_yaml(path)
+    cfg = SyncConfig.from_ontology(comp)   # namespace, types, link semantics, ttl/shapes: all from this ontology
 
     state = {"runner": runner, "runner_failed": False,
              "pipeline": pipeline if pipeline is not None else
-             (False if os.environ.get("AMARH_PIPELINE", "1") == "0" else None),
+             (False if os.environ.get("ISNAD_PIPELINE", "1") == "0" else None),
              "reasoning": False}
     plock = threading.RLock()
     worker = {"stop": None, "thread": None}
@@ -347,15 +361,15 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
                 c.close()
         except Exception as e:  # database may be down at startup; endpoints will report it
             log.warning("startup schema check failed: %s", e)
-        if os.environ.get("AMARH_OUTBOX_WORKER", "1") != "0":
+        if os.environ.get("ISNAD_OUTBOX_WORKER", "1") != "0":
             stop = threading.Event()
             th = threading.Thread(
                 target=outbox_mod.run_worker, name="outbox-worker", daemon=True,
-                args=(stop, float(os.environ.get("AMARH_OUTBOX_INTERVAL_S", "2"))),
+                args=(stop, float(os.environ.get("ISNAD_OUTBOX_INTERVAL_S", "2"))),
                 kwargs={"conn_factory": lambda: connect(dsn, schema=schema), "ontology": comp})
             th.start()
             worker["stop"], worker["thread"] = stop, th
-        if os.environ.get("AMARH_SIM_AUTOSTART", "0") == "1":
+        if os.environ.get("ISNAD_SIM_AUTOSTART", "0") == "1" and om.sim is not None:
             try:
                 get_runner().start()
             except HTTPException:
@@ -370,16 +384,21 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
             except Exception:  # noqa: BLE001
                 pass
 
-    app = FastAPI(title="Amarh ontology API", lifespan=lifespan)
+    app = FastAPI(title="Isnad ontology API", lifespan=lifespan)
     app.add_middleware(_BodyLimit, max_bytes=MAX_BODY_BYTES)
+    # DNS-rebinding guard: a page on another hostname that rebinds to 127.0.0.1 would send same-origin requests
+    # with an arbitrary x-role. Only these Host headers are served (override with ISNAD_ALLOWED_HOSTS=a,b).
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=[
+        h.strip() for h in os.environ.get("ISNAD_ALLOWED_HOSTS", "localhost,127.0.0.1,[::1],testserver").split(",") if h.strip()])
     app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-                       allow_methods=["*"], allow_headers=["*"])
+                       allow_methods=["*"], allow_headers=["*", "Authorization"])
     app.state.ontology = comp
     app.state.runtime = state
 
     @app.exception_handler(ApiError)
     async def _api_error(_: Request, e: ApiError):
-        return JSONResponse(e.body, status_code=e.status)
+        return JSONResponse(e.body, status_code=e.status, headers=e.headers)
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(_: Request, e: RequestValidationError):
@@ -390,9 +409,50 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
         return JSONResponse({"code": "invalid", "detail": errs}, status_code=422)
 
     # ---------------------------------------------------------- identity + connections
-    def get_principal(x_role: str | None = Header(default=None)) -> Principal:
-        """The single identity seam. Unknown role / `sim` / missing header => 403."""
-        role = x_role or os.environ.get("AMARH_DEFAULT_ROLE") or None
+    # Auth (Phase 6, W2): ISNAD_AUTH=1 -> signed bearer tokens; a refusal to configure it is a refusal to start.
+    from engine import auth as auth_mod
+    auth_svc = auth_mod.AuthService(set(om.roles)) if auth_mod.enabled() else None
+    app.state.auth = auth_svc
+    UNAUTH_HEADERS = {"WWW-Authenticate": "Bearer"}
+
+    def unauthenticated() -> ApiError:
+        return ApiError(401, "unauthenticated", "authentication required", headers=UNAUTH_HEADERS)
+
+    def bearer_token(request: Request) -> str | None:
+        h = request.headers.get("authorization") or ""
+        scheme, _, tok = h.partition(" ")
+        return tok.strip() if scheme.lower() == "bearer" and tok.strip() else None
+
+    def authenticate_request(request: Request, *, allow_ticket: bool = True):
+        """Auth on: (Identity, token payload|None) from the Bearer header, else (GET /agent/runs only) a one-time
+        stream ticket. `x-role`, `x-user` and ISNAD_DEFAULT_ROLE are never consulted."""
+        tok = bearer_token(request)
+        if tok is not None:
+            r = auth_svc.authenticate(tok)
+            if r is None:
+                raise unauthenticated()
+            return r
+        ticket = request.query_params.get("ticket")
+        if allow_ticket and ticket and request.method == "GET":
+            ident = auth_svc.redeem_ticket(ticket, request.url.path)
+            if ident is not None:
+                return ident, None
+        raise unauthenticated()
+
+    def get_principal(request: Request, x_role: str | None = Header(default=None)) -> Principal:
+        """The single identity seam. Auth off: `x-role` (unknown role / `sim` / missing => 403). Auth on: the
+        bearer token's user and role (missing / invalid / expired => 401); headers are ignored."""
+        if auth_svc is not None:
+            cached = getattr(request.state, "principal", None)
+            if cached is not None:
+                return cached
+            ident, _ = authenticate_request(request)
+            if ident.role == "sim" or ident.role not in om.roles:
+                raise unauthenticated()
+            pr = make_principal(ident.role, ident.user, comp)
+            request.state.principal = pr
+            return pr
+        role = x_role or os.environ.get("ISNAD_DEFAULT_ROLE") or None
         if not role:
             raise ApiError(403, "role_required", "x-role header required")
         if role == "sim" or role not in om.roles:
@@ -467,6 +527,13 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
         raise ae from e
 
     # ---------------------------------------------------------- runtime pieces
+    def _outbox_empty() -> bool:
+        c = connect(dsn, schema=schema)
+        try:
+            return c.execute("SELECT NOT EXISTS (SELECT 1 FROM graph_outbox)").fetchone()[0]
+        finally:
+            c.close()
+
     def get_pipeline():
         p = state["pipeline"]
         if p is False:
@@ -476,6 +543,8 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
                 from engine.sync.pipeline import SyncPipeline
                 p = state["pipeline"] = SyncPipeline(dsn=dsn, schema=schema, cfg=cfg)
                 with plock:  # first use: mirror what is already in Postgres, then reason once
+                    if _outbox_empty():  # bulk-loaded schema (imported workspace): no outbox rows, build from the views
+                        p.rebuild()
                     p.sync()
                     p.maybe_reason(force=True)
             except Exception as e:  # noqa: BLE001
@@ -484,7 +553,12 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
                 return None
         return p
 
+    def sim_unavailable() -> ApiError:
+        return ApiError(404, "sim_unavailable", "this ontology has no simulation")
+
     def get_runner():
+        if om.sim is None:  # the runner is never constructed for an ontology without a `sim:` block
+            raise sim_unavailable()
         if state["runner"] is None and not state["runner_failed"]:
             try:
                 from sim.runner import SimRunner
@@ -588,21 +662,40 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
         except Exception:  # noqa: BLE001
             ok = False
         return {"status": "ok" if ok else "degraded", "db": ok, "schema": schema,
+                "import_enabled": import_enabled, "auth": auth_svc is not None,
                 "pipeline": state["pipeline"] not in (False, None),
                 "simulation": state["runner"] is not None}
 
     @app.get("/types")
     def types(p: Principal = Depends(get_principal)):
+        """Ontology metadata the UI builds its pages from. Additive over the generated client's TypesResponse:
+        per type `geo` (has a point/linestring property), `volatile` (some property changes every tick),
+        `links` (`out`/`in`: link names with the other end), and `volatile` per property."""
+        geo = set(om.geo_types)
+        out_l: dict[str, list] = {t: [] for t in om.object_types}
+        in_l: dict[str, list] = {t: [] for t in om.object_types}
+        for l in om.link_types.values():
+            if l.src in out_l:
+                out_l[l.src].append({"link": l.name, "to": l.dst, "cardinality": l.cardinality})
+            if l.dst in in_l:
+                in_l[l.dst].append({"link": l.name, "from": l.src, "cardinality": l.cardinality})
         return {
+            "name": om.name,
             "namespace": om.namespace,
             "classes": {c.name: {"extends": c.extends} for c in om.classes.values()},
-            "objectTypes": [{"name": t.name, "properties": [
-                {"name": pr.name, "type": pr.type, "required": pr.required, "enum": list(pr.enum)}
-                for pr in t.properties]} for t in om.object_types.values()],
+            "objectTypes": [{"name": t.name, "label": t.name, "geo": t.name in geo,
+                             "volatile": any(pr.volatile for pr in t.properties),
+                             "properties": [
+                                 {"name": pr.name, "type": pr.type, "required": pr.required, "enum": list(pr.enum),
+                                  "volatile": pr.volatile} for pr in t.properties],
+                             "links": {"out": out_l[t.name], "in": in_l[t.name]}}
+                            for t in om.object_types.values()],
             "linkTypes": [{"name": l.name, "from": l.src, "to": l.dst, "cardinality": l.cardinality,
                            "required": l.required, "transitive": l.transitive, "inverse": l.inverse}
                           for l in om.link_types.values()],
             "role": p.role,
+            "kpis": {k: {"description": v.description, "expr": v.expr} for k, v in om.kpis.items()},
+            "sim": om.sim is not None,
         }
 
     @app.get("/me")
@@ -618,9 +711,53 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
                 "approves": [n for n in om.actions if om.role_can_approve(p.role, n)]}
 
     @app.get("/roles")
-    def roles():
+    def roles(request: Request):
+        if auth_svc is not None:   # one user, one role: no switching
+            ident, _ = authenticate_request(request, allow_ticket=False)
+            r = om.roles.get(ident.role)
+            return [] if r is None or ident.role == "sim" else [
+                {"role": ident.role, "description": r.description, "region": r.region, "user": ident.user}]
         return [{"role": n, "description": r.description, "region": r.region, "user": f"demo-{n}"}
                 for n, r in om.roles.items() if n != "sim"]
+
+    # ---------------------------------------------------------- auth endpoints (unauthenticated except as noted)
+    def require_auth_on():
+        if auth_svc is None:
+            raise ApiError(404, "auth_disabled", "authentication is not enabled")
+
+    @app.get("/auth/config")
+    def auth_config():
+        return {"enabled": auth_svc is not None}
+
+    @app.post("/auth/login")
+    def auth_login(body: LoginBody, request: Request):
+        require_auth_on()
+        ip = request.client.host if request.client else "unknown"   # the socket peer; proxy headers are not trusted
+        try:
+            return auth_svc.login(body.user, body.password, ip)
+        except auth_mod.LoginFailed:
+            raise ApiError(401, "invalid_credentials", "invalid user or password", headers=UNAUTH_HEADERS) from None
+        except auth_mod.Throttled as t:
+            raise ApiError(429, "rate_limited", "too many attempts, try again later", retry_after=t.retry_after,
+                           headers={"Retry-After": str(t.retry_after)}) from None
+
+    @app.post("/auth/logout")
+    def auth_logout(request: Request):
+        require_auth_on()
+        _, pl = authenticate_request(request, allow_ticket=False)
+        auth_svc.logout(pl)
+        return {"ok": True}
+
+    @app.post("/auth/stream-ticket")
+    def auth_stream_ticket(request: Request):
+        """One-time, 60 s ticket for `GET /agent/runs/...?ticket=` (clients that cannot set headers)."""
+        require_auth_on()
+        ident, _ = authenticate_request(request, allow_ticket=False)
+        try:
+            return {"ticket": auth_svc.issue_ticket(ident), "expires_in": auth_mod.service.TICKET_TTL_S}
+        except auth_mod.Throttled as t:
+            raise ApiError(429, "rate_limited", "too many open tickets", retry_after=t.retry_after,
+                           headers={"Retry-After": str(t.retry_after)}) from None
 
     # ---------------------------------------------------------- objects
     @app.get("/objects/{type}")
@@ -847,8 +984,8 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
         if body.speed is not None and str(body.speed) not in SPEEDS:
             raise HTTPException(422, f"speed must be one of {list(SPEEDS)}")
         if body.reset:
-            if os.environ.get("AMARH_ALLOW_RESET") != "1":
-                raise HTTPException(403, "reset deletes all data in this schema; set AMARH_ALLOW_RESET=1 to allow it")
+            if os.environ.get("ISNAD_ALLOW_RESET") != "1":
+                raise HTTPException(403, "reset deletes all data in this schema; set ISNAD_ALLOW_RESET=1 to allow it")
         try:
             if body.reset:
                 r.stop()
@@ -955,6 +1092,8 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
         if name in ("create_link", "end_link"):
             verb = "linked" if name == "create_link" else "unlinked"
             return f"{pr.get('link')}: {n('src')} {verb} {n('dst')}"
+        if name == "import_dataset":
+            return "Dataset imported"
         if name == "seed":
             return "Demo data seeded"
         if name == "reset":
@@ -994,13 +1133,17 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
             "params": mask_params(p, r["name"], r["params"]), "summary": summarize(r, nm)} for r in rows])
 
     # ------------------------------------------------------------ geo
+    # types that can be the far end of a Shipment's ships_from/ships_to (a `location` point property)
+    geo_endpoint_types = tuple(t for t in ("Port", "Warehouse") if t in om.object_types
+                               and any(pr.name == "location" and pr.type == "point"
+                                       for pr in om.object_types[t].properties))
     @app.get("/geo/{type}")
     def geo(type: str, bbox: str | None = None, as_of: str | None = None,
             p: Principal = Depends(get_principal), scn: ScenarioCtx | None = Depends(get_scenario),
             conn=Depends(rdb)):
         sid = scn.id if scn else 0
-        if type not in GEO_TYPES:
-            raise HTTPException(404, f"/geo supports {list(GEO_TYPES)}, got '{type}'")
+        if type not in om.geo_types:
+            raise HTTPException(404, f"/geo supports {list(om.geo_types)}, got '{type}'")
         otype(type)
         t = parse_ts(as_of)
         col = geo_col(type, conn)
@@ -1016,12 +1159,15 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
             params = [w, s_, e, n]
         rows = bt.list_objects(conn, type, t, None, sid, where=where, params=params)
         ends: dict[str, dict[str, list | None]] = {}
-        if type == "Shipment" and rows and sid:
+        # Shipment origin/destination enrichment: only when the ontology has those links and located endpoints
+        enrich = (type == "Shipment" and "ships_from" in om.link_types and "ships_to" in om.link_types
+                  and bool(geo_endpoint_types))
+        if enrich and rows and sid:
             ids = {r["id"] for r in rows}
             for link, key in (("ships_from", "origin"), ("ships_to", "destination")):
                 dst = {l["src"]: l["dst"] for l in bt.list_links(conn, link, t, None, sid) if l["src"] in ids}
                 locs: dict[Any, list] = {}
-                for ft in ("Port", "Warehouse"):
+                for ft in geo_endpoint_types:
                     for o in bt.list_objects(conn, ft, t, None, sid, where="id = ANY(%s)",
                                              params=[list(set(dst.values()))]):
                         loc = o.get("location")
@@ -1030,14 +1176,14 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
                 for src_, d_ in dst.items():
                     if d_ in locs:
                         ends.setdefault(str(src_), {})[key] = list(locs[d_])
-        elif type == "Shipment" and rows:
+        elif enrich and rows:
             ids = [r["id"] for r in rows]
+            union = " UNION ALL ".join(
+                f"SELECT id, location AS loc FROM {_o(ft)} WHERE {_vt('', T_ASOF)}" for ft in geo_endpoint_types)
             for link, key in (("ships_from", "origin"), ("ships_to", "destination")):
                 with conn.cursor() as cur:
                     cur.execute(
-                        f"SELECT l.src, ST_X(g.loc), ST_Y(g.loc) FROM link_{link} l JOIN ("
-                        f"SELECT id, location AS loc FROM {_o('Port')} WHERE {_vt('', T_ASOF)} UNION ALL "
-                        f"SELECT id, location FROM {_o('Warehouse')} WHERE {_vt('', T_ASOF)}) g ON g.id = l.dst "
+                        f"SELECT l.src, ST_X(g.loc), ST_Y(g.loc) FROM link_{link} l JOIN ({union}) g ON g.id = l.dst "
                         f"WHERE {_vt('l', T_ASOF)} AND l.src = ANY(%(ids)s::uuid[]) AND g.loc IS NOT NULL",
                         {"t": t, "ids": ids})
                     for src, x, y in cur.fetchall():
@@ -1047,33 +1193,56 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
             props = {k: v for k, v in r.items()
                      if k not in HIDDEN and k not in ("changed_by", col, "id")}
             props = {"id": r["id"], "type": type, **props}
-            if type == "Shipment":
+            if enrich:
                 e = ends.get(str(r["id"]), {})
                 props["origin"], props["destination"] = e.get("origin"), e.get("destination")
             feats.append({"type": "Feature", "id": r["id"], "geometry": r[col], "properties": props})
         return jsonable_encoder({"type": "FeatureCollection", "features": feats})
 
     # ------------------------------------------------------------ stats
+    # The legacy supply-chain summary keys (and the hand-written value_at_risk SQL) stay available when the
+    # ontology has the types/properties they read.
+    legacy_stats = kpis._builtin_ok(om, "value_at_risk") and kpis._builtin_ok(om, "invoices_flagged") \
+        and "Event" in om.object_types and any(pr.name == "ended" for pr in om.object_types["Event"].properties)
+
     @app.get("/stats/summary")
     def stats_summary(as_of: str | None = None, p: Principal = Depends(get_principal),
                       scn: ScenarioCtx | None = Depends(get_scenario), conn=Depends(rdb)):
+        """`{as_of, counts: {Type: n}, enums: {Type: {prop: {value: n}}}, kpis: {key: number}}` for the types the
+        caller can read (masked enum properties are omitted), plus the legacy supply-chain keys when the ontology
+        has those types."""
         t = parse_ts(as_of)
-        prm = {"t": t}
+        sid = scn.id if scn else 0
+        role = om.roles[p.role]
+        readable = [n for n in om.object_types if role.can_read(n)]
+        enum_spec = {}
+        for n in readable:
+            masked = set(role.types[n].mask)
+            ps = [pr.name for pr in om.object_types[n].properties if pr.type == "enum" and pr.name not in masked]
+            if ps:
+                enum_spec[n] = ps
+        res: dict[str, Any] = {
+            "as_of": _iso(t) if t else "live",
+            "counts": kpis.object_counts(conn, om, readable, sid, t),
+            "enums": kpis.enum_counts(conn, om, enum_spec, sid, t),
+            "kpis": kpis.declared(conn, p, sid, t, ontology=om),
+        }
+        if not legacy_stats:
+            return res
         if scn is not None:  # scenario-effective numbers (same shape), read through the overlay views
-            sid = scn.id
-
             def counts_s(type_: str, col: str, keys: tuple[str, ...]) -> dict[str, int]:
                 got = kpis.counts(conn, type_, col, sid, t)
                 return {k: got.get(k, 0) for k in keys}
-            return {
-                "as_of": _iso(t) if t else "live",
+            res.update({
                 "shipments": counts_s("Shipment", "status", ("planned", "in_transit", "delayed", "arrived")),
                 "ports": counts_s("Port", "status", ("open", "closed")),
                 "invoices": counts_s("Invoice", "status", ("open", "approved", "paid", "flagged")),
                 "value_at_risk": kpis.METRICS["value_at_risk"](conn, sid, t),
                 "delay_hours_total": kpis.METRICS["delay_hours_total"](conn, sid, t),
                 "open_events": kpis.open_events(conn, sid, t),
-            }
+            })
+            return res
+        prm = {"t": t}
 
         def counts(type_: str, col: str, keys: tuple[str, ...]) -> dict[str, int]:
             out = dict.fromkeys(keys, 0)
@@ -1082,12 +1251,11 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
                 if k in out:
                     out[k] = c
             return out
-        res = {
-            "as_of": _iso(t) if t else "live",
+        res.update({
             "shipments": counts("Shipment", "status", ("planned", "in_transit", "delayed", "arrived")),
             "ports": counts("Port", "status", ("open", "closed")),
             "invoices": counts("Invoice", "status", ("open", "approved", "paid", "flagged")),
-        }
+        })
         row = conn.execute(
             f"SELECT {_var_sql(T_ASOF)}, "
             f"(SELECT coalesce(sum(delay_hours), 0)::float8 FROM {_o('Shipment')} x WHERE {_vt('x', T_ASOF)}), "
@@ -1099,11 +1267,11 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
     def stats_series(metric: str, from_: str | None = Query(None, alias="from"), to: str | None = None,
                      step_hours: float = Query(24, gt=0), p: Principal = Depends(get_principal),
                      scn: ScenarioCtx | None = Depends(get_scenario), conn=Depends(rdb)):
-        if scn is not None:
-            if metric not in kpis.METRICS:
-                raise HTTPException(422, f"metric must be one of {list(kpis.METRICS)}")
-        elif metric not in METRICS:
-            raise HTTPException(422, f"metric must be one of {list(METRICS)}")
+        keys = list(kpis.metric_keys(om))
+        legacy = scn is None and legacy_stats and metric in METRICS
+        if scn is not None or not legacy:
+            if metric not in keys:
+                raise HTTPException(422, f"metric must be one of {keys}")
         hi, lo = parse_ts(to, "to"), parse_ts(from_, "from")
         if hi is None:
             hi = (scn.clock if scn is not None and scn.clock else None) or get_state_now()
@@ -1113,9 +1281,9 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
             raise HTTPException(422, "'from' must not be after 'to'")
         if (hi - lo) / timedelta(hours=step_hours) > MAX_SERIES_POINTS:
             raise HTTPException(422, f"too many points (max {MAX_SERIES_POINTS}); raise step_hours")
-        if scn is not None:
+        if not legacy:  # scenarios, and declared / non-legacy KPIs on main
             try:
-                res = kpis.series(conn, p, scn.id, metric, lo, hi, step_hours)
+                res = kpis.series(conn, p, scn.id if scn else 0, metric, lo, hi, step_hours, ontology=om)
             except ValueError as e:
                 raise HTTPException(422, str(e))
             return {"metric": metric, "points": [{"t": x["t"], "v": x["v"]} for x in res["points"]]}
@@ -1584,6 +1752,27 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
     from engine.api import ontology_routes
     app.include_router(ontology_routes.make_router(get_principal, wconn))
 
+    # Ingest + workspace routes: mounted ONLY when ISNAD_ALLOW_IMPORT=1 (in every mode, auth or not). A workspace process
+    # (ISNAD_ALLOW_IMPORT=0) exposes neither /ingest nor /workspaces.
+    import_enabled = os.environ.get("ISNAD_ALLOW_IMPORT", "0") == "1"
+    app.state.import_enabled = import_enabled
+    if import_enabled:
+        if auth_svc is None:
+            logging.getLogger("isnad.api").warning(
+                "ISNAD_ALLOW_IMPORT=1 with ISNAD_AUTH off: the x-role header is trusted, so ANY client that can reach this "
+                "port can act as admin and import datasets. Bind to 127.0.0.1 only, or enable ISNAD_AUTH=1.")
+        try:
+            from engine.api import ingest_routes
+
+            def _ingest_model(principal=None):
+                """factory(principal) -> model client; raises when no model is configured (the route answers 503)."""
+                return app.state.agent_model_factory(principal or make_principal("admin", "ingest", comp))
+
+            app.include_router(ingest_routes.make_router(get_principal, wconn, ontology=om, schema_name=schema,
+                                                        model_factory=_ingest_model))
+        except ImportError:
+            pass
+
     def scn_error(conn, e: Exception):
         fail(conn, e)
 
@@ -1657,11 +1846,14 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
         return {"status": "merged", **res}
 
     @app.get("/scenarios/{sid}/series")
-    def scenario_series(sid: int, metric: str = "value_at_risk", step_hours: float = Query(24, gt=0),
+    def scenario_series(sid: int, metric: str | None = None, step_hours: float = Query(24, gt=0),
                         from_: str | None = Query(None, alias="from"), to: str | None = None,
                         p: Principal = Depends(get_principal), conn=Depends(wconn)):
-        if metric not in kpis.METRICS:
-            raise ApiError(422, "invalid", f"metric must be one of {list(kpis.METRICS)}")
+        keys = list(kpis.metric_keys(om))
+        if metric is None and keys:
+            metric = "value_at_risk" if "value_at_risk" in keys else keys[0]
+        if metric not in keys:
+            raise ApiError(422, "invalid", f"metric must be one of {keys}")
         hi, lo = parse_ts(to, "to"), parse_ts(from_, "from")
         try:
             info = scenarios.get(conn, p, sid)
@@ -1669,7 +1861,7 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
                 raise ScenarioNotFound(f"scenario {sid} not found")
             hi = hi or info["clock"] or get_state_now()
             lo = lo or hi - timedelta(days=30)
-            return jsonable_encoder(kpis.series(conn, p, sid, metric, lo, hi, step_hours))
+            return jsonable_encoder(kpis.series(conn, p, sid, metric, lo, hi, step_hours, ontology=om))
         except LookupError as e:  # scenario closed / invisible while we worked
             scn_error(conn, ScenarioNotFound(str(e)))
         except Exception as e:  # noqa: BLE001
@@ -1719,9 +1911,34 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
                 sim_jobs[job_id].update(status="error",
                                         error=str(e)[:200] if isinstance(e, (RuntimeError, ValueError)) else type(e).__name__)
 
+    # injection kind -> the object type its target must be (the simulated world is built from the FULL world, so
+    # the caller's own visibility is checked here: a hidden target is indistinguishable from a missing one)
+    INJECT_TARGET_TYPE = {"port_closure": "Port", "shipment_delay": "Shipment", "supplier_delay": "Supplier",
+                          "price_shock": "Supplier", "invoice_anomaly": "Invoice"}
+
+    def check_injection_targets(conn, p: Principal, sid: int, injections) -> None:
+        targets = [(i.kind, i.target) for i in injections if i.target is not None]
+        if not targets:
+            return
+        try:
+            ctx = scenarios.resolve(conn, p, sid)
+            with read_scope(conn, p, ctx):
+                for kind, target in targets:
+                    typ = INJECT_TARGET_TYPE.get(kind)
+                    if typ not in om.object_types or bt.get_object(conn, typ, target, scenario_id=sid) is None:
+                        raise ApiError(422, "invalid", "injection target not found")
+        except ApiError:
+            conn.rollback()
+            raise
+        except Exception as e:  # noqa: BLE001
+            scn_error(conn, e)
+        conn.rollback()
+
     @app.post("/scenarios/{sid}/simulate", status_code=202)
     def simulate_scenario(sid: int, body: SimulateBody, p: Principal = Depends(get_principal), conn=Depends(wconn)):
-        max_days = int(os.environ.get("AMARH_SCN_SIM_MAX_DAYS", "90"))
+        if om.sim is None:
+            raise sim_unavailable()
+        max_days = int(os.environ.get("ISNAD_SCN_SIM_MAX_DAYS", "90"))
         if not 1 <= body.days <= max_days:
             raise ApiError(422, "invalid", f"days must be 1..{max_days}")
         try:
@@ -1731,6 +1948,7 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
             scn_error(conn, e)
         if p.role != "admin" and info["owner_user"] != p.user:
             raise ApiError(403, "permission_denied", "only the owner or an admin can simulate in a scenario")
+        check_injection_targets(conn, p, sid, body.injections)
         job_id = uuid4().hex
         with sim_lock:
             for j in [k for k, v in sim_jobs.items() if v["status"] != "running" and time.time() - v["t0"] > 3600]:
@@ -1755,6 +1973,8 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
 
     @app.get("/scenarios/{sid}/simulate/{job_id}")
     def simulate_status(sid: int, job_id: str, p: Principal = Depends(get_principal), conn=Depends(wconn)):
+        if om.sim is None:
+            raise sim_unavailable()
         try:
             scenarios.resolve(conn, p, sid)
         except Exception as e:  # noqa: BLE001
@@ -1772,7 +1992,7 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
                "actions": j["actions"] if mine else None, "kpis": None, "error": j["error"]}
         if j["status"] == "done":  # KPIs are recomputed for THIS viewer (RLS), never copied from the starter's view
             try:
-                out["kpis"] = kpis.compute(conn, p, sid)
+                out["kpis"] = kpis.compute(conn, p, sid, ontology=om)
             except Exception as e:  # noqa: BLE001
                 scn_error(conn, e)
         return jsonable_encoder(out)

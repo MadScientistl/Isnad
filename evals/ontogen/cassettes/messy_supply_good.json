@@ -1,0 +1,898 @@
+{
+ "description": "Hand-authored good proposal for messy_supply (explore, check, submit).",
+ "model": "cassette-hand-authored",
+ "name": "messy_supply_good",
+ "turns": [
+  {
+   "text": "I will profile all five tables first.",
+   "tool_uses": [
+    {
+     "id": "tu_p0",
+     "input": {
+      "table_id": "@tbl(suppliers)"
+     },
+     "name": "get_profile"
+    },
+    {
+     "id": "tu_p1",
+     "input": {
+      "table_id": "@tbl(ports)"
+     },
+     "name": "get_profile"
+    },
+    {
+     "id": "tu_p2",
+     "input": {
+      "table_id": "@tbl(warehouses)"
+     },
+     "name": "get_profile"
+    },
+    {
+     "id": "tu_p3",
+     "input": {
+      "table_id": "@tbl(shipments)"
+     },
+     "name": "get_profile"
+    },
+    {
+     "id": "tu_p4",
+     "input": {
+      "table_id": "@tbl(invoices)"
+     },
+     "name": "get_profile"
+    }
+   ],
+   "usage": [
+    1800,
+    260
+   ]
+  },
+  {
+   "text": "Drafting the ontology and validating it.",
+   "tool_uses": [
+    {
+     "id": "tu_1",
+     "input": {
+      "proposal": {
+       "actions": [],
+       "classes": [],
+       "linkTypes": [
+        {
+         "cardinality": "many-to-one",
+         "from": "Shipment",
+         "inverse": null,
+         "name": "operated_by",
+         "required": false,
+         "source": {
+          "from_col": "@col(shipments|carrier_id)",
+          "kind": "fk",
+          "to_type_key": "@col(shipments|carrier_id)"
+         },
+         "to": "Carrier",
+         "transitive": false
+        },
+        {
+         "cardinality": "many-to-one",
+         "from": "Shipment",
+         "inverse": null,
+         "name": "ships_from",
+         "required": false,
+         "source": {
+          "from_col": "@col(shipments|origin_port)",
+          "kind": "fk",
+          "to_type_key": "@col(ports|port_code)"
+         },
+         "to": "Port",
+         "transitive": false
+        },
+        {
+         "cardinality": "many-to-one",
+         "from": "Shipment",
+         "inverse": null,
+         "name": "ships_to",
+         "required": false,
+         "source": {
+          "from_col": "@col(shipments|dest_wh)",
+          "kind": "fk",
+          "to_type_key": "@col(warehouses|wh_id)"
+         },
+         "to": "Warehouse",
+         "transitive": false
+        },
+        {
+         "cardinality": "many-to-one",
+         "from": "Shipment",
+         "inverse": null,
+         "name": "supplied_by",
+         "required": false,
+         "source": {
+          "from_col": "@col(shipments|supplier)",
+          "kind": "fk",
+          "to_type_key": "@col(suppliers|Supp ID)"
+         },
+         "to": "Supplier",
+         "transitive": false
+        },
+        {
+         "cardinality": "many-to-one",
+         "from": "Invoice",
+         "inverse": null,
+         "name": "invoices_for",
+         "required": false,
+         "source": {
+          "from_col": "@col(invoices|shipment_ref)",
+          "kind": "fk",
+          "to_type_key": "@col(shipments|ship_ref)"
+         },
+         "to": "Shipment",
+         "transitive": false
+        },
+        {
+         "cardinality": "many-to-one",
+         "from": "Invoice",
+         "inverse": null,
+         "name": "billed_by",
+         "required": false,
+         "source": {
+          "from_col": "@col(invoices|supp_id)",
+          "kind": "fk",
+          "to_type_key": "@col(suppliers|Supp ID)"
+         },
+         "to": "Supplier",
+         "transitive": false
+        }
+       ],
+       "namespace": "",
+       "notes": [
+        "Some shipments reference ports or warehouses that do not exist; those links are dropped and counted at import."
+       ],
+       "objectTypes": [
+        {
+         "extends": null,
+         "key": [
+          "@col(suppliers|Supp ID)"
+         ],
+         "label": "Supplier",
+         "name": "Supplier",
+         "properties": [
+          {
+           "column": "@col(suppliers|Supp ID)",
+           "label": "",
+           "name": "code",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(suppliers|SUPPLIER_NAME)",
+           "label": "",
+           "name": "name",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(suppliers|cntry)",
+           "label": "",
+           "name": "country",
+           "required": false,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(suppliers|Price Idx)",
+           "label": "",
+           "name": "price_index",
+           "required": false,
+           "transform": "float",
+           "type": "float"
+          }
+         ],
+         "source_table": "@tbl(suppliers)"
+        },
+        {
+         "extends": null,
+         "key": [
+          "@col(ports|port_code)"
+         ],
+         "label": "Port",
+         "name": "Port",
+         "properties": [
+          {
+           "column": "@col(ports|port_code)",
+           "label": "",
+           "name": "code",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(ports|Port Name)",
+           "label": "",
+           "name": "name",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": null,
+           "label": "",
+           "name": "location",
+           "required": false,
+           "transform": "point(@col(ports|lat),@col(ports|lon))",
+           "type": "point"
+          },
+          {
+           "column": "@col(ports|Status)",
+           "label": "",
+           "name": "status",
+           "required": false,
+           "transform": "enum_map:{\"CLOSED\": \"closed\", \"Closed\": \"closed\", \"OPEN\": \"open\", \"Open\": \"open\", \"closed\": \"closed\", \"open\": \"open\"}",
+           "type": {
+            "enum": [
+             "open",
+             "closed"
+            ]
+           }
+          },
+          {
+           "column": "@col(ports|Region)",
+           "label": "",
+           "name": "region",
+           "required": false,
+           "transform": "enum_map:{\"AMER\": \"AMER\", \"APAC\": \"APAC\", \"Amer\": \"AMER\", \"Apac\": \"APAC\", \"EMEA\": \"EMEA\", \"Emea\": \"EMEA\", \"amer\": \"AMER\", \"apac\": \"APAC\", \"emea\": \"EMEA\"}",
+           "type": {
+            "enum": [
+             "APAC",
+             "EMEA",
+             "AMER"
+            ]
+           }
+          }
+         ],
+         "source_table": "@tbl(ports)"
+        },
+        {
+         "extends": null,
+         "key": [
+          "@col(warehouses|wh_id)"
+         ],
+         "label": "Warehouse",
+         "name": "Warehouse",
+         "properties": [
+          {
+           "column": "@col(warehouses|wh_id)",
+           "label": "",
+           "name": "code",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(warehouses|WH Name)",
+           "label": "",
+           "name": "name",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": null,
+           "label": "",
+           "name": "location",
+           "required": false,
+           "transform": "point(@col(warehouses|latitude),@col(warehouses|longitude))",
+           "type": "point"
+          },
+          {
+           "column": "@col(warehouses|reg)",
+           "label": "",
+           "name": "region",
+           "required": false,
+           "transform": "enum_map:{\"AMER\": \"AMER\", \"APAC\": \"APAC\", \"Amer\": \"AMER\", \"Apac\": \"APAC\", \"EMEA\": \"EMEA\", \"Emea\": \"EMEA\", \"amer\": \"AMER\", \"apac\": \"APAC\", \"emea\": \"EMEA\"}",
+           "type": {
+            "enum": [
+             "APAC",
+             "EMEA",
+             "AMER"
+            ]
+           }
+          }
+         ],
+         "source_table": "@tbl(warehouses)"
+        },
+        {
+         "extends": null,
+         "key": [
+          "@col(shipments|carrier_id)"
+         ],
+         "label": "Carrier",
+         "name": "Carrier",
+         "properties": [
+          {
+           "column": "@col(shipments|carrier_id)",
+           "label": "",
+           "name": "code",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(shipments|Carrier Name)",
+           "label": "",
+           "name": "name",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          }
+         ],
+         "source_table": "@tbl(shipments)"
+        },
+        {
+         "extends": null,
+         "key": [
+          "@col(shipments|ship_ref)"
+         ],
+         "label": "Shipment",
+         "name": "Shipment",
+         "properties": [
+          {
+           "column": "@col(shipments|ship_ref)",
+           "label": "",
+           "name": "ref",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(shipments|ETA)",
+           "label": "",
+           "name": "eta",
+           "required": false,
+           "transform": "timestamp:dd/mm/yyyy",
+           "type": "timestamp"
+          },
+          {
+           "column": "@col(shipments|status)",
+           "label": "",
+           "name": "status",
+           "required": false,
+           "transform": "enum_map:{\"ARRIVED\": \"arrived\", \"Arrived\": \"arrived\", \"DELAYED\": \"delayed\", \"Delayed\": \"delayed\", \"IN_TRANSIT\": \"in_transit\", \"In Transit\": \"in_transit\", \"In_Transit\": \"in_transit\", \"PLANNED\": \"planned\", \"Planned\": \"planned\", \"arrived\": \"arrived\", \"delayd\": \"delayed\", \"delayed\": \"delayed\", \"in transit\": \"in_transit\", \"in_transit\": \"in_transit\", \"planned\": \"planned\"}",
+           "type": {
+            "enum": [
+             "planned",
+             "in_transit",
+             "delayed",
+             "arrived"
+            ]
+           }
+          },
+          {
+           "column": "@col(shipments|Cargo Val)",
+           "label": "",
+           "name": "cargo_value",
+           "required": false,
+           "transform": "float",
+           "type": "float"
+          },
+          {
+           "column": "@col(shipments|deley_hrs)",
+           "label": "",
+           "name": "delay_hours",
+           "required": false,
+           "transform": "float",
+           "type": "float"
+          }
+         ],
+         "source_table": "@tbl(shipments)"
+        },
+        {
+         "extends": null,
+         "key": [
+          "@col(invoices|inv_no)"
+         ],
+         "label": "Invoice",
+         "name": "Invoice",
+         "properties": [
+          {
+           "column": "@col(invoices|inv_no)",
+           "label": "",
+           "name": "ref",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(invoices|Amount)",
+           "label": "",
+           "name": "amount",
+           "required": false,
+           "transform": "float",
+           "type": "float"
+          },
+          {
+           "column": "@col(invoices|ccy)",
+           "label": "",
+           "name": "currency",
+           "required": false,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(invoices|Status)",
+           "label": "",
+           "name": "status",
+           "required": false,
+           "transform": "enum_map:{\"APPROVED\": \"approved\", \"Approved\": \"approved\", \"FLAGGED\": \"flagged\", \"Flagged\": \"flagged\", \"OPEN\": \"open\", \"Open\": \"open\", \"PAID\": \"paid\", \"Paid\": \"paid\", \"approved\": \"approved\", \"flagged\": \"flagged\", \"open\": \"open\", \"paid\": \"paid\"}",
+           "type": {
+            "enum": [
+             "open",
+             "approved",
+             "paid",
+             "flagged"
+            ]
+           }
+          },
+          {
+           "column": "@col(invoices|Due Date)",
+           "label": "",
+           "name": "due",
+           "required": false,
+           "transform": "timestamp:dd Mon yyyy",
+           "type": "timestamp"
+          }
+         ],
+         "source_table": "@tbl(invoices)"
+        }
+       ],
+       "profile_hash": "@profile_hash",
+       "rationale": "Five entity tables plus the carrier columns repeated inside shipments, which become their own Carrier type keyed on carrier_id. Foreign keys become many-to-one links. Status columns are enums with spelling variants mapped to canonical values; lat/lon pairs become point properties.",
+       "roles": [
+        {
+         "access": "admin",
+         "description": "Administrator",
+         "name": "admin"
+        },
+        {
+         "access": "read",
+         "description": "Read-only analyst",
+         "name": "analyst"
+        }
+       ],
+       "version": 1
+      }
+     },
+     "name": "check_proposal"
+    }
+   ],
+   "usage": [
+    2200,
+    900
+   ]
+  },
+  {
+   "text": "The checks pass; submitting.",
+   "tool_uses": [
+    {
+     "id": "tu_2",
+     "input": {
+      "proposal": {
+       "actions": [],
+       "classes": [],
+       "linkTypes": [
+        {
+         "cardinality": "many-to-one",
+         "from": "Shipment",
+         "inverse": null,
+         "name": "operated_by",
+         "required": false,
+         "source": {
+          "from_col": "@col(shipments|carrier_id)",
+          "kind": "fk",
+          "to_type_key": "@col(shipments|carrier_id)"
+         },
+         "to": "Carrier",
+         "transitive": false
+        },
+        {
+         "cardinality": "many-to-one",
+         "from": "Shipment",
+         "inverse": null,
+         "name": "ships_from",
+         "required": false,
+         "source": {
+          "from_col": "@col(shipments|origin_port)",
+          "kind": "fk",
+          "to_type_key": "@col(ports|port_code)"
+         },
+         "to": "Port",
+         "transitive": false
+        },
+        {
+         "cardinality": "many-to-one",
+         "from": "Shipment",
+         "inverse": null,
+         "name": "ships_to",
+         "required": false,
+         "source": {
+          "from_col": "@col(shipments|dest_wh)",
+          "kind": "fk",
+          "to_type_key": "@col(warehouses|wh_id)"
+         },
+         "to": "Warehouse",
+         "transitive": false
+        },
+        {
+         "cardinality": "many-to-one",
+         "from": "Shipment",
+         "inverse": null,
+         "name": "supplied_by",
+         "required": false,
+         "source": {
+          "from_col": "@col(shipments|supplier)",
+          "kind": "fk",
+          "to_type_key": "@col(suppliers|Supp ID)"
+         },
+         "to": "Supplier",
+         "transitive": false
+        },
+        {
+         "cardinality": "many-to-one",
+         "from": "Invoice",
+         "inverse": null,
+         "name": "invoices_for",
+         "required": false,
+         "source": {
+          "from_col": "@col(invoices|shipment_ref)",
+          "kind": "fk",
+          "to_type_key": "@col(shipments|ship_ref)"
+         },
+         "to": "Shipment",
+         "transitive": false
+        },
+        {
+         "cardinality": "many-to-one",
+         "from": "Invoice",
+         "inverse": null,
+         "name": "billed_by",
+         "required": false,
+         "source": {
+          "from_col": "@col(invoices|supp_id)",
+          "kind": "fk",
+          "to_type_key": "@col(suppliers|Supp ID)"
+         },
+         "to": "Supplier",
+         "transitive": false
+        }
+       ],
+       "namespace": "",
+       "notes": [
+        "Some shipments reference ports or warehouses that do not exist; those links are dropped and counted at import."
+       ],
+       "objectTypes": [
+        {
+         "extends": null,
+         "key": [
+          "@col(suppliers|Supp ID)"
+         ],
+         "label": "Supplier",
+         "name": "Supplier",
+         "properties": [
+          {
+           "column": "@col(suppliers|Supp ID)",
+           "label": "",
+           "name": "code",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(suppliers|SUPPLIER_NAME)",
+           "label": "",
+           "name": "name",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(suppliers|cntry)",
+           "label": "",
+           "name": "country",
+           "required": false,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(suppliers|Price Idx)",
+           "label": "",
+           "name": "price_index",
+           "required": false,
+           "transform": "float",
+           "type": "float"
+          }
+         ],
+         "source_table": "@tbl(suppliers)"
+        },
+        {
+         "extends": null,
+         "key": [
+          "@col(ports|port_code)"
+         ],
+         "label": "Port",
+         "name": "Port",
+         "properties": [
+          {
+           "column": "@col(ports|port_code)",
+           "label": "",
+           "name": "code",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(ports|Port Name)",
+           "label": "",
+           "name": "name",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": null,
+           "label": "",
+           "name": "location",
+           "required": false,
+           "transform": "point(@col(ports|lat),@col(ports|lon))",
+           "type": "point"
+          },
+          {
+           "column": "@col(ports|Status)",
+           "label": "",
+           "name": "status",
+           "required": false,
+           "transform": "enum_map:{\"CLOSED\": \"closed\", \"Closed\": \"closed\", \"OPEN\": \"open\", \"Open\": \"open\", \"closed\": \"closed\", \"open\": \"open\"}",
+           "type": {
+            "enum": [
+             "open",
+             "closed"
+            ]
+           }
+          },
+          {
+           "column": "@col(ports|Region)",
+           "label": "",
+           "name": "region",
+           "required": false,
+           "transform": "enum_map:{\"AMER\": \"AMER\", \"APAC\": \"APAC\", \"Amer\": \"AMER\", \"Apac\": \"APAC\", \"EMEA\": \"EMEA\", \"Emea\": \"EMEA\", \"amer\": \"AMER\", \"apac\": \"APAC\", \"emea\": \"EMEA\"}",
+           "type": {
+            "enum": [
+             "APAC",
+             "EMEA",
+             "AMER"
+            ]
+           }
+          }
+         ],
+         "source_table": "@tbl(ports)"
+        },
+        {
+         "extends": null,
+         "key": [
+          "@col(warehouses|wh_id)"
+         ],
+         "label": "Warehouse",
+         "name": "Warehouse",
+         "properties": [
+          {
+           "column": "@col(warehouses|wh_id)",
+           "label": "",
+           "name": "code",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(warehouses|WH Name)",
+           "label": "",
+           "name": "name",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": null,
+           "label": "",
+           "name": "location",
+           "required": false,
+           "transform": "point(@col(warehouses|latitude),@col(warehouses|longitude))",
+           "type": "point"
+          },
+          {
+           "column": "@col(warehouses|reg)",
+           "label": "",
+           "name": "region",
+           "required": false,
+           "transform": "enum_map:{\"AMER\": \"AMER\", \"APAC\": \"APAC\", \"Amer\": \"AMER\", \"Apac\": \"APAC\", \"EMEA\": \"EMEA\", \"Emea\": \"EMEA\", \"amer\": \"AMER\", \"apac\": \"APAC\", \"emea\": \"EMEA\"}",
+           "type": {
+            "enum": [
+             "APAC",
+             "EMEA",
+             "AMER"
+            ]
+           }
+          }
+         ],
+         "source_table": "@tbl(warehouses)"
+        },
+        {
+         "extends": null,
+         "key": [
+          "@col(shipments|carrier_id)"
+         ],
+         "label": "Carrier",
+         "name": "Carrier",
+         "properties": [
+          {
+           "column": "@col(shipments|carrier_id)",
+           "label": "",
+           "name": "code",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(shipments|Carrier Name)",
+           "label": "",
+           "name": "name",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          }
+         ],
+         "source_table": "@tbl(shipments)"
+        },
+        {
+         "extends": null,
+         "key": [
+          "@col(shipments|ship_ref)"
+         ],
+         "label": "Shipment",
+         "name": "Shipment",
+         "properties": [
+          {
+           "column": "@col(shipments|ship_ref)",
+           "label": "",
+           "name": "ref",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(shipments|ETA)",
+           "label": "",
+           "name": "eta",
+           "required": false,
+           "transform": "timestamp:dd/mm/yyyy",
+           "type": "timestamp"
+          },
+          {
+           "column": "@col(shipments|status)",
+           "label": "",
+           "name": "status",
+           "required": false,
+           "transform": "enum_map:{\"ARRIVED\": \"arrived\", \"Arrived\": \"arrived\", \"DELAYED\": \"delayed\", \"Delayed\": \"delayed\", \"IN_TRANSIT\": \"in_transit\", \"In Transit\": \"in_transit\", \"In_Transit\": \"in_transit\", \"PLANNED\": \"planned\", \"Planned\": \"planned\", \"arrived\": \"arrived\", \"delayd\": \"delayed\", \"delayed\": \"delayed\", \"in transit\": \"in_transit\", \"in_transit\": \"in_transit\", \"planned\": \"planned\"}",
+           "type": {
+            "enum": [
+             "planned",
+             "in_transit",
+             "delayed",
+             "arrived"
+            ]
+           }
+          },
+          {
+           "column": "@col(shipments|Cargo Val)",
+           "label": "",
+           "name": "cargo_value",
+           "required": false,
+           "transform": "float",
+           "type": "float"
+          },
+          {
+           "column": "@col(shipments|deley_hrs)",
+           "label": "",
+           "name": "delay_hours",
+           "required": false,
+           "transform": "float",
+           "type": "float"
+          }
+         ],
+         "source_table": "@tbl(shipments)"
+        },
+        {
+         "extends": null,
+         "key": [
+          "@col(invoices|inv_no)"
+         ],
+         "label": "Invoice",
+         "name": "Invoice",
+         "properties": [
+          {
+           "column": "@col(invoices|inv_no)",
+           "label": "",
+           "name": "ref",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(invoices|Amount)",
+           "label": "",
+           "name": "amount",
+           "required": false,
+           "transform": "float",
+           "type": "float"
+          },
+          {
+           "column": "@col(invoices|ccy)",
+           "label": "",
+           "name": "currency",
+           "required": false,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(invoices|Status)",
+           "label": "",
+           "name": "status",
+           "required": false,
+           "transform": "enum_map:{\"APPROVED\": \"approved\", \"Approved\": \"approved\", \"FLAGGED\": \"flagged\", \"Flagged\": \"flagged\", \"OPEN\": \"open\", \"Open\": \"open\", \"PAID\": \"paid\", \"Paid\": \"paid\", \"approved\": \"approved\", \"flagged\": \"flagged\", \"open\": \"open\", \"paid\": \"paid\"}",
+           "type": {
+            "enum": [
+             "open",
+             "approved",
+             "paid",
+             "flagged"
+            ]
+           }
+          },
+          {
+           "column": "@col(invoices|Due Date)",
+           "label": "",
+           "name": "due",
+           "required": false,
+           "transform": "timestamp:dd Mon yyyy",
+           "type": "timestamp"
+          }
+         ],
+         "source_table": "@tbl(invoices)"
+        }
+       ],
+       "profile_hash": "@profile_hash",
+       "rationale": "Five entity tables plus the carrier columns repeated inside shipments, which become their own Carrier type keyed on carrier_id. Foreign keys become many-to-one links. Status columns are enums with spelling variants mapped to canonical values; lat/lon pairs become point properties.",
+       "roles": [
+        {
+         "access": "admin",
+         "description": "Administrator",
+         "name": "admin"
+        },
+        {
+         "access": "read",
+         "description": "Read-only analyst",
+         "name": "analyst"
+        }
+       ],
+       "version": 1
+      }
+     },
+     "name": "submit_proposal"
+    }
+   ],
+   "usage": [
+    2200,
+    900
+   ]
+  }
+ ],
+ "version": 1
+}

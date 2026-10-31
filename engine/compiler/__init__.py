@@ -11,13 +11,20 @@ from .ddl import generate_base_ddl, generate_ddl, generate_policy_ddl
 from .rdf import owl_turtle, shacl_turtle
 from .codegen import pydantic_source, ts_source
 
-__all__ = ["compile_ontology", "CompiledOntology", "OntologyError", "write_outputs"]
+__all__ = ["compile_ontology", "CompiledOntology", "OntologyError", "write_outputs", "kpi_sql", "parse_kpi"]
+from .kpi import kpi_sql, parse_kpi  # noqa: E402
 
 
 @dataclass
 class CompiledOntology:
     model: Ontology
     yaml_text: str
+
+    @classmethod
+    def from_text(cls, yaml_text: str) -> "CompiledOntology":
+        """Parse + validate YAML text (size / node / alias bounds of the versioning parser apply)."""
+        from engine.versioning.diff import parse
+        return cls(parse(yaml_text), yaml_text)
 
     @property
     def hash(self) -> str:
@@ -44,10 +51,10 @@ class CompiledOntology:
 
     def pydantic_models(self) -> types.ModuleType:
         """Exec the generated source; returns a module with one model class per object type."""
-        mod = types.ModuleType("amarh_models")
+        mod = types.ModuleType("isnad_models")
         import sys
-        sys.modules["amarh_models"] = mod
-        exec(compile(self.pydantic_source(), "<amarh_models>", "exec"), mod.__dict__)
+        sys.modules["isnad_models"] = mod
+        exec(compile(self.pydantic_source(), "<isnad_models>", "exec"), mod.__dict__)
         return mod
 
     def ts_sdk(self) -> str:

@@ -1,5 +1,15 @@
 version: 1
+name: Supply chain
+sim: {module: sim.world}
 namespace: https://example.org/sc#
+# Declarative KPIs. The remaining supply-chain KPIs (value_at_risk, extra_cost, exposure_shipments,
+# exposure_suppliers) need joins/recursion and stay in engine/kpis.py.
+kpis:
+  delay_hours_total: {description: Total delay hours over all shipments, expr: "sum(Shipment.delay_hours)"}
+  shipments_delayed: {description: Shipments currently delayed, expr: "count(Shipment, where status = 'delayed')"}
+  shipments_in_transit: {description: Shipments currently in transit, expr: "count(Shipment, where status = 'in_transit')"}
+  ports_closed: {description: Ports currently closed, expr: "count(Port, where status = 'closed')"}
+  invoices_flagged: {description: Invoices flagged as anomalous, expr: "count(Invoice, where status = 'flagged')"}
 classes:
   Facility: {}
   Port: {extends: Facility}
@@ -13,8 +23,8 @@ objectTypes:
       ref: "string!"
       eta: timestamp
       status: {enum: [planned, in_transit, delayed, arrived]}
-      position: point
-      progress: float
+      position: {type: point, volatile: true}
+      progress: {type: float, volatile: true}
       cargo_value: float
       delay_hours: float
       extra_cost: float
@@ -124,8 +134,8 @@ functions:
     params: {shipment: "uuid(Shipment)!"}
     roles: [planner, regional_ops_lead, finance_analyst, admin]
 webhooks:
-  notify_ops: {url_env: AMARH_WEBHOOK_OPS_URL, method: POST, max_attempts: 5, description: Notify operations of port disruptions.}
-  notify_finance: {url_env: AMARH_WEBHOOK_FINANCE_URL, method: POST, max_attempts: 5, description: Notify finance of flagged invoices.}
+  notify_ops: {url_env: ISNAD_WEBHOOK_OPS_URL, method: POST, max_attempts: 5, description: Notify operations of port disruptions.}
+  notify_finance: {url_env: ISNAD_WEBHOOK_FINANCE_URL, method: POST, max_attempts: 5, description: Notify finance of flagged invoices.}
 actions:
   create_object:
     description: Create an object of any type (generic, used by REST).

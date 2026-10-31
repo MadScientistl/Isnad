@@ -9,6 +9,7 @@ import { toast, useApp, usePolled } from "../store";
 import { DiffView } from "./Audit";
 import { MapView } from "./MapPage";
 import { MergeDialog } from "../ScenarioBanner";
+import { EmptyState, ErrorBanner, Spinner } from "../ui";
 import { KPI_META, deltaCls, fmtDelta, fmtKpi, compareHref, parseCompareHash, scnApi, type Scenario } from "../scenarios";
 
 echarts.use([LineChart, GridComponent, TooltipComponent, LegendComponent, CanvasRenderer]);
@@ -38,12 +39,13 @@ export default function ComparePage() {
         <button onClick={() => { cmp.reload(); scn.reload(); }}>Refresh</button>
         <span className="muted small">Differences are computed under your role, so objects you cannot see are not listed.</span>
       </div>
-      {cmp.error && <div className="err">{/API 404/.test(cmp.error) ? "Scenario not found, or not visible to your role." : cmp.error}</div>}
-      {cmp.loading && !c && <p className="muted">Comparing…</p>}
+      <ErrorBanner error={cmp.error ? (/API 404/.test(cmp.error) ? "Scenario not found, or not visible to your role." : cmp.error) : null} onRetry={cmp.reload} />
+      {cmp.loading && !c && <Spinner label="Comparing" />}
       {c && <>
         {c.truncated && <div className="warnbox">The diff is truncated; counts and KPIs are complete but the table lists only the first rows.</div>}
+        {!KPI_META.some((m) => m.k in c.kpis.a || m.k in c.kpis.b) && <p className="muted small">This ontology defines no KPIs, so only the changed objects are compared.</p>}
         <div className="kpigrid" aria-label="KPI comparison">
-          {KPI_META.map((m) => {
+          {KPI_META.filter((m) => m.k in c.kpis.a || m.k in c.kpis.b).map((m) => {
             const base = c.kpis.b[m.k], cur = c.kpis.a[m.k], d = (cur ?? 0) - (base ?? 0);
             return <div key={m.k} className={`kpicard ${deltaCls(d, m.good)}`}>
               <div className="k">{m.label}</div>
@@ -53,7 +55,7 @@ export default function ComparePage() {
           })}
         </div>
         <p className="muted small kpilegend"><span className="swatch good" /> better <span className="swatch bad" /> worse <span className="swatch neutral" /> neutral. Left value is {label(c.b)}, right value is {label(c.a)}.</p>
-        <section className="card"><h3>Changed objects ({c.diff.length})</h3><DiffView diff={c.diff} /></section>
+        <section className="card"><h3>Changed objects ({c.diff.length})</h3>{c.diff.length ? <DiffView diff={c.diff} /> : <EmptyState title="No differences">This scenario currently matches the baseline.</EmptyState>}</section>
         <section className="card"><h3>Map</h3>
           <div className="mapsplit">
             <div><MapView scn={withS} embedded changed={changed} title={`Baseline: ${label(c.b)}`} /></div>

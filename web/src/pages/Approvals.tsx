@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { EmptyState, ErrorBanner, Spinner } from "../ui";
 import { api, ApiError, dryDiff, dryImpact, type Proposal } from "../api";
 import { ImpactTable, ScnChip } from "../ScnUi";
 import { fmtT, toast, usePolled, useApp } from "../store";
@@ -13,9 +14,10 @@ export default function ApprovalsPage() {
       <h2>Approval inbox</h2>
       <p className="muted">Signed in as {me?.user ?? role}. A proposal cannot be approved by the user who proposed it.</p>
       {scenario !== null && <div className="warnbox">A scenario is active: you are seeing proposals recorded inside it. Approving and rejecting only work on main (exit the scenario first).</div>}
-      {q.error && <div className="err">{q.error}</div>}
+      <ErrorBanner error={q.error} onRetry={q.reload} />
+      {q.loading && !q.data && !q.error && <Spinner label="Loading proposals" />}
       {q.data?.map((p) => <Card key={p.id} p={p} onDone={q.reload} />)}
-      {q.data && !q.data.length && <p className="muted">No pending proposals.</p>}
+      {q.data && !q.data.length && <EmptyState title="No pending proposals">Proposals made by people or by an agent on your behalf appear here for approval.</EmptyState>}
     </div>
   );
 }

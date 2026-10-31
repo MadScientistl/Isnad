@@ -1,0 +1,17 @@
+port_code,Port Name,lat,lon,Status,Region
+P01,Rotterdam,51.9500,4.1400,open,EMEA
+P02,Hamburg,53.5400,9.9700,OPEN,EMEA
+P03,Antwerp,51.2600,4.4000,open,emea
+P04,Piraeus,37.9400,23.6400,open,EMEA
+P05,Singapore,1.2600,103.8400,closed,APAC
+P06,Shanghai,31.2300,121.4700,closed,APAC
+P07,Busan,35.1000,129.0400,OPEN,APAC
+P08,Yokohama,35.4400,139.6400,open,apac
+P09,Los Angeles,33.7400,-118.2700,open,amer
+P10,New York,40.6700,-74.0400,Open,amer
+P11,Santos,-23.9600,-46.3000,OPEN,AMER
+P12,Savannah,32.0800,-81.0900,OPEN,AMER
+P13,Jebel Ali,25.0100,55.0600,Open,emea
+P14,Mumbai,18.9500,72.9500,closed,APAC
+P15,Valencia,39.4500,-0.3200,open,emea
+P16,Colombo,6.9400,79.8500,open,apac

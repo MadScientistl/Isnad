@@ -10,8 +10,22 @@ from engine.compiler.model import AGENT_TOOLS, GENERIC_ACTIONS
 # does, a role whose YAML lists no scenario tool gets these defaults (still intersected with the role's agent
 # allowlist for scenario_apply). A role that lists ANY scenario tool in its YAML gets exactly the YAML list.
 SCENARIO_TOOLS = ("scenario_open", "scenario_apply", "scenario_simulate", "scenario_compare")
-SCENARIO_DEFAULTS = {"finance_analyst": ("scenario_open", "scenario_compare")}
+SCENARIO_DEFAULTS: dict[str, tuple[str, ...]] = {}   # optional explicit per-role overrides (none needed)
 SCENARIO_DEFAULT_FULL = SCENARIO_TOOLS
+
+
+def default_scenario_tools(model, role: str, acts: tuple[str, ...]) -> tuple[str, ...]:
+    """Scenario tools for a full agent whose YAML lists none, derived from what the role can do (never from its
+    name): every proposing agent may open + compare; applying needs an action it may propose; simulating
+    forward needs an ontology that declares a simulation."""
+    if role in SCENARIO_DEFAULTS:
+        return SCENARIO_DEFAULTS[role]
+    out = ["scenario_open", "scenario_compare"]
+    if acts:
+        out.insert(1, "scenario_apply")
+        if getattr(model, "sim", None) is not None:
+            out.insert(2, "scenario_simulate")
+    return tuple(out)
 
 
 class PolicyDenied(Exception):
@@ -38,7 +52,7 @@ def allowed_tools(model, role: str) -> tuple[str, ...]:
     base = tuple(t for t in yaml_tools if t in AGENT_TOOLS and (t != "propose_action" or acts))
     scn = tuple(t for t in yaml_tools if t in SCENARIO_TOOLS)
     if not scn and "propose_action" in base:   # defaults only for full agents (a deliberately narrowed role stays narrow)
-        scn = SCENARIO_DEFAULTS.get(role, SCENARIO_DEFAULT_FULL)
+        scn = default_scenario_tools(model, role, acts)
     scn = tuple(t for t in scn if t != "scenario_apply" or acts)
     return base + tuple(t for t in scn if t not in base)
 

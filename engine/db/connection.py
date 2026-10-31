@@ -1,4 +1,4 @@
-"""Connection helper. DSN comes from AMARH_DSN, defaulting to the contract DSN."""
+"""Connection helper. DSN comes from ISNAD_DSN, defaulting to the contract DSN."""
 from __future__ import annotations
 
 import os
@@ -8,7 +8,7 @@ import psycopg
 import psycopg.types.datetime
 from psycopg import sql
 
-DEFAULT_DSN = "postgresql://amarh:amarh@localhost:55441/amarh"
+DEFAULT_DSN = "postgresql://isnad:isnad@localhost:55441/isnad"
 
 
 class _InfTimestamptz(psycopg.types.datetime.TimestamptzLoader):
@@ -21,7 +21,7 @@ class _InfTimestamptz(psycopg.types.datetime.TimestamptzLoader):
 
 
 def get_dsn() -> str:
-    return os.environ.get("AMARH_DSN", DEFAULT_DSN)
+    return os.environ.get("ISNAD_DSN", DEFAULT_DSN)
 
 
 def connect(dsn: str | None = None, schema: str | None = None, **kw) -> psycopg.Connection:

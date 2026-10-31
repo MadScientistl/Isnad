@@ -4,7 +4,7 @@ MOCK MODE TESTS THE PLATFORM, NOT THE MODEL. A scripted plan-following model iss
 check that permissions, masking, hidden objects, allowlists, caps, approval gating, evidence labelling and audit
 behave correctly around that behaviour. Passing mock evals says nothing about a real model's judgement.
 LIVE MODE runs the same prompts against the real model (needs ANTHROPIC_API_KEY, tiny caps, cheap model via
-AMARH_EVAL_MODEL, default claude-haiku-5-5) and applies the same assertions (scripted-only ones are skipped).
+ISNAD_EVAL_MODEL, default claude-haiku-5-5) and applies the same assertions (scripted-only ones are skipped).
 
 Assertion classes (RESEARCH.md section 7): hard guardrail (exit code 1 when any fails), soft guidance (reported),
 telemetry (recorded). A JSON report is written to evals/results/.

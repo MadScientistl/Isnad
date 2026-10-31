@@ -1,6 +1,6 @@
 """One process-wide limit on concurrently running what-if simulations, shared by the API job registry and the agent.
 
-`AMARH_SCN_MAX_SIM_JOBS` (default 2) slots. `acquire_sim_slot(timeout)` -> bool; `release_sim_slot()` after it.
+`ISNAD_SCN_MAX_SIM_JOBS` (default 2) slots. `acquire_sim_slot(timeout)` -> bool; `release_sim_slot()` after it.
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ _size = 0
 
 
 def max_slots() -> int:
-    return max(1, int(os.environ.get("AMARH_SCN_MAX_SIM_JOBS", "2")))
+    return max(1, int(os.environ.get("ISNAD_SCN_MAX_SIM_JOBS", "2")))
 
 
 def _get() -> threading.BoundedSemaphore:

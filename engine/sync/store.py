@@ -25,8 +25,17 @@ from . import iri
 from .iri import G_ASSERTED, G_META, RDF_TYPE, SYNC_SUBJ, LAST_SEQ, class_iri, link_iri, obj_iri
 
 
+def build_dir() -> Path:
+    """Workspace build directory (compiled artefacts): ISNAD_BUILD_DIR, default `build/` at the repo root."""
+    import os
+    return Path(os.environ.get("ISNAD_BUILD_DIR") or Path(__file__).resolve().parents[2] / "build")
+
+
+# Legacy default for tests and scripts that construct a bare SyncConfig(); a running app always builds its
+# config from the loaded ontology (SyncConfig.from_ontology / from_model) and never reads this.
 DEFAULT_YAML = Path(__file__).resolve().parents[2] / "ontology" / "supply_chain.yaml"
 _yaml_cache: dict = {}
+_ttl_cache: dict = {}
 
 
 def _yaml_defaults(path) -> tuple:
@@ -34,8 +43,20 @@ def _yaml_defaults(path) -> tuple:
     if k not in _yaml_cache:
         from engine.compiler import compile_ontology
         m = compile_ontology(path).model
-        _yaml_cache[k] = (m.namespace, tuple(m.object_types), tuple(m.link_types))
+        _yaml_cache[k] = (m.namespace, tuple(m.object_types), tuple(m.link_types), semantics_of(m))
     return _yaml_cache[k]
+
+
+def semantics_of(model) -> dict[str, tuple[str, bool]]:
+    """{inferred link name -> (base link, reversed)}: a transitive link maps to itself, an inverse name to
+    (its base link, True)."""
+    sem: dict[str, tuple[str, bool]] = {}
+    for l in model.link_types.values():
+        if l.transitive:
+            sem[l.name] = (l.name, False)
+        if l.inverse:
+            sem[l.inverse] = (l.name, True)
+    return sem
 
 
 @dataclass
@@ -43,10 +64,15 @@ class SyncConfig:
     namespace: str | None = None
     object_types: tuple[str, ...] | None = None
     link_types: tuple[str, ...] | None = None
-    ontology_ttl: Path | None = Path(__file__).resolve().parents[2] / "build" / "ontology.ttl"
+    ontology_ttl: Path | None = field(default_factory=lambda: build_dir() / "ontology.ttl")
+    # Set by from_ontology/from_model (running apps): compiled text wins over the file path, so the store and
+    # the SHACL shapes always match the loaded ontology and no build/ fallback is read.
+    ontology_turtle: str | None = None
+    shapes_turtle: str | None = None
+    semantics: dict | None = None
 
     def __post_init__(self):
-        # Unset fields derive from the default YAML ontology (explicit args win).
+        # Unset fields derive from the legacy default YAML (explicit args win).
         if self.namespace is None or self.object_types is None or self.link_types is None:
             d = _yaml_defaults(DEFAULT_YAML)
             if self.namespace is None:
@@ -55,18 +81,43 @@ class SyncConfig:
                 self.object_types = d[1]
             if self.link_types is None:
                 self.link_types = d[2]
+            if self.semantics is None:
+                self.semantics = d[3]
 
     @classmethod
     def from_yaml(cls, path) -> "SyncConfig":
-        return cls(*_yaml_defaults(path))
+        from engine.compiler import compile_ontology
+        return cls.from_ontology(compile_ontology(path))
+
+    @classmethod
+    def from_ontology(cls, comp) -> "SyncConfig":
+        m = comp.model
+        c = cls(m.namespace, tuple(m.object_types), tuple(m.link_types), ontology_ttl=None,
+                semantics=semantics_of(m))
+        key = comp.hash
+        if key not in _ttl_cache:
+            if len(_ttl_cache) > 16:
+                _ttl_cache.clear()
+            _ttl_cache[key] = (comp.owl_turtle(), comp.shacl_turtle())
+        c.ontology_turtle, c.shapes_turtle = _ttl_cache[key]
+        return c
+
+    @classmethod
+    def from_model(cls, m) -> "SyncConfig":
+        """Names + link semantics only (no store/ttl): enough for visibility and graph reads."""
+        return cls(m.namespace, tuple(m.object_types), tuple(m.link_types), ontology_ttl=None,
+                   semantics=semantics_of(m))
 
 
 def open_store(path: str | Path | None = None, cfg: SyncConfig | None = None) -> Store:
     """On-disk store at `path` (configurable) or in-memory if None. Loads the ontology graph once."""
     cfg = cfg or SyncConfig()
     st = Store(str(path)) if path else Store()
-    if cfg.ontology_ttl and not any(True for _ in st.quads_for_pattern(None, None, None, iri.G_ONTOLOGY)):
-        st.bulk_load(path=str(cfg.ontology_ttl), format=_TTL, base_iri=None, to_graph=iri.G_ONTOLOGY)
+    if not any(True for _ in st.quads_for_pattern(None, None, None, iri.G_ONTOLOGY)):
+        if cfg.ontology_turtle:
+            st.bulk_load(input=cfg.ontology_turtle.encode(), format=_TTL, base_iri=None, to_graph=iri.G_ONTOLOGY)
+        elif cfg.ontology_ttl:
+            st.bulk_load(path=str(cfg.ontology_ttl), format=_TTL, base_iri=None, to_graph=iri.G_ONTOLOGY)
     return st
 
 

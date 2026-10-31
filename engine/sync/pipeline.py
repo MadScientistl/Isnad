@@ -64,7 +64,7 @@ class SyncPipeline:
         """Record derivations of inferred edges (inferred_support) as OWNER. Skipped if the table is absent."""
         c = self._conn()
         try:
-            self.support_stats = write_support(c, self.store, self.cfg.namespace)
+            self.support_stats = write_support(c, self.store, self.cfg.namespace, self.cfg)
         except psycopg.errors.UndefinedTable:
             self.support_stats = None
         finally:

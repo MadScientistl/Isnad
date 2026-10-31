@@ -49,7 +49,7 @@ def main(argv=None) -> int:
 def demo(world, mode: str) -> int:
     names = names_map(world)
     mock = mode == "mock"
-    print(f"Amarh Phase 4 demo, {mode.upper()} mode. World fingerprint {world.fingerprint()} "
+    print(f"Isnad Phase 4 demo, {mode.upper()} mode. World fingerprint {world.fingerprint()} "
           f"(schema {world.schema}, seed 1).")
     print("World: Rotterdam (EMEA) closed on day 6; SH-1001..1005 sail via it (SH-1005 is bound for the AMER warehouse "
           "Chicago); SH-1006 via Singapore (APAC);\n       Supplier 05 has an oversized invoice INV-2304 and a duplicated "

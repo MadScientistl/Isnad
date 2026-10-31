@@ -86,10 +86,10 @@ def test_beyond_wall_clock_and_cap(world, monkeypatch):
         ctx2 = scenario_admin.ctx_of(c, ctx.id)
     finally:
         c.close()
-    monkeypatch.setenv("AMARH_SCN_SIM_MAX_DAYS", "900")
+    monkeypatch.setenv("ISNAD_SCN_SIM_MAX_DAYS", "900")
     r = go(schema, ctx2, days=1)
     assert r.sim_now > datetime.now(UTC) + timedelta(days=399)
-    monkeypatch.setenv("AMARH_SCN_SIM_MAX_DAYS", "90")
+    monkeypatch.setenv("ISNAD_SCN_SIM_MAX_DAYS", "90")
     with pytest.raises(ValueError):
         go(schema, fork(schema)[0], days=91)
     with pytest.raises(ValueError):
@@ -183,7 +183,7 @@ def test_discarded_scenario_returns_a_clean_error(world):
 
 def test_sim_slots_are_shared_and_bounded(monkeypatch):
     from sim import limits
-    monkeypatch.setenv("AMARH_SCN_MAX_SIM_JOBS", "2")
+    monkeypatch.setenv("ISNAD_SCN_MAX_SIM_JOBS", "2")
     limits._sem = None
     assert limits.acquire_sim_slot(0) and limits.acquire_sim_slot(0) and not limits.acquire_sim_slot(0)
     limits.release_sim_slot()

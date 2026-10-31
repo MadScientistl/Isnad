@@ -577,7 +577,7 @@ def validate_expr(node: Node, onto, *, params: Mapping[str, str] | None = None, 
 
 
 # ---------------------------------------------------------------- SQL rendering (row filters)
-REGION_SQL = "NULLIF(current_setting('amarh.region', true), '')"
+REGION_SQL = "NULLIF(current_setting('isnad.region', true), '')"
 
 
 def _sql_lit(v) -> str:
@@ -600,7 +600,7 @@ def main_current_pred(alias: str) -> str:
 
 def eff_pred(alias: str, kind: str, name: str) -> str:
     """Scenario-aware 'current version' predicate (Phase 5). Equals `main_current_pred` while
-    `amarh.scenario` is unset; inside a scenario it is the overlay rule: a row of the scenario that is
+    `isnad.scenario` is unset; inside a scenario it is the overlay rule: a row of the scenario that is
     current knowledge and valid at the scenario clock, OR a main row as believed at `base_recorded`, valid at
     the scenario clock, whose key has no `scenario_override` row (overridden keys, tombstones included,
     come only from the scenario's own rows). `kind` is 'obj' (key = id) or 'link' (key = src,dst); `name`
@@ -609,16 +609,16 @@ def eff_pred(alias: str, kind: str, name: str) -> str:
     (visibility helpers, exists() filters) and by the eff_* views; never by the cur_* views."""
     if kind not in ("obj", "link"):
         raise ValueError(kind)
-    scn, base, now = "(SELECT amarh_scn())", "(SELECT amarh_scn_base())", "(SELECT amarh_now())"
+    scn, base, now = "(SELECT isnad_scn())", "(SELECT isnad_scn_base())", "(SELECT isnad_now())"
     o = f"xs_{alias}"
     key = (f"{o}.key_a = {alias}.id" if kind == "obj"
            else f"{o}.key_a = {alias}.src AND {o}.key_b = {alias}.dst")
     ov = (f"NOT EXISTS (SELECT 1 FROM scenario_override {o} WHERE {o}.scenario_id = {scn} "
           f"AND {o}.kind = '{kind}' AND {o}.type = {_sql_lit(name)} AND {key})")
     # cheap per-row switch (no sub-select): the main path pays one current_setting() call per evaluation
-    unset = "coalesce(current_setting('amarh.scenario', true), '') IN ('', '0')"
+    unset = "coalesce(current_setting('isnad.scenario', true), '') IN ('', '0')"
     return (f"CASE WHEN {unset} THEN ({main_current_pred(alias)}) "
-            f"ELSE (SELECT amarh_scenario_visible(amarh_scn())) AND ("
+            f"ELSE (SELECT isnad_scenario_visible(isnad_scn())) AND ("
             f"({alias}.scenario_id = {scn} AND {_OPEN.format(a=alias)} AND {alias}.valid_during @> {now}) "
             f"OR ({alias}.scenario_id = 0 AND {alias}.recorded_during @> {base} AND {alias}.valid_during @> {now} "
             f"AND {ov})) END")
@@ -626,15 +626,15 @@ def eff_pred(alias: str, kind: str, name: str) -> str:
 
 def eff_pred_fn(alias: str, kind: str, name: str) -> str:
     """Same rule as `eff_pred`, but the scenario branch is one call to the plpgsql function
-    `amarh_eff_row` instead of an inline sub-select. Used where the predicate is embedded in policy /
+    `isnad_eff_row` instead of an inline sub-select. Used where the predicate is embedded in policy /
     visibility-helper plans: a large inline branch makes Postgres initialise its sub-plans on every call of
     the helper (measured ~4x slowdown on the main path); a function call node is tiny and never executes
     on the main path."""
     if kind not in ("obj", "link"):
         raise ValueError(kind)
-    unset = "coalesce(current_setting('amarh.scenario', true), '') IN ('', '0')"
+    unset = "coalesce(current_setting('isnad.scenario', true), '') IN ('', '0')"
     keys = f"{alias}.id, NULL::uuid" if kind == "obj" else f"{alias}.src, {alias}.dst"
-    return (f"CASE WHEN {unset} THEN ({main_current_pred(alias)}) ELSE amarh_eff_row('{kind}', {_sql_lit(name)}, "
+    return (f"CASE WHEN {unset} THEN ({main_current_pred(alias)}) ELSE isnad_eff_row('{kind}', {_sql_lit(name)}, "
             f"{alias}.scenario_id, {alias}.valid_during, {alias}.recorded_during, {keys}) END")
 
 

@@ -75,9 +75,9 @@ def test_agent_opens_and_works_in_the_launchers_scenario(conn, world):
 
 
 def test_agent_and_user_quotas_are_separate(conn, world, monkeypatch):
-    monkeypatch.setenv("AMARH_SCN_MAX_PER_USER", "1")
-    monkeypatch.setenv("AMARH_SCN_MAX_AGENT_PER_USER", "2")
-    monkeypatch.setenv("AMARH_SCN_MAX_PER_RUN", "5")
+    monkeypatch.setenv("ISNAD_SCN_MAX_PER_USER", "1")
+    monkeypatch.setenv("ISNAD_SCN_MAX_AGENT_PER_USER", "2")
+    monkeypatch.setenv("ISNAD_SCN_MAX_PER_RUN", "5")
     mk(conn, AGENT, run_id="r1")
     mk(conn, AGENT, run_id="r2")
     with pytest.raises(ScenarioLimit):
@@ -217,11 +217,11 @@ def test_merge_detects_links_added_in_main_that_a_reroute_would_end(conn, world)
 
 # ------------------------------------------------------------------ M3 / M4d
 def test_ttl_is_capped_server_side(conn, world, monkeypatch):
-    monkeypatch.setenv("AMARH_SCN_TTL_H", "2")
+    monkeypatch.setenv("ISNAD_SCN_TTL_H", "2")
     d = scenarios.create(conn, PLANNER, "long", expires_in_h=100000)
     left = (d["expires_at"] - d["created_at"]).total_seconds() / 3600
     assert 1.9 < left < 2.1
-    monkeypatch.setenv("AMARH_SCN_TTL_H", "100000")
+    monkeypatch.setenv("ISNAD_SCN_TTL_H", "100000")
     assert service.limits()["ttl_h"] == 720.0
     with pytest.raises(ValueError):
         scenarios.create(conn, PLANNER, "nan", expires_in_h=float("nan"))
@@ -240,7 +240,7 @@ def test_expired_scenario_is_closed_on_use_without_the_janitor(conn, world, monk
         scenarios.compare(conn, PLANNER, sid)
     assert scenarios.get(conn, PLANNER, sid)["name"] == "s"   # governance history stays readable
     # the lazy janitor on create releases the quota
-    monkeypatch.setenv("AMARH_SCN_MAX_PER_USER", "1")
+    monkeypatch.setenv("ISNAD_SCN_MAX_PER_USER", "1")
     service._expire_stamp.clear()
     assert mk(conn, name="next")
     assert scenarios.get(conn, PLANNER, sid)["status"] == "expired"
@@ -321,7 +321,7 @@ def test_an_approver_reads_the_proposal_but_not_the_evidence_scenario(conn, worl
         with scoped(conn, approver):
             assert conn.execute("SELECT count(*) FROM proposal WHERE id = %s", [pid]).fetchone()[0] == 1
             assert conn.execute("SELECT count(*) FROM scenario WHERE id = %s", [sid]).fetchone()[0] == 0
-            assert conn.execute("SELECT amarh_scenario_visible(%s)", [sid]).fetchone()[0] is False
+            assert conn.execute("SELECT isnad_scenario_visible(%s)", [sid]).fetchone()[0] is False
         with scoped(conn, nobody):
             assert conn.execute("SELECT count(*) FROM proposal WHERE id = %s", [pid]).fetchone()[0] == 0
     conn.commit()

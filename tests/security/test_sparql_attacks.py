@@ -43,11 +43,11 @@ REJECT = {
     "describe_iri": "DESCRIBE <https://example.org/sc#obj/x>",
     "service": "SELECT ?s WHERE { SERVICE <http://evil.example/sparql> { ?s ?p ?o } }",
     "service_silent": "SELECT ?s WHERE { SERVICE SILENT <http://127.0.0.1:1/x> { ?s ?p ?o } }",
-    "from": "SELECT ?s FROM <urn:amarh:g:inferred> WHERE { ?s ?p ?o }",
-    "from_named": "SELECT ?s FROM NAMED <urn:amarh:g:meta> WHERE { GRAPH ?g { ?s ?p ?o } }",
+    "from": "SELECT ?s FROM <urn:isnad:g:inferred> WHERE { ?s ?p ?o }",
+    "from_named": "SELECT ?s FROM NAMED <urn:isnad:g:meta> WHERE { GRAPH ?g { ?s ?p ?o } }",
     "graph_var": "SELECT ?g ?s WHERE { GRAPH ?g { ?s ?p ?o } }",
-    "graph_iri": "SELECT ?s WHERE { GRAPH <urn:amarh:g:meta> { ?s ?p ?o } }",
-    "graph_nested": "SELECT ?s WHERE { { SELECT ?s WHERE { GRAPH <urn:amarh:g:asserted> { ?s ?p ?o } } } }",
+    "graph_iri": "SELECT ?s WHERE { GRAPH <urn:isnad:g:meta> { ?s ?p ?o } }",
+    "graph_nested": "SELECT ?s WHERE { { SELECT ?s WHERE { GRAPH <urn:isnad:g:asserted> { ?s ?p ?o } } } }",
     "garbage": "SELEKT nothing",
     "empty": "   ",
 }
@@ -200,7 +200,7 @@ def test_query_api_has_no_write_side_effects(world):
 
 
 def test_meta_graph_not_exposed(world):
-    r = q(world, "admin", "SELECT ?s ?p ?o WHERE { ?s ?p ?o FILTER(STRSTARTS(STR(?s), 'urn:amarh')) }")
+    r = q(world, "admin", "SELECT ?s ?p ?o WHERE { ?s ?p ?o FILTER(STRSTARTS(STR(?s), 'urn:isnad')) }")
     assert r["rows"] == []
 
 

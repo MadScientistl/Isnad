@@ -53,10 +53,10 @@ def cl(sch):
 
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
-    monkeypatch.delenv("AMARH_DEFAULT_ROLE", raising=False)
-    monkeypatch.setenv("AMARH_OUTBOX_WORKER", "0")
-    monkeypatch.setenv("AMARH_SCN_MAX_GLOBAL", "100")
-    monkeypatch.setenv("AMARH_SCN_MAX_PER_USER", "50")
+    monkeypatch.delenv("ISNAD_DEFAULT_ROLE", raising=False)
+    monkeypatch.setenv("ISNAD_OUTBOX_WORKER", "0")
+    monkeypatch.setenv("ISNAD_SCN_MAX_GLOBAL", "100")
+    monkeypatch.setenv("ISNAD_SCN_MAX_PER_USER", "50")
 
 
 @pytest.fixture(scope="module")

@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .kpi import KpiDef, KPI_KEY_RE, parse_kpi
 from .exprs import ExprError, parse_expr, parse_filter, validate_expr, validate_filter, params_used
 
 import yaml
@@ -25,6 +26,7 @@ class Property:
     type: str  # string|int|float|bool|timestamp|enum
     required: bool = False
     enum: tuple[str, ...] = ()
+    volatile: bool = False  # changes on every tick (position, progress): excluded from change feeds / diffs of state
 
 
 @dataclass(frozen=True)
@@ -200,6 +202,11 @@ class WebhookDef:
     description: str | None = None
 
 
+@dataclass(frozen=True)
+class SimDef:
+    module: str
+
+
 GEO_TYPES = ("point", "linestring")
 PARAM_TYPES = ("string", "int", "float", "bool", "timestamp", "point", "linestring", "uuid")
 
@@ -215,6 +222,14 @@ class Ontology:
     roles: dict[str, RoleDef] = field(default_factory=dict)
     webhooks: dict[str, WebhookDef] = field(default_factory=dict)
     functions: dict[str, FunctionDef] = field(default_factory=dict)
+    name: str = ""  # display name (top-level `name`, else the namespace host)
+    kpis: dict[str, KpiDef] = field(default_factory=dict)
+    sim: SimDef | None = None
+
+    @property
+    def geo_types(self) -> tuple[str, ...]:
+        """Object types with at least one point/linestring property."""
+        return tuple(n for n, o in self.object_types.items() if any(p.type in GEO_TYPES for p in o.properties))
 
     def agent_allowlist(self, role: str) -> tuple[str, ...]:
         """Actions the role's agent may propose (empty if the role has no agent block)."""
@@ -253,7 +268,10 @@ def _parse_prop(name: str, spec) -> Property:
     if isinstance(spec, str):
         req = spec.endswith("!")
         return Property(name, spec.rstrip("!"), req)
-    return Property(name, "enum", bool(spec.get("required", False)), tuple(spec["enum"]))
+    vol = bool(spec.get("volatile", False))
+    if "enum" in spec:
+        return Property(name, "enum", bool(spec.get("required", False)), tuple(spec["enum"]), vol)
+    return Property(name, spec["type"], bool(spec.get("required", False)), (), vol)
 
 
 _REF_RE = re.compile(r"^\$[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)?$")
@@ -568,6 +586,18 @@ def _parse_webhooks(raw: dict, onto: "Ontology", errors: list[str]) -> None:
                                       w.get("description"))
 
 
+def _parse_kpis(raw: dict, onto: "Ontology", errors: list[str]) -> None:
+    for k, d in (raw.get("kpis") or {}).items():
+        d = d or {}
+        if not KPI_KEY_RE.match(k):
+            errors.append(f"kpi '{k}': invalid key")
+            continue
+        try:
+            onto.kpis[k] = parse_kpi(k, d.get("description") or "", d["expr"], onto)
+        except ExprError as e:
+            errors.append(f"kpi '{k}': {e}")
+
+
 def _cross_check(onto: "Ontology", errors: list[str]) -> None:
     for a in onto.actions.values():
         for r in a.roles:
@@ -597,6 +627,11 @@ def _cross_check(onto: "Ontology", errors: list[str]) -> None:
                 errors.append(f"role '{r.name}' approves '{a}' but the action does not list it as approver")
 
 
+def _host_name(namespace: str) -> str:
+    from urllib.parse import urlparse
+    return urlparse(namespace).hostname or namespace
+
+
 def parse_ontology(raw: dict) -> Ontology:
     schema = json.loads(SCHEMA_PATH.read_text())
     v = jsonschema.Draft202012Validator(schema)
@@ -606,6 +641,9 @@ def parse_ontology(raw: dict) -> Ontology:
         raise OntologyError("invalid ontology schema:\n  " + "\n  ".join(msgs))
 
     onto = Ontology(raw["version"], raw["namespace"])
+    onto.name = raw.get("name") or _host_name(raw["namespace"])
+    if raw.get("sim"):
+        onto.sim = SimDef(raw["sim"]["module"])
     for n, c in (raw.get("classes") or {}).items():
         onto.classes[n] = ClassDef(n, (c or {}).get("extends"))
     for n, o in raw["objectTypes"].items():
@@ -622,6 +660,7 @@ def parse_ontology(raw: dict) -> Ontology:
     _parse_roles(raw, onto, errors)
     _parse_webhooks(raw, onto, errors)
     _parse_functions(raw, onto, errors)
+    _parse_kpis(raw, onto, errors)
     _cross_check(onto, errors)
     for c in onto.classes.values():
         if c.extends and c.extends not in onto.classes:

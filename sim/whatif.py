@@ -6,7 +6,7 @@ The world loads the scenario's EFFECTIVE state (scenario overlay over main as of
 sim time (`scenario_state.clock`, else the fork's `base_sim_time`, else the sim epoch), runs `days` sim days and
 writes every action through `engine.actions.execute(..., scenario_id=N, source='sim')`, so the overlay, audit
 (`scenario_id=N`), no-webhook and no-graph-outbox rules of the action engine apply. The scenario clock
-(`scenario_state.clock`) is advanced every sim hour (so `amarh_now()` follows the what-if) and is NOT bounded by
+(`scenario_state.clock`) is advanced every sim hour (so `isnad_now()` follows the what-if) and is NOT bounded by
 wall-clock now. Same fork + seed + injections gives the same digest (RNG families as in SimRunner).
 
 Injection spec: `{kind, target?, at_h?, duration_h?, magnitude?}`, `at_h` = hours after the fork's sim time
@@ -55,7 +55,7 @@ class WhatIfResult:
 
 
 def max_days() -> int:
-    return int(os.environ.get("AMARH_SCN_SIM_MAX_DAYS", "90"))
+    return int(os.environ.get("ISNAD_SCN_SIM_MAX_DAYS", "90"))
 
 
 def _normalise(injections, start_hour: int) -> list[dict]:
@@ -99,11 +99,11 @@ def run(conn_factory, scenario_ctx, *, days, seed, injections=(), ontology=None,
     """Run a what-if in `scenario_ctx`. `conn_factory()` returns a fresh owner-side connection (the caller's
     job runner passes `lambda: connect(dsn, schema=schema)`); `schema`/`dsn` are accepted for symmetry and used
     only when `conn_factory` is None. `principal`/`kpi_principal`: whose RLS the returned KPIs use (default
-    admin). `deadline` = time.monotonic() value after which the run stops cleanly with `partial=True`. Raises ValueError for days outside 1..AMARH_SCN_SIM_MAX_DAYS or a bad injection."""
+    admin). `deadline` = time.monotonic() value after which the run stops cleanly with `partial=True`. Raises ValueError for days outside 1..ISNAD_SCN_SIM_MAX_DAYS or a bad injection."""
     cap = max_days()
     days = float(days)
     if not 0 < days <= cap:
-        raise ValueError(f"days must be in 1..{cap} (AMARH_SCN_SIM_MAX_DAYS)")
+        raise ValueError(f"days must be in 1..{cap} (ISNAD_SCN_SIM_MAX_DAYS)")
     if conn_factory is None:
         from engine.db import connect
         conn_factory = lambda: connect(dsn, schema=schema)  # noqa: E731
@@ -121,7 +121,7 @@ def run(conn_factory, scenario_ctx, *, days, seed, injections=(), ontology=None,
         base_t = base[0] if base and base[0] is not None else epoch
         end_h = start_h + int(round(days * 24))
         if (epoch + timedelta(hours=end_h) - base_t) > timedelta(days=cap):
-            raise ValueError(f"the scenario would run beyond {cap} sim days from its fork (AMARH_SCN_SIM_MAX_DAYS)")
+            raise ValueError(f"the scenario would run beyond {cap} sim days from its fork (ISNAD_SCN_SIM_MAX_DAYS)")
         specs = _normalise(injections, start_h)
 
         sha = hashlib.sha256()

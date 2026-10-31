@@ -7,8 +7,8 @@ Reads of agent_run / agent_run_event always happen under `scoped()` as the calle
 an invisible run is a 404 (never 403). Status is derived at read time: the last `finished` event, else `running`
 if the run is in the in-process registry, else `interrupted` (rows are never updated).
 
-Limits (env, read per request): AMARH_AGENT_MAX_CONCURRENT=1 per user, AMARH_AGENT_RUNS_PER_MIN=6 per user,
-AMARH_AGENT_DAILY_USD=5 per user, AMARH_AGENT_MAX_GLOBAL=4 runs at once. They are checked under one lock that also
+Limits (env, read per request): ISNAD_AGENT_MAX_CONCURRENT=1 per user, ISNAD_AGENT_RUNS_PER_MIN=6 per user,
+ISNAD_AGENT_DAILY_USD=5 per user, ISNAD_AGENT_MAX_GLOBAL=4 runs at once. They are checked under one lock that also
 registers the new run, so concurrent POSTs cannot both pass.
 """
 from __future__ import annotations
@@ -30,7 +30,7 @@ from agent import AgentContext, AgentRun, DbSink, allowed_actions, allowed_tools
 from agent.context import Caps
 from engine.db.principal import Principal, scoped
 
-log = logging.getLogger("amarh.agent_api")
+log = logging.getLogger("isnad.agent_api")
 
 PROMPT_MAX = 4000
 START_WAIT_S = 5.0
@@ -128,10 +128,10 @@ MAX_STREAMS_PER_RUN = 4
 
 
 def limits() -> dict:
-    return {"max_concurrent": _env_num("AMARH_AGENT_MAX_CONCURRENT", 1, int),
-            "runs_per_minute": _env_num("AMARH_AGENT_RUNS_PER_MIN", 6, int),
-            "daily_usd": _env_num("AMARH_AGENT_DAILY_USD", 5.0, float),
-            "max_global": _env_num("AMARH_AGENT_MAX_GLOBAL", 4, int),
+    return {"max_concurrent": _env_num("ISNAD_AGENT_MAX_CONCURRENT", 1, int),
+            "runs_per_minute": _env_num("ISNAD_AGENT_RUNS_PER_MIN", 6, int),
+            "daily_usd": _env_num("ISNAD_AGENT_DAILY_USD", 5.0, float),
+            "max_global": _env_num("ISNAD_AGENT_MAX_GLOBAL", 4, int),
             "prompt_max_chars": PROMPT_MAX}
 
 
@@ -218,7 +218,7 @@ def mount(app, *, comp, get_principal, connect_fn, get_pipeline, model_factory=N
             return cur.fetchone()
         return read(p, fn)
 
-    def fetch_events(p: Principal, run_id: str, after: int = 0) -> list[dict]:
+    def fetch_events(p: Principal, run_id: str, after: int = 0, limit: int | None = None) -> list[dict]:
         def fn(cur):
             cur.execute("SELECT seq AS dbseq, kind, payload, tokens_in, tokens_out, cost_usd, at "
                         "FROM agent_run_event WHERE run_id = %s ORDER BY seq", [run_id])
@@ -228,6 +228,8 @@ def mount(app, *, comp, get_principal, connect_fn, get_pipeline, model_factory=N
             pl = dict(r["payload"] or {})
             seq = int(pl.pop("seq", r["dbseq"]))
             if seq > after:
+                if limit is not None and len(out) >= limit:
+                    break
                 out.append(_jsonable({"seq": seq, "kind": r["kind"], "payload": pl, "tokens_in": r["tokens_in"],
                                       "tokens_out": r["tokens_out"], "cost_usd": float(r["cost_usd"]),
                                       "at": r["at"]}))
@@ -349,11 +351,18 @@ def mount(app, *, comp, get_principal, connect_fn, get_pipeline, model_factory=N
         return [run_json(r) for r in read(p, fn)]
 
     @app.get("/agent/runs/{run_id}")
-    def get_run(run_id: str, p: Principal = Depends(get_principal)):
+    def get_run(run_id: str, after: int = Query(0, ge=0), limit: int = Query(500, ge=1),
+                p: Principal = Depends(get_principal)):
+        """Events are paged by `seq`: `?after=<seq>&limit=<n>` (default 500, capped at 2000). `next` is the seq to
+        pass as `after` for the following page, or null when this page is the last one."""
         rid, row = visible_run(p, run_id)
         if row is None:
             return NOT_FOUND()
-        return {"run": run_json(row), "events": fetch_events(p, rid)}
+        limit = min(limit, 2000)
+        evs = fetch_events(p, rid, after, limit + 1)
+        more = len(evs) > limit
+        evs = evs[:limit]
+        return {"run": run_json(row), "events": evs, "next": evs[-1]["seq"] if more and evs else None}
 
     @app.post("/agent/runs/{run_id}/cancel")
     def cancel_run(run_id: str, p: Principal = Depends(get_principal)):

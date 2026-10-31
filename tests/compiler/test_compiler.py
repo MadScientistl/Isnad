@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 YAML = ROOT / "ontology" / "supply_chain.yaml"
 GOLD = Path(__file__).parent / "golden"
 SC = Namespace("https://example.org/sc#")
-DSN = os.environ.get("AMARH_DSN", "postgresql://amarh:amarh@localhost:55441/amarh")
+DSN = os.environ.get("ISNAD_DSN", "postgresql://isnad:isnad@localhost:55441/isnad")
 
 
 @pytest.fixture(scope="module")

@@ -6,8 +6,8 @@ NOT be inside ``scoped``. A scenario the caller may not see is reported exactly 
 (``ScenarioNotFound``); a scenario the caller can see but not change (a ``shared_roles`` viewer) raises
 ``PermissionDenied`` on writes (discard, merge).
 
-Limits (env, read per call): ``AMARH_SCN_MAX_PER_USER`` (5), ``AMARH_SCN_MAX_PER_RUN`` (3),
-``AMARH_SCN_MAX_GLOBAL`` (20), ``AMARH_SCN_TTL_H`` (168; fixed lifetime from creation, ``expire_due`` marks
+Limits (env, read per call): ``ISNAD_SCN_MAX_PER_USER`` (5), ``ISNAD_SCN_MAX_PER_RUN`` (3),
+``ISNAD_SCN_MAX_GLOBAL`` (20), ``ISNAD_SCN_TTL_H`` (168; fixed lifetime from creation, ``expire_due`` marks
 expired scenarios and purges their rows). The scenario/event tables are append-only, so the TTL is not extended
 by activity (documented deviation from "idle expiry").
 """
@@ -30,12 +30,11 @@ from engine.db import scenario_admin
 from engine.db.bitemporal import ScenarioLimit
 from engine.db.principal import OWNER, ScenarioCtx, scoped
 
-log = logging.getLogger("amarh.scenarios")
+log = logging.getLogger("isnad.scenarios")
 
 TERMINAL = ("merged", "discarded", "expired")
 EVENT_KINDS = ("simulated", "proposal")  # kinds an API layer may record (created/terminal ones are ours)
 REPLAY_SOURCES = ("api", "agent", "ui")
-VOLATILE = core.VOLATILE_PROPS
 _SELECT = (
     "SELECT s.id, s.name, s.owner_user, s.owner_role, s.parent_id, s.base_recorded, s.base_sim_time, "
     "s.shared_roles, s.run_id, s.created_at, s.expires_at, st.clock, st.data_version, st.override_rows, "
@@ -44,15 +43,15 @@ _SELECT = (
     "FROM scenario s LEFT JOIN scenario_state st ON st.scenario_id = s.id")
 
 
-MAX_TTL_H = 720.0  # hard ceiling for any scenario lifetime, whatever AMARH_SCN_TTL_H says
+MAX_TTL_H = 720.0  # hard ceiling for any scenario lifetime, whatever ISNAD_SCN_TTL_H says
 
 
 def limits() -> dict:
-    return {"per_user": int(os.environ.get("AMARH_SCN_MAX_PER_USER", "5")),
-            "per_run": int(os.environ.get("AMARH_SCN_MAX_PER_RUN", "3")),
-            "per_user_agent": int(os.environ.get("AMARH_SCN_MAX_AGENT_PER_USER", "5")),
-            "global": int(os.environ.get("AMARH_SCN_MAX_GLOBAL", "20")),
-            "ttl_h": min(float(os.environ.get("AMARH_SCN_TTL_H", "168")), MAX_TTL_H)}
+    return {"per_user": int(os.environ.get("ISNAD_SCN_MAX_PER_USER", "5")),
+            "per_run": int(os.environ.get("ISNAD_SCN_MAX_PER_RUN", "3")),
+            "per_user_agent": int(os.environ.get("ISNAD_SCN_MAX_AGENT_PER_USER", "5")),
+            "global": int(os.environ.get("ISNAD_SCN_MAX_GLOBAL", "20")),
+            "ttl_h": min(float(os.environ.get("ISNAD_SCN_TTL_H", "168")), MAX_TTL_H)}
 
 
 _expire_stamp: dict[str, float] = {}
@@ -100,7 +99,7 @@ def _open_info(conn, sid: int) -> dict:
         raise ScenarioNotFound(f"scenario {sid} not found")
     d = _fetch(conn, sid)
     if d is None or d["status"] != "open" or not conn.execute(
-            "SELECT amarh_scenario_visible(%s)", [sid]).fetchone()[0]:
+            "SELECT isnad_scenario_visible(%s)", [sid]).fetchone()[0]:
         raise ScenarioNotFound(f"scenario {sid} not found")
     return d
 
@@ -133,7 +132,7 @@ def create(conn, principal, name: str, *, run_id: str | None = None, parent: int
     ttl = lim["ttl_h"] if expires_in_h is None else float(expires_in_h)
     if not 0 < ttl < float("inf"):
         raise ValueError("expires_in_h must be positive")
-    ttl = min(ttl, lim["ttl_h"])  # server-side cap (AMARH_SCN_TTL_H, never above 720 h)
+    ttl = min(ttl, lim["ttl_h"])  # server-side cap (ISNAD_SCN_TTL_H, never above 720 h)
     _lazy_expire(conn)
     roles = core._load(ontology).roles
     shared = []
@@ -149,15 +148,15 @@ def create(conn, principal, name: str, *, run_id: str | None = None, parent: int
                  "AND e.kind IN ('merged','discarded','expired'))")
         if kind == "user" and conn.execute(f"SELECT count(*) {openq} AND s.owner_user = %s AND s.kind = 'user'",
                                            [owner]).fetchone()[0] >= lim["per_user"]:
-            raise ScenarioLimit(f"you already have {lim['per_user']} open scenarios (AMARH_SCN_MAX_PER_USER)")
+            raise ScenarioLimit(f"you already have {lim['per_user']} open scenarios (ISNAD_SCN_MAX_PER_USER)")
         if kind == "agent" and conn.execute(f"SELECT count(*) {openq} AND s.owner_user = %s AND s.kind = 'agent'",
                                             [owner]).fetchone()[0] >= lim["per_user_agent"]:
             raise ScenarioLimit(f"you already have {lim['per_user_agent']} open agent scenarios "
-                                "(AMARH_SCN_MAX_AGENT_PER_USER)")
+                                "(ISNAD_SCN_MAX_AGENT_PER_USER)")
         if run_id and conn.execute(f"SELECT count(*) {openq} AND s.run_id = %s", [run_id]).fetchone()[0] >= lim["per_run"]:
-            raise ScenarioLimit(f"this agent run already opened {lim['per_run']} scenarios (AMARH_SCN_MAX_PER_RUN)")
+            raise ScenarioLimit(f"this agent run already opened {lim['per_run']} scenarios (ISNAD_SCN_MAX_PER_RUN)")
         if conn.execute(f"SELECT count(*) {openq}").fetchone()[0] >= lim["global"]:
-            raise ScenarioLimit(f"{lim['global']} scenarios are open (AMARH_SCN_MAX_GLOBAL)")
+            raise ScenarioLimit(f"{lim['global']} scenarios are open (ISNAD_SCN_MAX_GLOBAL)")
         sim_now = conn.execute("SELECT max(sim_time) FROM audit_event WHERE scenario_id = 0 AND status = 'executed' "
                                "AND sim_time IS NOT NULL").fetchone()[0]
         # inserted by the loader (the scoped INSERT ... RETURNING cannot see its own row through the definer
@@ -199,7 +198,7 @@ def resolve(conn, principal, id) -> ScenarioCtx:
     _lazy_expire(conn)
     with conn.transaction():
         with scoped(conn, principal):
-            d = _open_info(conn, id)  # open, visible AND not past expires_at (amarh_scenario_visible)
+            d = _open_info(conn, id)  # open, visible AND not past expires_at (isnad_scenario_visible)
     conn.commit()
     return ScenarioCtx(d["id"], d["base_recorded"], d["clock"])
 
@@ -335,7 +334,7 @@ def compare(conn, principal, a: int, b: int = 0, *, limit: int = 500, ontology=N
             ctx = scenario_admin.ctx_of(conn, sid) if sid else None
             with scoped(conn, principal, ctx):
                 sides[tag] = _read_side(conn, klist, sid)
-                kp[tag] = kpis.compute(conn, principal, sid)
+                kp[tag] = kpis.compute(conn, principal, sid, ontology=ontology)
     conn.commit()
     diff = []
     for k in klist:
@@ -396,7 +395,7 @@ def _conflicts(conn, model, principal_role: str, owner_role: str, overrides: lis
             if cur is None:
                 bad("the object no longer exists in main (or is no longer visible to you)")
                 continue
-            hide = _NOISE | VOLATILE | _masked(model, principal_role, typ) | _masked(model, owner_role, typ)
+            hide = _NOISE | core._volatile(model, typ) | _masked(model, principal_role, typ) | _masked(model, owner_role, typ)
             was = {k: v for k, v in (base.get("props") or {}).items() if k not in hide}
             now = {k: v for k, v in cur.items() if k not in hide}
             changed = sorted(k for k in set(was) | set(now) if was.get(k) != now.get(k))

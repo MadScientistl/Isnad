@@ -45,6 +45,7 @@ def rows(schema, q, *a):
         c.close()
 
 
+@pytest.mark.perf
 def test_thirty_days_completes_and_measure(base):
     assert base["err"] is None, base["err"]
     assert base["actions"] > 500
@@ -52,8 +53,9 @@ def test_thirty_days_completes_and_measure(base):
         assert base["stats"].get(k, 0) > 0, k
     print(f"\n30 sim days: {base['actions']} actions in {base['wall']:.1f}s "
           f"= {base['actions'] / base['wall']:.0f} actions/s; stats={base['stats']}")
-    # 60 s on a developer machine; shared CI runners are slower (set AMARH_SIM_MAX_SECONDS there)
-    assert base["wall"] < float(os.environ.get("AMARH_SIM_MAX_SECONDS", "60"))
+    # Marked `perf`: the 60 s default holds on a developer machine only (49-61 s observed); shared CI runners are
+    # slower, so tune with ISNAD_SIM_MAX_SECONDS or deselect with `-m "not perf"`.
+    assert base["wall"] < float(os.environ.get("ISNAD_SIM_MAX_SECONDS", "60"))
 
 
 def test_determinism(db, base):

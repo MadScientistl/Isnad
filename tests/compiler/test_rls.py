@@ -10,7 +10,7 @@ from engine.compiler import compile_ontology
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-DSN = os.environ.get("AMARH_DSN", "postgresql://amarh:amarh@localhost:55441/amarh")
+DSN = os.environ.get("ISNAD_DSN", "postgresql://isnad:isnad@localhost:55441/isnad")
 IDS = {k: uuid.uuid4() for k in ("p_emea", "p_apac", "p_hist", "p_moved", "w_emea", "w_apac", "s_emea", "s_apac",
                                  "sup", "inv", "car", "ev")}
 
@@ -92,9 +92,9 @@ def db(schema):
 
 
 def act(c, role, region="EMEA"):
-    c.execute("SET LOCAL ROLE amarh_app")
+    c.execute("SET LOCAL ROLE isnad_app")
     if role is not None:
-        c.execute("SELECT set_config('amarh.role', %s, true), set_config('amarh.region', %s, true)", (role, region))
+        c.execute("SELECT set_config('isnad.role', %s, true), set_config('isnad.region', %s, true)", (role, region))
 
 
 def q(c, role, sql, region="EMEA", params=()):
@@ -280,14 +280,14 @@ def test_catalog_flags(db):
     views = db.execute("SELECT c.relname, c.reloptions FROM pg_class c WHERE c.relnamespace = current_schema()::regnamespace "
                        "AND c.relkind = 'v' AND (c.relname LIKE 'cur\\_%' OR c.relname LIKE 'rd\\_%')").fetchall()
     assert views and all("security_invoker=true" in (v[1] or []) for v in views), views
-    role = db.execute("SELECT rolsuper, rolbypassrls, rolcanlogin FROM pg_roles WHERE rolname = 'amarh_app'").fetchone()
+    role = db.execute("SELECT rolsuper, rolbypassrls, rolcanlogin FROM pg_roles WHERE rolname = 'isnad_app'").fetchone()
     assert role == (False, False, False)
 
 
 def test_concurrent_role_creation_is_safe(schema):
     block = compile_ontology(ROOT / "ontology" / "supply_chain.yaml").policy_ddl().split("DO $$ BEGIN IF NOT has_schema")[0]
-    name = "amarh_conc_" + uuid.uuid4().hex[:6]
-    block = block.replace("amarh_app", name)  # same block, throwaway role name
+    name = "isnad_conc_" + uuid.uuid4().hex[:6]
+    block = block.replace("isnad_app", name)  # same block, throwaway role name
     errs = []
 
     def run():

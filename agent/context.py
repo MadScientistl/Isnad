@@ -61,6 +61,7 @@ class AgentContext:
     scenario_ids: list = field(default_factory=list)  # every scenario this run opened, in order
     on_finish: object = None                         # optional callable run before the run's scenarios are expired
     _conn: object = None
+    _cfg: object = None
 
     def __post_init__(self):
         role = self.model.roles.get(self.principal.role)
@@ -75,6 +76,14 @@ class AgentContext:
     @property
     def model(self):
         return getattr(self.comp, "model", self.comp)
+
+    @property
+    def cfg(self):
+        """Names + link semantics of the run's ontology (visibility reads never fall back to the demo ontology)."""
+        if self._cfg is None:
+            from engine.sync.store import SyncConfig
+            self._cfg = SyncConfig.from_model(self.model)
+        return self._cfg
 
     @property
     def role_def(self):

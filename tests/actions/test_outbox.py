@@ -45,8 +45,8 @@ class Receiver:
 @pytest.fixture
 def rcv(monkeypatch):
     r = Receiver()
-    monkeypatch.setenv("AMARH_WEBHOOK_OPS_URL", r.url)
-    monkeypatch.setenv("AMARH_WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("ISNAD_WEBHOOK_OPS_URL", r.url)
+    monkeypatch.setenv("ISNAD_WEBHOOK_SECRET", "s3cret")
     yield r
     r.close()
 
@@ -76,10 +76,10 @@ def test_success_headers_and_signature(conn, world, factory, rcv):
     assert state(conn, oid) == ("delivered", 1, 200, None)
     (call,) = rcv.calls
     assert call["headers"]["Idempotency-Key"] == f"{r.action_id}:notify_ops"
-    ts = call["headers"]["X-Amarh-Timestamp"]
+    ts = call["headers"]["X-Isnad-Timestamp"]
     assert abs(int(ts) - NOW.timestamp()) < 3600 or abs(int(ts) - __import__("time").time()) < 60
     want = "sha256=" + hmac.new(b"s3cret", ts.encode() + b"." + call["body"], hashlib.sha256).hexdigest()
-    assert call["headers"]["X-Amarh-Signature"] == want
+    assert call["headers"]["X-Isnad-Signature"] == want
     body = json.loads(call["body"])
     assert body["action"] == "close_port" and body["action_id"] == str(r.action_id)
     assert outbox.deliver_due(factory, NOW) == 0 and len(rcv.calls) == 1   # delivered is final
@@ -136,15 +136,15 @@ def test_manual_retry_after_dead(conn, world, factory, rcv):
 
 
 def test_missing_url_is_dead_with_error(conn, world, factory, monkeypatch):
-    monkeypatch.delenv("AMARH_WEBHOOK_OPS_URL", raising=False)
+    monkeypatch.delenv("ISNAD_WEBHOOK_OPS_URL", raising=False)
     _, oid = fire(conn, world)
     assert outbox.deliver_due(factory, NOW) == 1
     assert state(conn, oid) == ("dead", 1, None, "no url")
 
 
 def test_unreachable_receiver_retries(conn, world, factory, monkeypatch):
-    monkeypatch.setenv("AMARH_WEBHOOK_SECRET", "s3cret")
-    monkeypatch.setenv("AMARH_WEBHOOK_OPS_URL", "http://127.0.0.1:9/none")
+    monkeypatch.setenv("ISNAD_WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("ISNAD_WEBHOOK_OPS_URL", "http://127.0.0.1:9/none")
     _, oid = fire(conn, world)
     outbox.deliver_due(factory, NOW)
     st = state(conn, oid)
@@ -166,7 +166,7 @@ def test_worker_thread_delivers_and_stops(conn, world, factory, rcv):
 
 
 def test_no_secret_means_dead_and_no_request(conn, world, factory, rcv, monkeypatch):
-    monkeypatch.delenv("AMARH_WEBHOOK_SECRET", raising=False)
+    monkeypatch.delenv("ISNAD_WEBHOOK_SECRET", raising=False)
     _, oid = fire(conn, world)
     outbox.deliver_due(factory, NOW)
     assert state(conn, oid) == ("dead", 1, None, "no secret")
@@ -189,7 +189,7 @@ def test_redirects_not_followed_and_scheme_restricted():
     srv = http.server.HTTPServer(("127.0.0.1", 0), R)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     import os
-    os.environ["AMARH_WEBHOOK_SECRET"] = "x"
+    os.environ["ISNAD_WEBHOOK_SECRET"] = "x"
     try:
         code, err = outbox._send(f"http://127.0.0.1:{srv.server_port}/a", "POST", b"{}", "k")
     finally:

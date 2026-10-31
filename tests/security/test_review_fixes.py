@@ -78,7 +78,7 @@ def test_definer_helpers_have_pg_temp_last(hist):
     c = connect(schema=name)
     cfgs = [r[0] for r in c.execute(
         "SELECT proconfig FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
-        "WHERE n.nspname = current_schema() AND proname LIKE 'amarh\\_visible\\_%'").fetchall()]
+        "WHERE n.nspname = current_schema() AND proname LIKE 'isnad\\_visible\\_%'").fetchall()]
     c.close()
     assert cfgs
     for cfg in cfgs:
@@ -86,7 +86,7 @@ def test_definer_helpers_have_pg_temp_last(hist):
         assert sp[0] == "pg_catalog" and sp[-1] == "pg_temp", sp
 
 
-def test_amarh_app_cannot_create_temp_tables(hist):
+def test_isnad_app_cannot_create_temp_tables(hist):
     name, _, _ = hist
     with C.as_role(name, "regional_ops_lead") as c:
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
@@ -94,20 +94,20 @@ def test_amarh_app_cannot_create_temp_tables(hist):
 
 
 # ------------------------------------------------- known limitations (tracked, see docs/contracts.md)
-@pytest.mark.xfail(strict=True, reason="KNOWN LIMITATION (F4): amarh.* identity GUCs are trusted inside a "
+@pytest.mark.xfail(strict=True, reason="KNOWN LIMITATION (F4): isnad.* identity GUCs are trusted inside a "
                                        "scoped session; arbitrary SQL could set_config them. Signed identity "
                                        "context is deferred.")
 def test_limitation_set_config_forges_identity(hist):
     name, _, _ = hist
     with C.as_role(name, "regional_ops_lead") as c:
-        c.execute("SELECT set_config('amarh.role', 'admin', true)")
+        c.execute("SELECT set_config('isnad.role', 'admin', true)")
         # desired: forging is impossible / sees nothing extra
         assert c.execute("SELECT count(*) FROM obj_port WHERE region <> 'EMEA'").fetchone()[0] == 0 \
-            and c.execute("SELECT current_setting('amarh.role')").fetchone()[0] == "regional_ops_lead"
+            and c.execute("SELECT current_setting('isnad.role')").fetchone()[0] == "regional_ops_lead"
 
 
 @pytest.mark.xfail(strict=True, reason="KNOWN LIMITATION (F4): the connection user can RESET ROLE out of "
-                                       "amarh_app inside a scoped session if SQL execution is exposed.")
+                                       "isnad_app inside a scoped session if SQL execution is exposed.")
 def test_limitation_reset_role_escapes_rls(hist):
     name, _, _ = hist
     with C.as_role(name, "regional_ops_lead") as c:

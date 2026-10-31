@@ -73,7 +73,7 @@ def _check_scn(conn, scenario, as_of=None) -> int:
         raise TypeError("scenario must be a ScenarioCtx or None")
     if as_of is not None:
         raise ValueError("as_of is not supported inside a scenario")
-    got = conn.execute("SELECT current_setting('amarh.scenario', true)").fetchone()[0]
+    got = conn.execute("SELECT current_setting('isnad.scenario', true)").fetchone()[0]
     if str(got or "") != str(scenario.id):
         raise PermissionError("connection is not scoped to this scenario")
     return scenario.id
@@ -240,7 +240,7 @@ def inferred_visible(conn, edges: Iterable[Edge], *, is_admin: bool = False,
     sid = _check_scn(conn, scenario)
     if not edges:
         return set()
-    sem = link_semantics()
+    sem = link_semantics(cfg)
     rows = conn.execute(
         "SELECT s.link, s.src, s.dst, s.derivation_no, s.support FROM inferred_support s "
         "JOIN unnest(%s::text[], %s::uuid[], %s::uuid[]) e(l, a, b) "

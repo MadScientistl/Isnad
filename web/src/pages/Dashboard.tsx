@@ -6,6 +6,7 @@ import { CanvasRenderer } from "echarts/renderers";
 import { api, type Metric, type EventRow } from "../api";
 import { useAsOf, usePolled, fmtT } from "../store";
 import { ScnChip } from "../ScnUi";
+import { Bar, EmptyState, ErrorBanner, Spinner, Trunc } from "../ui";
 
 echarts.use([LineChart, GridComponent, TooltipComponent, MarkLineComponent, CanvasRenderer]);
 
@@ -18,6 +19,9 @@ const METRICS: { m: Metric; title: string; color: string; money?: boolean }[] = 
 ];
 const money = (v: number) => (v >= 1e6 ? `${(v / 1e6).toFixed(1)}M` : v >= 1e3 ? `${(v / 1e3).toFixed(0)}k` : String(Math.round(v)));
 
+const num = (v: unknown) => (typeof v === "number" ? v : typeof v === "object" && v && "value" in v ? Number((v as { value: number }).value) : NaN);
+const humanize = (k: string) => k.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
+
 export default function Dashboard() {
   const { asOfQ, asOf, live, sim } = useAsOf();
   const poll = live ? 3000 : undefined;
@@ -27,30 +31,49 @@ export default function Dashboard() {
   const end = asOf ? asOf.toISOString() : sim?.sim_now;
   const marker = end;
   const s = sum.data;
-  const tiles: { k: string; v: string; cls?: string; sub?: string }[] = s ? [
-    { k: "Shipments in transit", v: String(s.shipments.in_transit), sub: `${s.shipments.planned} planned, ${s.shipments.arrived} arrived` },
-    { k: "Shipments delayed", v: String(s.shipments.delayed), cls: s.shipments.delayed ? "warn" : "", sub: `${Math.round(s.delay_hours_total)} delay hours` },
-    { k: "Ports closed", v: String(s.ports.closed), cls: s.ports.closed ? "bad" : "", sub: `${s.ports.open} open` },
-    { k: "Invoices flagged", v: String(s.invoices.flagged), cls: s.invoices.flagged ? "warn" : "", sub: `${s.invoices.open} open, ${s.invoices.paid} paid` },
-    { k: "Value at risk", v: money(s.value_at_risk), cls: s.value_at_risk ? "bad" : "", sub: "cargo via closed ports or delayed" },
-    { k: "Open events", v: String(s.open_events) },
+  // Legacy supply-chain keys (still served for that ontology): headline tiles and time-series charts.
+  const legacy = !!(s && s.shipments && s.ports && s.invoices);
+  const tiles: { k: string; v: string; cls?: string; sub?: string }[] = legacy && s ? [
+    { k: "Shipments in transit", v: String(s.shipments!.in_transit), sub: `${s.shipments!.planned} planned, ${s.shipments!.arrived} arrived` },
+    { k: "Shipments delayed", v: String(s.shipments!.delayed), cls: s.shipments!.delayed ? "warn" : "", sub: `${Math.round(s.delay_hours_total ?? 0)} delay hours` },
+    { k: "Ports closed", v: String(s.ports!.closed), cls: s.ports!.closed ? "bad" : "", sub: `${s.ports!.open} open` },
+    { k: "Invoices flagged", v: String(s.invoices!.flagged), cls: s.invoices!.flagged ? "warn" : "", sub: `${s.invoices!.open} open, ${s.invoices!.paid} paid` },
+    { k: "Value at risk", v: money(s.value_at_risk ?? 0), cls: s.value_at_risk ? "bad" : "", sub: "cargo via closed ports or delayed" },
+    { k: "Open events", v: String(s.open_events ?? 0) },
   ] : [];
+  const counts = Object.entries(s?.counts ?? {});
+  const kpis = Object.entries(s?.kpis ?? {}).map(([k, v]) => ({ k, label: typeof v === "object" && v?.label ? v.label : humanize(k), v: num(v), sub: typeof v === "object" ? v?.description : undefined })).filter((x) => !Number.isNaN(x.v));
+  const enums = Object.entries(s?.enums ?? {}).flatMap(([t, props]) => Object.entries(props).map(([p, vals]) => ({ t, p, vals: Object.entries(vals).sort((a, b) => b[1] - a[1]) }))).filter((e) => e.vals.length);
+  const empty = !!s && !tiles.length && !counts.length && !kpis.length;
   return (
     <div className="pagebody">
-      {(sum.error || ev.error) && <div className="err">{sum.error ?? ev.error}</div>}
-      <div className="tiles" aria-label="Key figures">
-        {tiles.map((t) => <div key={t.k} className={`tile ${t.cls ?? ""}`}><div className="k">{t.k}</div><div className="v">{t.v}</div><div className="s">{t.sub ?? " "}</div></div>)}
-        {!s && !sum.error && <div className="muted">Loading...</div>}
-      </div>
+      <ErrorBanner error={sum.error} title="Summary" onRetry={sum.reload} />
+      {!s && !sum.error && <Spinner label="Loading summary" />}
+      {empty && <EmptyState title="Nothing to summarise yet">This ontology has no objects or KPIs. Import data or add objects in the Explorer.</EmptyState>}
+      {tiles.length > 0 && <div className="tiles" aria-label="Key figures">
+        {tiles.map((t) => <div key={t.k} className={`tile ${t.cls ?? ""}`}><div className="k">{t.k}</div><div className="v">{t.v}</div><div className="s">{t.sub ?? " "}</div></div>)}
+      </div>}
+      {!legacy && kpis.length > 0 && <div className="tiles" aria-label="KPIs">
+        {kpis.map((t) => <div key={t.k} className="tile" title={t.sub}><div className="k"><Trunc max={36}>{t.label}</Trunc></div><div className="v">{money(t.v)}</div><div className="s"><Trunc max={40}>{t.sub ?? " "}</Trunc></div></div>)}
+      </div>}
+      {counts.length > 0 && <section className="card" aria-label="Objects by type"><h3>Objects by type</h3>
+        <div className="tiles">{counts.map(([t, n]) => <a key={t} className="tile linktile" href={`#/${t}`}><div className="k"><Trunc max={30}>{t}</Trunc></div><div className="v">{n}</div></a>)}</div></section>}
+      {enums.length > 0 && <div className="enumgrid">{enums.map((e) => {
+        const mx = Math.max(...e.vals.map((x) => x[1]), 1);
+        return <section key={`${e.t}.${e.p}`} className="card"><h3><Trunc max={40}>{e.t}</Trunc> by {e.p}</h3>
+          <table className="enumtable"><tbody>{e.vals.slice(0, 8).map(([val, n]) => <tr key={val}><td><Trunc max={24}>{val}</Trunc></td><td className="num">{n}</td><td className="barcell"><Bar value={n} max={mx} label={`${val}: ${n}`} /></td></tr>)}</tbody></table>
+          {e.vals.length > 8 && <p className="muted small">and {e.vals.length - 8} more values</p>}</section>;
+      })}</div>}
       <div className="dashgrid">
-        <div className="charts">
+        {legacy && <div className="charts">
           {epoch && end && METRICS.map((m) => <MetricChart key={m.m} {...m} from={epoch} to={end} marker={marker!} live={live} poll={poll} asOfQ={asOfQ} />)}
-        </div>
-        <section className="card feed-card"><h3>Events {live ? "(live)" : `(up to ${fmtT(asOf)})`}</h3>
+        </div>}
+        {!ev.error || ev.data ? <section className="card feed-card" style={legacy ? undefined : { gridColumn: "1 / -1" }}><h3>Events {live ? "(live)" : `(up to ${fmtT(asOf)})`}</h3>
           <ul className="feed">
             {(ev.data ?? []).map((e: EventRow) => <EventItem key={e.seq} e={e} />)}
-            {ev.data && !ev.data.length && <li className="muted">No events.</li>}
-          </ul></section>
+            {ev.loading && !ev.data && <li><Spinner label="Loading events" /></li>}
+            {ev.data && !ev.data.length && <li className="muted">No events recorded yet.</li>}
+          </ul></section> : <ErrorBanner error={ev.error} title="Events" onRetry={ev.reload} />}
       </div>
     </div>
   );

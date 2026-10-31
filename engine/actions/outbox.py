@@ -6,8 +6,8 @@ failure NEVER touches data or the graph: it is retried with exponential backoff,
 State of an outbox id = its latest webhook_delivery row (view `webhook_state`).
 
 Request: POST JSON body, `Idempotency-Key: <action_id>:<hook>` (stable across retries),
-`X-Amarh-Timestamp: <unix s>` and `X-Amarh-Signature: sha256=<hex HMAC of "<ts>.<body>">` keyed with
-AMARH_WEBHOOK_SECRET (required: without it deliveries are dead-lettered with error 'no secret'). Redirects are
+`X-Isnad-Timestamp: <unix s>` and `X-Isnad-Signature: sha256=<hex HMAC of "<ts>.<body>">` keyed with
+ISNAD_WEBHOOK_SECRET (required: without it deliveries are dead-lettered with error 'no secret'). Redirects are
 not followed; only http/https URLs are used.
 """
 from __future__ import annotations
@@ -48,7 +48,7 @@ _OPENER = urllib.request.build_opener(_NoRedirect)
 def _send(url: str, method: str, body: bytes, key: str) -> tuple[int | None, str | None]:
     """One delivery attempt. Returns (http_status, sanitized error). Errors never carry raw exception
     text (it can contain internal hosts / paths): only a fixed class name or 'HTTP <code>'."""
-    secret = os.environ.get("AMARH_WEBHOOK_SECRET", "")
+    secret = os.environ.get("ISNAD_WEBHOOK_SECRET", "")
     if not secret:
         return None, "no secret"
     if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
@@ -56,8 +56,8 @@ def _send(url: str, method: str, body: bytes, key: str) -> tuple[int | None, str
     ts = str(int(time.time()))
     sig = hmac.new(secret.encode(), ts.encode() + b"." + body, hashlib.sha256).hexdigest()
     req = urllib.request.Request(url, data=body, method=method, headers={
-        "Content-Type": "application/json", "Idempotency-Key": key, "X-Amarh-Timestamp": ts,
-        "X-Amarh-Signature": f"sha256={sig}"})
+        "Content-Type": "application/json", "Idempotency-Key": key, "X-Isnad-Timestamp": ts,
+        "X-Isnad-Signature": f"sha256={sig}"})
     try:
         with _OPENER.open(req, timeout=TIMEOUT_S) as r:
             return r.status, None
@@ -86,7 +86,7 @@ def deliver_due(conn_factory, now: datetime | None = None, ontology=None) -> int
                 attempt += 1
                 if not url:
                     status, http, err, nxt = "dead", None, "no url", None
-                elif not os.environ.get("AMARH_WEBHOOK_SECRET"):
+                elif not os.environ.get("ISNAD_WEBHOOK_SECRET"):
                     status, http, err, nxt = "dead", None, "no secret", None
                 else:
                     http, err = _send(url, wd.method if wd else "POST",

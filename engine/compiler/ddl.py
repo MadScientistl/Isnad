@@ -39,8 +39,8 @@ def lit(s: str) -> str:
     return "'" + s.replace("'", "''") + "'"
 
 
-APP_ROLE = "amarh_app"
-ROLE_SQL = "current_setting('amarh.role', true)"
+APP_ROLE = "isnad_app"
+ROLE_SQL = "current_setting('isnad.role', true)"
 
 
 def generate_ddl(o: Ontology) -> str:
@@ -55,9 +55,9 @@ def generate_base_ddl(o: Ontology) -> str:
            "CREATE TABLE IF NOT EXISTS graph_outbox (",
            "    seq bigserial PRIMARY KEY,", "    kind text,", "    type text,", "    id uuid,",
            "    src uuid,", "    dst uuid,", "    op text,", "    at timestamptz DEFAULT now()", ");", "",
-           "DROP TRIGGER IF EXISTS amarh_no_scn ON graph_outbox;",
-           "CREATE TRIGGER amarh_no_scn BEFORE INSERT ON graph_outbox FOR EACH ROW "
-           "EXECUTE FUNCTION amarh_no_scenario_write();", "",
+           "DROP TRIGGER IF EXISTS isnad_no_scn ON graph_outbox;",
+           "CREATE TRIGGER isnad_no_scn BEFORE INSERT ON graph_outbox FOR EACH ROW "
+           "EXECUTE FUNCTION isnad_no_scenario_write();", "",
            "CREATE TABLE IF NOT EXISTS ontology_registry (",
            "    hash text PRIMARY KEY,", "    yaml text,", "    applied_at timestamptz", ");", ""]
     for name in sorted(o.object_types):
@@ -101,7 +101,7 @@ def generate_base_ddl(o: Ontology) -> str:
 
 # ------------------------------------------------------------------ policy layer
 def _role_case(arms: list[tuple[str, str]], default: str = "false") -> str:
-    """CASE over amarh.role; unset/unknown role falls to `default` (fail closed)."""
+    """CASE over isnad.role; unset/unknown role falls to `default` (fail closed)."""
     if not arms:
         return default
     body = " ".join(f"WHEN {lit(r)} THEN {e}" for r, e in arms)
@@ -112,17 +112,17 @@ def _endpoint_vis(o: Ontology, target: str, col: str) -> str:
     names = subtype_names(o, target)
     if not names:
         return "false"
-    return "(" + " OR ".join(f"amarh_visible_{snake_case(n)}({col})" for n in names) + ")"
+    return "(" + " OR ".join(f"isnad_visible_{snake_case(n)}({col})" for n in names) + ")"
 
 
 def generate_policy_ddl(o: Ontology) -> str:
     """Roles, SECURITY DEFINER visibility helpers, FORCE RLS + policies, masking views, grants.
 
     Notes:
-    * Policies are `TO amarh_app` only. The owner (the connection user: loader, migrations, sync,
-      reasoner) is exempted from FORCE by an `amarh_owner` policy (and a superuser bypasses RLS
-      entirely, which is the dev setup). Only `SET LOCAL ROLE amarh_app` requests are filtered.
-    * Unset/unknown amarh.role matches no CASE arm: zero rows, writes denied.
+    * Policies are `TO isnad_app` only. The owner (the connection user: loader, migrations, sync,
+      reasoner) is exempted from FORCE by an `isnad_owner` policy (and a superuser bypasses RLS
+      entirely, which is the dev setup). Only `SET LOCAL ROLE isnad_app` requests are filtered.
+    * Unset/unknown isnad.role matches no CASE arm: zero rows, writes denied.
     """
     out = ["-- ---- policy layer (roles, row-level security, masking views, grants) ----",
            "DO $$ BEGIN",
@@ -148,18 +148,18 @@ def generate_policy_ddl(o: Ontology) -> str:
             else:
                 flt = filter_to_sql(acc.where_ast, o, t, "t")
                 arms.append((rn, f"EXISTS (SELECT 1 FROM obj_{snake} t WHERE t.id = p_id AND {current_pred('t', 'obj', t)} AND {flt})"))
-        out += [f"CREATE OR REPLACE FUNCTION amarh_visible_{snake}(p_id uuid) RETURNS boolean",
+        out += [f"CREATE OR REPLACE FUNCTION isnad_visible_{snake}(p_id uuid) RETURNS boolean",
                 "LANGUAGE sql STABLE SECURITY DEFINER AS $fn$",
                 f"SELECT {_role_case(arms)}", "$fn$;",
                 # pg_temp LAST (and pg_catalog first): temp objects can never shadow the real tables
-                f"DO $do$ BEGIN EXECUTE format('ALTER FUNCTION amarh_visible_{snake}(uuid) SET search_path = "
+                f"DO $do$ BEGIN EXECUTE format('ALTER FUNCTION isnad_visible_{snake}(uuid) SET search_path = "
                 f"pg_catalog, %I, public, pg_temp', current_schema()); END $do$;",
-                f"REVOKE ALL ON FUNCTION amarh_visible_{snake}(uuid) FROM PUBLIC;",
-                f"GRANT EXECUTE ON FUNCTION amarh_visible_{snake}(uuid) TO {APP_ROLE};", ""]
+                f"REVOKE ALL ON FUNCTION isnad_visible_{snake}(uuid) FROM PUBLIC;",
+                f"GRANT EXECUTE ON FUNCTION isnad_visible_{snake}(uuid) TO {APP_ROLE};", ""]
 
     def owner_policy(tbl):
-        return [f"DROP POLICY IF EXISTS amarh_owner ON {tbl};",
-                f"CREATE POLICY amarh_owner ON {tbl} FOR ALL TO CURRENT_USER USING (true) WITH CHECK (true);"]
+        return [f"DROP POLICY IF EXISTS isnad_owner ON {tbl};",
+                f"CREATE POLICY isnad_owner ON {tbl} FOR ALL TO CURRENT_USER USING (true) WITH CHECK (true);"]
 
     def enable(tbl):
         return [f"ALTER TABLE {tbl} ENABLE ROW LEVEL SECURITY;", f"ALTER TABLE {tbl} FORCE ROW LEVEL SECURITY;"]
@@ -167,18 +167,18 @@ def generate_policy_ddl(o: Ontology) -> str:
     # a row of scenario N is reachable only inside scenario N (GUC set server-side) and only while the caller may
     # see (read) / own (write) it; main rows (scenario_id = 0) are unaffected (the OR short-circuits; plain
     # function calls, no sub-selects, so the main-path plan keeps no InitPlans).
-    scn_r = "(scenario_id = 0 OR (scenario_id = amarh_scn() AND amarh_scenario_visible(scenario_id)))"
+    scn_r = "(scenario_id = 0 OR (scenario_id = isnad_scn() AND isnad_scenario_visible(scenario_id)))"
     # writes: main rows only while NO scenario is active; scenario rows only into the active scenario
-    scn_w = ("((scenario_id = 0 AND amarh_scn() = 0) OR "
-             "(scenario_id = amarh_scn() AND amarh_scenario_writable(scenario_id)))")
+    scn_w = ("((scenario_id = 0 AND isnad_scn() = 0) OR "
+             "(scenario_id = isnad_scn() AND isnad_scenario_writable(scenario_id)))")
 
     def policies(tbl, sel, ins, upd_using, upd_check):
         out2 = []
-        for nm in ("amarh_select", "amarh_insert", "amarh_update"):
+        for nm in ("isnad_select", "isnad_insert", "isnad_update"):
             out2.append(f"DROP POLICY IF EXISTS {nm} ON {tbl};")
-        out2 += [f"CREATE POLICY amarh_select ON {tbl} FOR SELECT TO {APP_ROLE} USING ({scn_r} AND {sel});",
-                 f"CREATE POLICY amarh_insert ON {tbl} FOR INSERT TO {APP_ROLE} WITH CHECK ({scn_w} AND {ins});",
-                 f"CREATE POLICY amarh_update ON {tbl} FOR UPDATE TO {APP_ROLE} USING ({scn_w} AND {upd_using}) "
+        out2 += [f"CREATE POLICY isnad_select ON {tbl} FOR SELECT TO {APP_ROLE} USING ({scn_r} AND {sel});",
+                 f"CREATE POLICY isnad_insert ON {tbl} FOR INSERT TO {APP_ROLE} WITH CHECK ({scn_w} AND {ins});",
+                 f"CREATE POLICY isnad_update ON {tbl} FOR UPDATE TO {APP_ROLE} USING ({scn_w} AND {upd_using}) "
                  f"WITH CHECK ({scn_w} AND {upd_check});"]
         return out2
 
@@ -197,8 +197,8 @@ def generate_policy_ddl(o: Ontology) -> str:
             w_arms.append((rn, "true"))
             i_arms.append((rn, "true" if acc.where_ast is None else filter_to_sql(acc.where_ast, o, t, tbl)))
         out += enable(tbl) + owner_policy(tbl)
-        out += policies(tbl, f"amarh_visible_{snake}(id) AND {_role_case(r_arms)}", _role_case(i_arms),
-                        f"{_role_case(w_arms)} AND amarh_visible_{snake}(id)", _role_case(i_arms))
+        out += policies(tbl, f"isnad_visible_{snake}(id) AND {_role_case(r_arms)}", _role_case(i_arms),
+                        f"{_role_case(w_arms)} AND isnad_visible_{snake}(id)", _role_case(i_arms))
         out.append("")
 
     # 3. link tables

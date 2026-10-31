@@ -129,7 +129,7 @@ export function route(method: string, path: string, q: URLSearchParams, body: Js
     const name = String(body?.name ?? "").trim();
     if (!name) return [422, { detail: [{ loc: ["body", "name"], msg: "name required", type: "value_error" }] }];
     const open = scns.filter((x) => x.owner_user === user(role) && x.status === "open").length;
-    if (open >= 5) return err(429, "scenario_limit", "you already have 5 open scenarios (AMARH_SCN_MAX_PER_USER)");
+    if (open >= 5) return err(429, "scenario_limit", "you already have 5 open scenarios (ISNAD_SCN_MAX_PER_USER)");
     return [201, out(create(role, name, { expires_in_h: body?.expires_in_h, shared_roles: body?.shared_roles ?? [] }))];
   }
   if (path === "/scenarios" && method === "GET") {

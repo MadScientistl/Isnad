@@ -1,0 +1,959 @@
+{
+ "description": "Flawed first submit (Station keyed on a non-unique column, closed_at required, bike status enum missing 'retired'), then the repaired proposal after the validation report.",
+ "model": "cassette-hand-authored",
+ "name": "bikeshare_repair",
+ "turns": [
+  {
+   "text": "Profiling all seven tables.",
+   "tool_uses": [
+    {
+     "id": "tu_p0",
+     "input": {
+      "table_id": "@tbl(zones)"
+     },
+     "name": "get_profile"
+    },
+    {
+     "id": "tu_p1",
+     "input": {
+      "table_id": "@tbl(clusters)"
+     },
+     "name": "get_profile"
+    },
+    {
+     "id": "tu_p2",
+     "input": {
+      "table_id": "@tbl(stations)"
+     },
+     "name": "get_profile"
+    },
+    {
+     "id": "tu_p3",
+     "input": {
+      "table_id": "@tbl(bikes)"
+     },
+     "name": "get_profile"
+    },
+    {
+     "id": "tu_p4",
+     "input": {
+      "table_id": "@tbl(riders)"
+     },
+     "name": "get_profile"
+    },
+    {
+     "id": "tu_p5",
+     "input": {
+      "table_id": "@tbl(trips)"
+     },
+     "name": "get_profile"
+    },
+    {
+     "id": "tu_p6",
+     "input": {
+      "table_id": "@tbl(maintenance)"
+     },
+     "name": "get_profile"
+    }
+   ],
+   "usage": [
+    1800,
+    260
+   ]
+  },
+  {
+   "text": "Submitting my first draft.",
+   "tool_uses": [
+    {
+     "id": "tu_1",
+     "input": {
+      "proposal": {
+       "actions": [],
+       "classes": [],
+       "linkTypes": [
+        {
+         "cardinality": "many-to-one",
+         "from": "StationCluster",
+         "inverse": null,
+         "name": "in_zone",
+         "required": false,
+         "source": {
+          "from_col": "@col(clusters|zone_id)",
+          "kind": "fk",
+          "to_type_key": "@col(zones|zone_id)"
+         },
+         "to": "Zone",
+         "transitive": false
+        },
+        {
+         "cardinality": "many-to-one",
+         "from": "Station",
+         "inverse": null,
+         "name": "in_cluster",
+         "required": false,
+         "source": {
+          "from_col": "@col(stations|cluster_id)",
+          "kind": "fk",
+          "to_type_key": "@col(clusters|cluster_id)"
+         },
+         "to": "StationCluster",
+         "transitive": false
+        },
+        {
+         "cardinality": "many-to-one",
+         "from": "Trip",
+         "inverse": null,
+         "name": "starts_at",
+         "required": false,
+         "source": {
+          "from_col": "@col(trips|start_station_id)",
+          "kind": "fk",
+          "to_type_key": "@col(stations|station_id)"
+         },
+         "to": "Station",
+         "transitive": false
+        },
+        {
+         "cardinality": "many-to-one",
+         "from": "Trip",
+         "inverse": null,
+         "name": "ends_at",
+         "required": false,
+         "source": {
+          "from_col": "@col(trips|end_station_id)",
+          "kind": "fk",
+          "to_type_key": "@col(stations|station_id)"
+         },
+         "to": "Station",
+         "transitive": false
+        },
+        {
+         "cardinality": "many-to-one",
+         "from": "Trip",
+         "inverse": null,
+         "name": "ridden_bike",
+         "required": false,
+         "source": {
+          "from_col": "@col(trips|bike_id)",
+          "kind": "fk",
+          "to_type_key": "@col(bikes|bike_id)"
+         },
+         "to": "Bike",
+         "transitive": false
+        },
+        {
+         "cardinality": "many-to-one",
+         "from": "Trip",
+         "inverse": null,
+         "name": "ridden_by",
+         "required": false,
+         "source": {
+          "from_col": "@col(trips|rider_id)",
+          "kind": "fk",
+          "to_type_key": "@col(riders|rider_id)"
+         },
+         "to": "Rider",
+         "transitive": false
+        },
+        {
+         "cardinality": "many-to-one",
+         "from": "Ticket",
+         "inverse": null,
+         "name": "ticket_for",
+         "required": false,
+         "source": {
+          "from_col": "@col(maintenance|bike_id)",
+          "kind": "fk",
+          "to_type_key": "@col(bikes|bike_id)"
+         },
+         "to": "Bike",
+         "transitive": false
+        }
+       ],
+       "namespace": "",
+       "notes": [],
+       "objectTypes": [
+        {
+         "extends": null,
+         "key": [
+          "@col(zones|zone_id)"
+         ],
+         "label": "Zone",
+         "name": "Zone",
+         "properties": [
+          {
+           "column": "@col(zones|zone_id)",
+           "label": "",
+           "name": "code",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(zones|zone_name)",
+           "label": "",
+           "name": "name",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(zones|city)",
+           "label": "",
+           "name": "city",
+           "required": false,
+           "transform": "none",
+           "type": "string"
+          }
+         ],
+         "source_table": "@tbl(zones)"
+        },
+        {
+         "extends": null,
+         "key": [
+          "@col(clusters|cluster_id)"
+         ],
+         "label": "StationCluster",
+         "name": "StationCluster",
+         "properties": [
+          {
+           "column": "@col(clusters|cluster_id)",
+           "label": "",
+           "name": "code",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(clusters|cluster_name)",
+           "label": "",
+           "name": "name",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          }
+         ],
+         "source_table": "@tbl(clusters)"
+        },
+        {
+         "extends": null,
+         "key": [
+          "@col(stations|cluster_id)"
+         ],
+         "label": "Station",
+         "name": "Station",
+         "properties": [
+          {
+           "column": "@col(stations|station_id)",
+           "label": "",
+           "name": "code",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(stations|name)",
+           "label": "",
+           "name": "name",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": null,
+           "label": "",
+           "name": "location",
+           "required": false,
+           "transform": "point(@col(stations|lat),@col(stations|lon))",
+           "type": "point"
+          },
+          {
+           "column": "@col(stations|capacity)",
+           "label": "",
+           "name": "capacity",
+           "required": false,
+           "transform": "int",
+           "type": "int"
+          }
+         ],
+         "source_table": "@tbl(stations)"
+        },
+        {
+         "extends": null,
+         "key": [
+          "@col(bikes|bike_id)"
+         ],
+         "label": "Bike",
+         "name": "Bike",
+         "properties": [
+          {
+           "column": "@col(bikes|bike_id)",
+           "label": "",
+           "name": "code",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(bikes|status)",
+           "label": "",
+           "name": "status",
+           "required": false,
+           "transform": "enum_map:{\"available\": \"available\", \"in_use\": \"in_use\", \"maintenance\": \"maintenance\"}",
+           "type": {
+            "enum": [
+             "available",
+             "in_use",
+             "maintenance"
+            ]
+           }
+          },
+          {
+           "column": "@col(bikes|model)",
+           "label": "",
+           "name": "model",
+           "required": false,
+           "transform": "enum_map:{\"classic\": \"classic\", \"electric\": \"electric\"}",
+           "type": {
+            "enum": [
+             "classic",
+             "electric"
+            ]
+           }
+          },
+          {
+           "column": "@col(bikes|purchased_on)",
+           "label": "",
+           "name": "purchased_on",
+           "required": false,
+           "transform": "timestamp:@fmt(bikes|purchased_on)",
+           "type": "timestamp"
+          }
+         ],
+         "source_table": "@tbl(bikes)"
+        },
+        {
+         "extends": null,
+         "key": [
+          "@col(riders|rider_id)"
+         ],
+         "label": "Rider",
+         "name": "Rider",
+         "properties": [
+          {
+           "column": "@col(riders|rider_id)",
+           "label": "",
+           "name": "code",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(riders|full_name)",
+           "label": "",
+           "name": "full_name",
+           "required": false,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(riders|plan)",
+           "label": "",
+           "name": "plan",
+           "required": false,
+           "transform": "enum_map:{\"casual\": \"casual\", \"member\": \"member\", \"student\": \"student\"}",
+           "type": {
+            "enum": [
+             "casual",
+             "member",
+             "student"
+            ]
+           }
+          },
+          {
+           "column": "@col(riders|joined)",
+           "label": "",
+           "name": "joined",
+           "required": false,
+           "transform": "timestamp:@fmt(riders|joined)",
+           "type": "timestamp"
+          }
+         ],
+         "source_table": "@tbl(riders)"
+        },
+        {
+         "extends": null,
+         "key": [
+          "@col(trips|trip_id)"
+         ],
+         "label": "Trip",
+         "name": "Trip",
+         "properties": [
+          {
+           "column": "@col(trips|trip_id)",
+           "label": "",
+           "name": "code",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(trips|started_at)",
+           "label": "",
+           "name": "started_at",
+           "required": true,
+           "transform": "timestamp:@fmt(trips|started_at)",
+           "type": "timestamp"
+          },
+          {
+           "column": "@col(trips|ended_at)",
+           "label": "",
+           "name": "ended_at",
+           "required": false,
+           "transform": "timestamp:@fmt(trips|ended_at)",
+           "type": "timestamp"
+          }
+         ],
+         "source_table": "@tbl(trips)"
+        },
+        {
+         "extends": null,
+         "key": [
+          "@col(maintenance|ticket_id)"
+         ],
+         "label": "Ticket",
+         "name": "Ticket",
+         "properties": [
+          {
+           "column": "@col(maintenance|ticket_id)",
+           "label": "",
+           "name": "code",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(maintenance|issue)",
+           "label": "",
+           "name": "issue",
+           "required": false,
+           "transform": "enum_map:{\"battery\": \"battery\", \"brakes\": \"brakes\", \"chain\": \"chain\", \"lock\": \"lock\", \"tyre\": \"tyre\"}",
+           "type": {
+            "enum": [
+             "brakes",
+             "tyre",
+             "battery",
+             "chain",
+             "lock"
+            ]
+           }
+          },
+          {
+           "column": "@col(maintenance|severity)",
+           "label": "",
+           "name": "severity",
+           "required": false,
+           "transform": "enum_map:{\"high\": \"high\", \"low\": \"low\", \"medium\": \"medium\"}",
+           "type": {
+            "enum": [
+             "low",
+             "medium",
+             "high"
+            ]
+           }
+          },
+          {
+           "column": "@col(maintenance|opened_at)",
+           "label": "",
+           "name": "opened_at",
+           "required": false,
+           "transform": "timestamp:@fmt(maintenance|opened_at)",
+           "type": "timestamp"
+          },
+          {
+           "column": "@col(maintenance|closed_at)",
+           "label": "",
+           "name": "closed_at",
+           "required": true,
+           "transform": "timestamp:@fmt(maintenance|closed_at)",
+           "type": "timestamp"
+          }
+         ],
+         "source_table": "@tbl(maintenance)"
+        }
+       ],
+       "profile_hash": "@profile_hash",
+       "rationale": "Seven entity tables. Zones contain clusters, clusters contain stations (a hierarchy through two many-to-one links); trips link a bike, a rider and two stations; maintenance tickets link to bikes.",
+       "roles": [
+        {
+         "access": "admin",
+         "description": "Administrator",
+         "name": "admin"
+        },
+        {
+         "access": "read",
+         "description": "Read-only analyst",
+         "name": "analyst"
+        }
+       ],
+       "version": 1
+      }
+     },
+     "name": "submit_proposal"
+    }
+   ],
+   "usage": [
+    2200,
+    900
+   ]
+  },
+  {
+   "text": "The report shows a non-unique station key, nulls in a required column and a missing enum value; fixed.",
+   "tool_uses": [
+    {
+     "id": "tu_2",
+     "input": {
+      "proposal": {
+       "actions": [],
+       "classes": [],
+       "linkTypes": [
+        {
+         "cardinality": "many-to-one",
+         "from": "StationCluster",
+         "inverse": null,
+         "name": "in_zone",
+         "required": false,
+         "source": {
+          "from_col": "@col(clusters|zone_id)",
+          "kind": "fk",
+          "to_type_key": "@col(zones|zone_id)"
+         },
+         "to": "Zone",
+         "transitive": false
+        },
+        {
+         "cardinality": "many-to-one",
+         "from": "Station",
+         "inverse": null,
+         "name": "in_cluster",
+         "required": false,
+         "source": {
+          "from_col": "@col(stations|cluster_id)",
+          "kind": "fk",
+          "to_type_key": "@col(clusters|cluster_id)"
+         },
+         "to": "StationCluster",
+         "transitive": false
+        },
+        {
+         "cardinality": "many-to-one",
+         "from": "Trip",
+         "inverse": null,
+         "name": "starts_at",
+         "required": false,
+         "source": {
+          "from_col": "@col(trips|start_station_id)",
+          "kind": "fk",
+          "to_type_key": "@col(stations|station_id)"
+         },
+         "to": "Station",
+         "transitive": false
+        },
+        {
+         "cardinality": "many-to-one",
+         "from": "Trip",
+         "inverse": null,
+         "name": "ends_at",
+         "required": false,
+         "source": {
+          "from_col": "@col(trips|end_station_id)",
+          "kind": "fk",
+          "to_type_key": "@col(stations|station_id)"
+         },
+         "to": "Station",
+         "transitive": false
+        },
+        {
+         "cardinality": "many-to-one",
+         "from": "Trip",
+         "inverse": null,
+         "name": "ridden_bike",
+         "required": false,
+         "source": {
+          "from_col": "@col(trips|bike_id)",
+          "kind": "fk",
+          "to_type_key": "@col(bikes|bike_id)"
+         },
+         "to": "Bike",
+         "transitive": false
+        },
+        {
+         "cardinality": "many-to-one",
+         "from": "Trip",
+         "inverse": null,
+         "name": "ridden_by",
+         "required": false,
+         "source": {
+          "from_col": "@col(trips|rider_id)",
+          "kind": "fk",
+          "to_type_key": "@col(riders|rider_id)"
+         },
+         "to": "Rider",
+         "transitive": false
+        },
+        {
+         "cardinality": "many-to-one",
+         "from": "Ticket",
+         "inverse": null,
+         "name": "ticket_for",
+         "required": false,
+         "source": {
+          "from_col": "@col(maintenance|bike_id)",
+          "kind": "fk",
+          "to_type_key": "@col(bikes|bike_id)"
+         },
+         "to": "Bike",
+         "transitive": false
+        }
+       ],
+       "namespace": "",
+       "notes": [],
+       "objectTypes": [
+        {
+         "extends": null,
+         "key": [
+          "@col(zones|zone_id)"
+         ],
+         "label": "Zone",
+         "name": "Zone",
+         "properties": [
+          {
+           "column": "@col(zones|zone_id)",
+           "label": "",
+           "name": "code",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(zones|zone_name)",
+           "label": "",
+           "name": "name",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(zones|city)",
+           "label": "",
+           "name": "city",
+           "required": false,
+           "transform": "none",
+           "type": "string"
+          }
+         ],
+         "source_table": "@tbl(zones)"
+        },
+        {
+         "extends": null,
+         "key": [
+          "@col(clusters|cluster_id)"
+         ],
+         "label": "StationCluster",
+         "name": "StationCluster",
+         "properties": [
+          {
+           "column": "@col(clusters|cluster_id)",
+           "label": "",
+           "name": "code",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(clusters|cluster_name)",
+           "label": "",
+           "name": "name",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          }
+         ],
+         "source_table": "@tbl(clusters)"
+        },
+        {
+         "extends": null,
+         "key": [
+          "@col(stations|station_id)"
+         ],
+         "label": "Station",
+         "name": "Station",
+         "properties": [
+          {
+           "column": "@col(stations|station_id)",
+           "label": "",
+           "name": "code",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(stations|name)",
+           "label": "",
+           "name": "name",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": null,
+           "label": "",
+           "name": "location",
+           "required": false,
+           "transform": "point(@col(stations|lat),@col(stations|lon))",
+           "type": "point"
+          },
+          {
+           "column": "@col(stations|capacity)",
+           "label": "",
+           "name": "capacity",
+           "required": false,
+           "transform": "int",
+           "type": "int"
+          }
+         ],
+         "source_table": "@tbl(stations)"
+        },
+        {
+         "extends": null,
+         "key": [
+          "@col(bikes|bike_id)"
+         ],
+         "label": "Bike",
+         "name": "Bike",
+         "properties": [
+          {
+           "column": "@col(bikes|bike_id)",
+           "label": "",
+           "name": "code",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(bikes|status)",
+           "label": "",
+           "name": "status",
+           "required": false,
+           "transform": "enum_map:{\"available\": \"available\", \"in_use\": \"in_use\", \"maintenance\": \"maintenance\", \"retired\": \"retired\"}",
+           "type": {
+            "enum": [
+             "available",
+             "in_use",
+             "maintenance",
+             "retired"
+            ]
+           }
+          },
+          {
+           "column": "@col(bikes|model)",
+           "label": "",
+           "name": "model",
+           "required": false,
+           "transform": "enum_map:{\"classic\": \"classic\", \"electric\": \"electric\"}",
+           "type": {
+            "enum": [
+             "classic",
+             "electric"
+            ]
+           }
+          },
+          {
+           "column": "@col(bikes|purchased_on)",
+           "label": "",
+           "name": "purchased_on",
+           "required": false,
+           "transform": "timestamp:@fmt(bikes|purchased_on)",
+           "type": "timestamp"
+          }
+         ],
+         "source_table": "@tbl(bikes)"
+        },
+        {
+         "extends": null,
+         "key": [
+          "@col(riders|rider_id)"
+         ],
+         "label": "Rider",
+         "name": "Rider",
+         "properties": [
+          {
+           "column": "@col(riders|rider_id)",
+           "label": "",
+           "name": "code",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(riders|full_name)",
+           "label": "",
+           "name": "full_name",
+           "required": false,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(riders|plan)",
+           "label": "",
+           "name": "plan",
+           "required": false,
+           "transform": "enum_map:{\"casual\": \"casual\", \"member\": \"member\", \"student\": \"student\"}",
+           "type": {
+            "enum": [
+             "casual",
+             "member",
+             "student"
+            ]
+           }
+          },
+          {
+           "column": "@col(riders|joined)",
+           "label": "",
+           "name": "joined",
+           "required": false,
+           "transform": "timestamp:@fmt(riders|joined)",
+           "type": "timestamp"
+          }
+         ],
+         "source_table": "@tbl(riders)"
+        },
+        {
+         "extends": null,
+         "key": [
+          "@col(trips|trip_id)"
+         ],
+         "label": "Trip",
+         "name": "Trip",
+         "properties": [
+          {
+           "column": "@col(trips|trip_id)",
+           "label": "",
+           "name": "code",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(trips|started_at)",
+           "label": "",
+           "name": "started_at",
+           "required": true,
+           "transform": "timestamp:@fmt(trips|started_at)",
+           "type": "timestamp"
+          },
+          {
+           "column": "@col(trips|ended_at)",
+           "label": "",
+           "name": "ended_at",
+           "required": false,
+           "transform": "timestamp:@fmt(trips|ended_at)",
+           "type": "timestamp"
+          }
+         ],
+         "source_table": "@tbl(trips)"
+        },
+        {
+         "extends": null,
+         "key": [
+          "@col(maintenance|ticket_id)"
+         ],
+         "label": "Ticket",
+         "name": "Ticket",
+         "properties": [
+          {
+           "column": "@col(maintenance|ticket_id)",
+           "label": "",
+           "name": "code",
+           "required": true,
+           "transform": "none",
+           "type": "string"
+          },
+          {
+           "column": "@col(maintenance|issue)",
+           "label": "",
+           "name": "issue",
+           "required": false,
+           "transform": "enum_map:{\"battery\": \"battery\", \"brakes\": \"brakes\", \"chain\": \"chain\", \"lock\": \"lock\", \"tyre\": \"tyre\"}",
+           "type": {
+            "enum": [
+             "brakes",
+             "tyre",
+             "battery",
+             "chain",
+             "lock"
+            ]
+           }
+          },
+          {
+           "column": "@col(maintenance|severity)",
+           "label": "",
+           "name": "severity",
+           "required": false,
+           "transform": "enum_map:{\"high\": \"high\", \"low\": \"low\", \"medium\": \"medium\"}",
+           "type": {
+            "enum": [
+             "low",
+             "medium",
+             "high"
+            ]
+           }
+          },
+          {
+           "column": "@col(maintenance|opened_at)",
+           "label": "",
+           "name": "opened_at",
+           "required": false,
+           "transform": "timestamp:@fmt(maintenance|opened_at)",
+           "type": "timestamp"
+          },
+          {
+           "column": "@col(maintenance|closed_at)",
+           "label": "",
+           "name": "closed_at",
+           "required": false,
+           "transform": "timestamp:@fmt(maintenance|closed_at)",
+           "type": "timestamp"
+          }
+         ],
+         "source_table": "@tbl(maintenance)"
+        }
+       ],
+       "profile_hash": "@profile_hash",
+       "rationale": "Seven entity tables. Zones contain clusters, clusters contain stations (a hierarchy through two many-to-one links); trips link a bike, a rider and two stations; maintenance tickets link to bikes.",
+       "roles": [
+        {
+         "access": "admin",
+         "description": "Administrator",
+         "name": "admin"
+        },
+        {
+         "access": "read",
+         "description": "Read-only analyst",
+         "name": "analyst"
+        }
+       ],
+       "version": 1
+      }
+     },
+     "name": "submit_proposal"
+    }
+   ],
+   "usage": [
+    2200,
+    900
+   ]
+  }
+ ],
+ "version": 1
+}

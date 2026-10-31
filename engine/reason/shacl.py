@@ -27,7 +27,13 @@ from engine.sync import iri
 from engine.db.principal import ScenarioCtx
 from engine.sync.iri import G_ASSERTED, obj_iri
 
-SHAPES = Path(__file__).resolve().parents[2] / "build" / "shapes.ttl"
+def _default_shapes() -> Path:
+    from engine.sync.store import build_dir
+    return build_dir() / "shapes.ttl"
+
+
+# Legacy default (tests / benchmarks). A running app passes `shapes_turtle=cfg.shapes_turtle` of its own ontology.
+SHAPES = _default_shapes()
 XSD = "http://www.w3.org/2001/XMLSchema#"
 
 
@@ -87,7 +93,7 @@ def pg_props_loader(conn, types: Iterable[str], ns: str = iri.DEFAULT_NS,
         quads = []
         for t in types:
             if scenario is not None:
-                got = conn.execute("SELECT current_setting('amarh.scenario', true)").fetchone()[0]
+                got = conn.execute("SELECT current_setting('isnad.scenario', true)").fetchone()[0]
                 if str(got or "") != str(scenario.id):
                     raise PermissionError("connection is not scoped to this scenario")
             cur = conn.execute(sql.SQL("SELECT * FROM {} WHERE id = ANY(%s)").format(
@@ -114,9 +120,17 @@ def _shapes(path: str):
     return g
 
 
+@lru_cache(maxsize=8)
+def _shapes_text(text: str):
+    from rdflib import Graph
+    g = Graph()
+    g.parse(data=text, format="turtle")
+    return g
+
+
 def validate_changed(st: Store, changed_ids: Iterable, ns: str = iri.DEFAULT_NS,
                      props_loader: Callable | None = None, shapes_path: Path | str = SHAPES,
-                     scenario: ScenarioCtx | None = None) -> ShaclResult:
+                     scenario: ScenarioCtx | None = None, shapes_turtle: str | None = None) -> ShaclResult:
     """Extract neighbourhood of changed ids, optionally hydrate, validate with pySHACL.
 
     With `scenario`, `st` must be the scenario's ScenarioGraph (its isolated store is validated);
@@ -141,7 +155,7 @@ def validate_changed(st: Store, changed_ids: Iterable, ns: str = iri.DEFAULT_NS,
     data = Graph()
     data.parse(data=serialize(quads, format=RdfFormat.N_TRIPLES).decode(), format="nt")
     t2 = time.perf_counter()
-    conforms, rg, _ = pyshacl.validate(data, shacl_graph=_shapes(str(shapes_path)), inference="none")
+    conforms, rg, _ = pyshacl.validate(data, shacl_graph=_shapes_text(shapes_turtle) if shapes_turtle else _shapes(str(shapes_path)), inference="none")
     t3 = time.perf_counter()
     SH = Namespace("http://www.w3.org/ns/shacl#")
     viol = []

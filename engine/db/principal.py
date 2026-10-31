@@ -45,8 +45,8 @@ class _Owner:
 OWNER = _Owner()  # sentinel: loader/migration code running as the connection user
 
 
-_SCN_RESET = ("SELECT set_config('amarh.scenario', '', true), set_config('amarh.scenario_base', '', true), "
-              "set_config('amarh.now', '', true)")
+_SCN_RESET = ("SELECT set_config('isnad.scenario', '', true), set_config('isnad.scenario_base', '', true), "
+              "set_config('isnad.now', '', true)")
 
 
 def _scn_values(scenario) -> tuple[str, str, str]:
@@ -61,7 +61,7 @@ def _scn_values(scenario) -> tuple[str, str, str]:
 @contextmanager
 def scoped(conn: psycopg.Connection, principal, scenario: ScenarioCtx | None = None, *,
            statement_timeout_ms: int = 5000, lock_timeout_ms: int = 2000):
-    """Run the block as `principal` inside the current transaction (SET LOCAL ROLE amarh_app).
+    """Run the block as `principal` inside the current transaction (SET LOCAL ROLE isnad_app).
 
     The caller must be in a transaction (`with conn.transaction():` or an implicit one); the
     identity is transaction-local so it can never leak to the next transaction on a reused
@@ -69,8 +69,8 @@ def scoped(conn: psycopg.Connection, principal, scenario: ScenarioCtx | None = N
     runs as the owner again). OWNER does nothing, except that with a `scenario` it sets (and on
     exit clears) the scenario GUCs without switching role.
 
-    `scenario` (Phase 5) selects the what-if overlay: `amarh.scenario`, `amarh.scenario_base` and
-    `amarh.now` (the scenario clock, '' = wall clock) are set next to the identity and cleared on exit;
+    `scenario` (Phase 5) selects the what-if overlay: `isnad.scenario`, `isnad.scenario_base` and
+    `isnad.now` (the scenario clock, '' = wall clock) are set next to the identity and cleared on exit;
     with `scenario=None` they are explicitly set to '' (= main). Only a `ScenarioCtx` is accepted.
     """
     scn_vals = _scn_values(scenario)
@@ -78,8 +78,8 @@ def scoped(conn: psycopg.Connection, principal, scenario: ScenarioCtx | None = N
         if scenario is None:
             yield conn
             return
-        conn.execute("SELECT set_config('amarh.scenario', %s, true), set_config('amarh.scenario_base', %s, true), "
-                     "set_config('amarh.now', %s, true)", list(scn_vals))
+        conn.execute("SELECT set_config('isnad.scenario', %s, true), set_config('isnad.scenario_base', %s, true), "
+                     "set_config('isnad.now', %s, true)", list(scn_vals))
         try:
             yield conn
         finally:
@@ -88,14 +88,14 @@ def scoped(conn: psycopg.Connection, principal, scenario: ScenarioCtx | None = N
         return
     if conn.autocommit and conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE:
         raise RuntimeError("scoped() requires an open transaction (conn.transaction())")
-    conn.execute("SET LOCAL ROLE amarh_app")
+    conn.execute("SET LOCAL ROLE isnad_app")
     conn.execute(
-        "SELECT set_config('amarh.role', %s, true), set_config('amarh.user', %s, true), "
-        "set_config('amarh.region', %s, true), set_config('amarh.approves', %s, true), "
-        "set_config('amarh.scenario', %s, true), set_config('amarh.scenario_base', %s, true), "
-        "set_config('amarh.now', %s, true), "
+        "SELECT set_config('isnad.role', %s, true), set_config('isnad.user', %s, true), "
+        "set_config('isnad.region', %s, true), set_config('isnad.approves', %s, true), "
+        "set_config('isnad.scenario', %s, true), set_config('isnad.scenario_base', %s, true), "
+        "set_config('isnad.now', %s, true), "
         "set_config('statement_timeout', %s, true), set_config('lock_timeout', %s, true), "
-        "set_config('amarh.on_behalf_of', %s, true)",
+        "set_config('isnad.on_behalf_of', %s, true)",
         [principal.role, principal.user, principal.region or "", ",".join(principal.approves), *scn_vals,
          f"{int(statement_timeout_ms)}ms", f"{int(lock_timeout_ms)}ms",
          (principal.on_behalf_of or "") if str(principal.user).startswith("agent:") else ""])
@@ -106,26 +106,26 @@ def scoped(conn: psycopg.Connection, principal, scenario: ScenarioCtx | None = N
         if conn.info.transaction_status != psycopg.pq.TransactionStatus.INERROR:
             conn.execute("RESET ROLE")
             conn.execute(
-                "SELECT set_config('amarh.role', '', true), set_config('amarh.user', '', true), "
-                "set_config('amarh.region', '', true), set_config('amarh.approves', '', true), "
-                "set_config('amarh.scenario', '', true), set_config('amarh.scenario_base', '', true), "
-                "set_config('amarh.now', '', true), "
+                "SELECT set_config('isnad.role', '', true), set_config('isnad.user', '', true), "
+                "set_config('isnad.region', '', true), set_config('isnad.approves', '', true), "
+                "set_config('isnad.scenario', '', true), set_config('isnad.scenario_base', '', true), "
+                "set_config('isnad.now', '', true), "
                 "set_config('statement_timeout', '0', true), set_config('lock_timeout', '0', true), "
-                "set_config('amarh.on_behalf_of', '', true)")
+                "set_config('isnad.on_behalf_of', '', true)")
 
 
 def current_scenario(conn: psycopg.Connection) -> int:
     """The scenario id currently set on the connection (0 = main). For tests / consistency checks."""
-    v = conn.execute("SELECT current_setting('amarh.scenario', true)").fetchone()[0]
+    v = conn.execute("SELECT current_setting('isnad.scenario', true)").fetchone()[0]
     return int(v) if v else 0
 
 
 def current_principal(conn: psycopg.Connection) -> Principal | None:
     """The identity currently set on the connection (None when no role is set). For tests."""
     role, user, region, appr, behalf = conn.execute(
-        "SELECT current_setting('amarh.role', true), current_setting('amarh.user', true), "
-        "current_setting('amarh.region', true), current_setting('amarh.approves', true), "
-        "current_setting('amarh.on_behalf_of', true)").fetchone()
+        "SELECT current_setting('isnad.role', true), current_setting('isnad.user', true), "
+        "current_setting('isnad.region', true), current_setting('isnad.approves', true), "
+        "current_setting('isnad.on_behalf_of', true)").fetchone()
     if not role:
         return None
     return Principal(role, user or "", region or "", tuple(a for a in (appr or "").split(",") if a), behalf or "")

@@ -1,0 +1,32 @@
+version: 1
+namespace: https://example.org/messy#
+classes:
+  Facility: {}
+  Port: {extends: Facility}
+  Warehouse: {extends: Facility}
+objectTypes:
+  Supplier: {properties: {code: "string!", name: "string!", country: string, price_index: float}}
+  Port:     {properties: {code: "string!", name: "string!", location: point, status: {enum: [open, closed]}, region: {enum: [APAC, EMEA, AMER]}}}
+  Warehouse: {properties: {code: "string!", name: "string!", location: point, region: {enum: [APAC, EMEA, AMER]}}}
+  Carrier:  {properties: {code: "string!", name: "string!"}}
+  Shipment:
+    properties:
+      ref: "string!"
+      eta: timestamp
+      status: {enum: [planned, in_transit, delayed, arrived]}
+      cargo_value: float
+      delay_hours: float
+  Invoice:
+    properties:
+      ref: "string!"
+      amount: float
+      currency: string
+      status: {enum: [open, approved, paid, flagged]}
+      due: timestamp
+linkTypes:
+  operated_by:  {from: Shipment, to: Carrier,   cardinality: many-to-one}
+  ships_from:   {from: Shipment, to: Port,      cardinality: many-to-one}
+  ships_to:     {from: Shipment, to: Warehouse, cardinality: many-to-one}
+  supplied_by:  {from: Shipment, to: Supplier,  cardinality: many-to-one}
+  invoices_for: {from: Invoice,  to: Shipment,  cardinality: many-to-one}
+  billed_by:    {from: Invoice,  to: Supplier,  cardinality: many-to-one}
