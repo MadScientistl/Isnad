@@ -43,10 +43,27 @@ CREATE TABLE IF NOT EXISTS ingest_decision (
 );
 CREATE INDEX IF NOT EXISTS ingest_decision_proposal_idx ON ingest_decision (proposal_id);
 
+-- Model-spend ledger: every model job writes a 'reserved' row (its maximum cost) when it starts and a settling row
+-- (done / failed / cancelled / error, actual or worst-case cost) in a finally. A reservation is counted only until its
+-- job has a settling row. Failed and cancelled runs therefore still count against the daily budget.
+CREATE TABLE IF NOT EXISTS ingest_spend (
+    id uuid PRIMARY KEY,
+    username text NOT NULL,
+    job_id text NOT NULL,
+    cost_usd numeric NOT NULL CHECK (cost_usd >= 0),
+    status text NOT NULL CHECK (status IN ('reserved', 'done', 'failed', 'cancelled', 'error', 'rejected')),
+    at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE INDEX IF NOT EXISTS ingest_spend_user_idx ON ingest_spend (username, at);
+CREATE INDEX IF NOT EXISTS ingest_spend_job_idx ON ingest_spend (job_id);
+
+-- At most one approval per proposal (reviewers change a proposal by editing it, which creates a new proposal).
+CREATE UNIQUE INDEX IF NOT EXISTS ingest_decision_one_approval ON ingest_decision (proposal_id) WHERE decision = 'approved';
+
 DO $$
 DECLARE t text; p record; owner_role text := current_user;
 BEGIN
-  FOREACH t IN ARRAY ARRAY['ingest_session','ingest_proposal','ingest_decision'] LOOP
+  FOREACH t IN ARRAY ARRAY['ingest_session','ingest_proposal','ingest_decision','ingest_spend'] LOOP
     EXECUTE format('DROP TRIGGER IF EXISTS isnad_no_update ON %I', t);
     EXECUTE format('CREATE TRIGGER isnad_no_update BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION isnad_append_only()', t);
     EXECUTE format('DROP TRIGGER IF EXISTS isnad_no_truncate ON %I', t);

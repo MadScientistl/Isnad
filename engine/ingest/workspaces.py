@@ -73,7 +73,9 @@ def read_report(slug: str, root: str | os.PathLike | None = None) -> dict | None
         return None
 
 
-def list_workspaces(root: str | os.PathLike | None = None) -> list[dict]:
+def list_workspaces(root: str | os.PathLike | None = None, schemas: set[str] | None = None) -> list[dict]:
+    """``schemas`` = names of the schemas that exist; a directory without its schema is reported with status 'orphan'
+    (not importable, no api_base)."""
     base = workspaces_root(root)
     out: list[dict] = []
     if not base.is_dir():
@@ -85,8 +87,10 @@ def list_workspaces(root: str | os.PathLike | None = None) -> list[dict]:
         if not y.is_file():
             continue
         rep = read_report(d.name, root) or {}
+        orphan = schemas is not None and (rep.get("schema") or schema_for(d.name)) not in schemas
         out.append({"slug": d.name, "schema": rep.get("schema") or schema_for(d.name),
+                    "status": "orphan" if orphan else "ready",
                     "ontology_hash": rep.get("ontology_hash") or hashlib.sha256(y.read_bytes()).hexdigest(),
                     "imported_at": rep.get("imported_at"),
-                    "rows": rep.get("rows"), "api_base": _api_base(d.name, d)})
+                    "rows": rep.get("rows"), "api_base": None if orphan else _api_base(d.name, d)})
     return out

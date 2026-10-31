@@ -3,8 +3,9 @@
     app.include_router(ingest_routes.make_router(get_principal, wconn, ontology=om, schema_name=schema,
                                                  model_factory=..., source_registry=None))
 
-Admin only: everyone else gets a plain 404 (`not_found`); with `ISNAD_AUTH` != 1 the routes also need
-`ISNAD_ALLOW_IMPORT=1` (else 404 `import_disabled`). Errors are `{code, detail}` JSON and never echo request or data
+Admin only: everyone else gets a plain 404 (`not_found`). The router is mounted only with `ISNAD_ALLOW_IMPORT=1`
+(every mode); the gate is checked again per request (404 `import_disabled`). Jobs belong to the admin identity that
+created them (anyone else gets 404). Errors are `{code, detail}` JSON and never echo request or data
 content (request-validation errors are rewritten to field names only). Uploads are raw bodies streamed to disk with the
 `ISNAD_MAX_UPLOAD_BYTES` limit enforced while reading. All writes to ingest_* go through `engine.ingest.store` under
 `scoped(conn, principal)`; the heavy work (model proposals, repairs, imports) runs as jobs in `engine.ingest.jobs`.
@@ -22,6 +23,7 @@ import uuid
 from contextlib import contextmanager
 from typing import Any, Callable, Literal
 
+import psycopg.errors
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -219,11 +221,29 @@ def make_router(get_principal, wconn, *, ontology=None, schema_name: str | None 
     def vfn(profile, proposal, source, *, namespace=None, slug=None):
         return (validate_fn or default_validate)(profile, proposal, source, namespace=namespace, slug=slug)
 
+    # ------------------------------------------------------------ concurrency slots (L7)
+    busy_users: set[str] = set()
+    busy_lock = threading.Lock()
+    upload_sem = threading.BoundedSemaphore(2)
+
+    @contextmanager
+    def user_slot(user: str):
+        """One heavy synchronous operation (validation) per user at a time: 429 `busy` otherwise."""
+        with busy_lock:
+            if user in busy_users:
+                raise ApiErr(429, "busy", "another operation is still running for this user", retry_after=3)
+            busy_users.add(user)
+        try:
+            yield
+        finally:
+            with busy_lock:
+                busy_users.discard(user)
+
     # ------------------------------------------------------------ guards + helpers
     def admin(p: Principal = Depends(get_principal)) -> Principal:
         if getattr(p, "role", None) != "admin":
             raise ApiErr(404, "not_found", "not found")
-        if not auth_on() and os.environ.get("ISNAD_ALLOW_IMPORT") != "1":
+        if os.environ.get("ISNAD_ALLOW_IMPORT") != "1":
             raise ApiErr(404, "import_disabled", "ontology import is disabled")
         return p
 
@@ -327,6 +347,15 @@ def make_router(get_principal, wconn, *, ontology=None, schema_name: str | None 
         return out
 
     def finish_upload(conn, p, tmp, sha: str, name: str) -> dict:
+        if not upload_sem.acquire(blocking=False):
+            tmp.unlink(missing_ok=True)
+            raise ApiErr(429, "busy", "too many uploads are being profiled; try again shortly", retry_after=3)
+        try:
+            return _finish_upload(conn, p, tmp, sha, name)
+        finally:
+            upload_sem.release()
+
+    def _finish_upload(conn, p, tmp, sha: str, name: str) -> dict:
         sid = uuid.uuid4()
         path = S.commit_upload(tmp, sid, sha, ingest_root)
         try:
@@ -353,6 +382,8 @@ def make_router(get_principal, wconn, *, ontology=None, schema_name: str | None 
         if ns is None:
             raise ApiErr(404, "not_found", "source not found")
         check_quota(conn, p)
+        if not upload_sem.acquire(blocking=False):
+            raise ApiErr(429, "busy", "too many sources are being profiled; try again shortly", retry_after=3)
         try:
             with ns.open(SourceLimits.from_env()) as src:
                 prof = profile_source(src, caps=Caps.from_env())
@@ -361,6 +392,8 @@ def make_router(get_principal, wconn, *, ontology=None, schema_name: str | None 
         except Exception as e:  # noqa: BLE001
             log.warning("named source failed: %s", type(e).__name__)
             raise ApiErr(502, "source_unavailable", "the source could not be reached") from None
+        finally:
+            upload_sem.release()
         sid = uuid.uuid4()
         with tx(conn, p):
             S.insert_session(conn, sid, p.user, prof["source"]["kind"], S.NAMED_PREFIX + name,
@@ -395,6 +428,9 @@ def make_router(get_principal, wconn, *, ontology=None, schema_name: str | None 
         try:
             prop = Proposal.model_validate(prop_dict).model_copy(update={"namespace": ns})
             yaml_text, mapping = to_yaml(prop, profile, slug=slug)
+        except ValidationError as e:
+            from engine.ingest.proposal import summarize_validation_error
+            raise ApiErr(422, "invalid_proposal", "the proposal is invalid: " + summarize_validation_error(e)) from None
         except (ProposalError, ValueError) as e:
             raise ApiErr(422, "invalid_proposal", clean_text(str(e), 300) or "the proposal is invalid") from None
         return prop, yaml_text, _jsonable(mapping), _jsonable(prop.model_dump(by_alias=True, mode="json"))
@@ -416,27 +452,54 @@ def make_router(get_principal, wconn, *, ontology=None, schema_name: str | None 
             log.warning("ingest model unavailable: %s", type(e).__name__)
             raise ApiErr(503, "agent_unavailable", "the model is not configured") from None
 
-    def start_job(kind, p, work):
+    def start_job(kind, p, work, *, job_id=None):
         try:
-            return registry.start(kind, p.user, work)
+            return registry.start(kind, p.user, work, job_id=job_id)
         except J.JobLimit as e:
             raise ApiErr(429, "rate_limited", e.message, retry_after=e.retry_after) from None
 
-    def budget(conn, p) -> float:
+    def reserve_budget(conn, p, job_id: str) -> float:
+        """Check the per-user and the global daily budget and reserve the job's maximum cost, atomically (advisory
+        lock). Returns the cost cap of the job. The reservation counts until the job's settling row exists."""
         lim = J.limits()
         with tx(conn, p):
-            used = S.daily_cost(conn, p.user)
-        if used >= lim["daily_usd"]:
-            raise ApiErr(429, "rate_limited", "daily generation budget used up", retry_after=3600)
-        return max(0.0, min(1.0, lim["daily_usd"] - used))
+            S.lock_spend(conn)
+            used, used_all = S.daily_cost(conn, p.user), S.daily_cost_global(conn)
+            room = min(lim["daily_usd"] - used, lim["global_daily_usd"] - used_all)
+            if room <= 0:
+                raise ApiErr(429, "rate_limited", "daily generation budget used up", retry_after=3600)
+            cap = max(0.0, min(1.0, room))
+            S.record_spend(conn, p.user, job_id, cap, "reserved")
+        return cap
+
+    def settle_spend(p, job_id: str, cost: float, status: str) -> None:
+        c = conn_factory()
+        try:
+            with tx(c, p):
+                S.record_spend(c, p.user, job_id, cost, status)
+        except Exception as e:  # noqa: BLE001
+            log.error("could not record model spend: %s", type(e).__name__)
+        finally:
+            c.close()
+
+    def start_model_job(kind, p, conn, work_fn):
+        job_id = str(uuid.uuid4())
+        max_cost = reserve_budget(conn, p, job_id)
+        try:
+            return start_job(kind, p, lambda j: work_fn(j, max_cost), job_id=job_id)
+        except BaseException:
+            settle_spend(p, job_id, 0.0, "rejected")     # the job never ran: release the reservation
+            raise
 
     def run_generate(job, p, s, kind: str, model, parent: dict | None, max_cost: float) -> None:
         from agent.ontogen import GenCaps, generate  # noqa: PLC0415
         from engine.ingest.proposal import to_yaml
-        slug, ns = session_ns(s)
-        profile = s["profile"]
-        c = conn_factory()
+        spent, outcome = max_cost, "error"      # worst case until generate() reports the real cost
+        c = None
         try:
+            slug, ns = session_ns(s)
+            profile = s["profile"]
+            c = conn_factory()
             def vf(prof, prop):
                 return run_validation(s, prof, prop, slug, ns)
             if parent is not None:
@@ -445,6 +508,8 @@ def make_router(get_principal, wconn, *, ontology=None, schema_name: str | None 
             res = generate(profile, model=model, validate_fn=vf, caps=GenCaps(max_cost_usd=max_cost), namespace=ns,
                            cancel=job.cancel, on_event=lambda ev: job.push(ev["kind"], ev["payload"]),
                            to_yaml_fn=lambda pr, prf: to_yaml(pr, prf, slug=slug))
+            spent, outcome = res.cost_usd, ("cancelled" if res.status == "cancelled" else
+                                            "done" if res.proposal is not None else "failed")
             job.cost_usd = res.cost_usd
             if res.proposal is None or res.yaml is None:
                 job.finish("cancelled" if res.status == "cancelled" else "failed",
@@ -459,7 +524,9 @@ def make_router(get_principal, wconn, *, ontology=None, schema_name: str | None 
             job.finish("done", result={"proposal_id": job.proposal_id, "ok": res.ok, "status": res.status,
                                        "repair_rounds": res.repair_rounds, "cost_usd": res.cost_usd})
         finally:
-            c.close()
+            if c is not None:
+                c.close()
+            settle_spend(p, job.id, spent, outcome)   # every model job lands in the ledger: success, failure, cancel, error
 
     class _Seeded:
         """Model wrapper for a repair run: the first user message also carries the previous proposal and its report."""
@@ -487,14 +554,14 @@ def make_router(get_principal, wconn, *, ontology=None, schema_name: str | None 
         slug, ns = session_ns(s)
         if body.mode == "baseline":
             prop, yaml_text, mapping, pj = build(baseline_proposal(s["profile"]), s["profile"], slug, ns)
-            rep = run_validation(s, s["profile"], prop, slug, ns)
+            with user_slot(p.user):
+                rep = run_validation(s, s["profile"], prop, slug, ns)
             row = store_proposal(conn, p, s, "baseline", pj, yaml_text, mapping, rep)
             job = registry.completed("baseline", p.user, result={"proposal_id": str(row["id"]), "ok": rep.get("ok")},
                                      proposal_id=str(row["id"]))
             return {"job_id": job.id, "proposal_id": str(row["id"])}
         model = new_model(p)
-        max_cost = budget(conn, p)
-        job = start_job("model", p, lambda j: run_generate(j, p, s, "model", model, None, max_cost))
+        job = start_model_job("model", p, conn, lambda j, mc: run_generate(j, p, s, "model", model, None, mc))
         return {"job_id": job.id}
 
     @r.post("/ingest/proposals/{pid}/repair", status_code=202)
@@ -509,8 +576,7 @@ def make_router(get_principal, wconn, *, ontology=None, schema_name: str | None 
         if depth >= 5:
             raise ApiErr(409, "repair_limit", "the repair limit for this proposal chain is reached")
         model = new_model(p)
-        max_cost = budget(conn, p)
-        job = start_job("repair", p, lambda j: run_generate(j, p, s, "repair", model, parent, max_cost))
+        job = start_model_job("repair", p, conn, lambda j, mc: run_generate(j, p, s, "repair", model, parent, mc))
         return {"job_id": job.id}
 
     @r.patch("/ingest/proposals/{pid}/items", status_code=201)
@@ -526,7 +592,8 @@ def make_router(get_principal, wconn, *, ontology=None, schema_name: str | None 
         check_edit_policy(parent["proposal"], new)
         slug, ns = session_ns(s)
         prop, yaml_text, mapping, pj = build(new, s["profile"], slug, ns)
-        rep = run_validation(s, s["profile"], prop, slug, ns)
+        with user_slot(p.user):
+            rep = run_validation(s, s["profile"], prop, slug, ns)
         rep["edit_items"] = items
         row = store_proposal(conn, p, s, "edit", pj, yaml_text, mapping, rep, parent_id=parent["id"])
         return proposal_json(row, s, include_diff=True)
@@ -572,6 +639,10 @@ def make_router(get_principal, wconn, *, ontology=None, schema_name: str | None 
     @r.post("/ingest/proposals/{pid}/approve", status_code=201)
     def approve(pid: str, body: ApproveBody, p: Principal = Depends(admin), conn=Depends(wconn)):
         u = parse_id(pid)
+        # Item-level decisions are not applied at import: an approval approves the proposal exactly as stored.
+        # Reviewers change a proposal with PATCH (a new proposal) and approve that one.
+        if any(i.action != "accept" for i in body.items):
+            raise ApiErr(422, "use_edit", "to reject or edit items, PATCH the proposal and approve the new proposal")
         with tx(conn, p):
             row = S.get_proposal(conn, u)
             if row is None:
@@ -580,6 +651,8 @@ def make_router(get_principal, wconn, *, ontology=None, schema_name: str | None 
             existing = S.decisions_for(conn, u)
         if any(d["decision"] == "approved" for d in existing):
             raise ApiErr(409, "already_decided", "this proposal is already approved")
+        if any(d["decision"] == "rejected" for d in existing):
+            raise ApiErr(409, "rejected", "this proposal was rejected; edit it and approve the new proposal")
         if not (row["validation"] or {}).get("ok"):
             raise ApiErr(409, "validation_failed", "only a proposal that passes validation can be approved")
         if auth_on() and p.user == s["created_by"]:
@@ -588,9 +661,12 @@ def make_router(get_principal, wconn, *, ontology=None, schema_name: str | None 
         if sensitive and not body.comment.strip():
             raise ApiErr(422, "comment_required", "this import defines roles and permissions; approval needs a comment",
                          sensitive=len(sensitive))
-        with tx(conn, p):
-            d = S.insert_decision(conn, u, "approved", p.user, p.role, body.comment.strip() or None,
-                                  [i.model_dump() for i in body.items])
+        try:
+            with tx(conn, p):
+                d = S.insert_decision(conn, u, "approved", p.user, p.role, body.comment.strip() or None,
+                                      [i.model_dump() for i in body.items])
+        except psycopg.errors.UniqueViolation:
+            raise ApiErr(409, "already_decided", "this proposal is already approved") from None
         return {"decision_id": str(d["id"]), "proposal_id": str(u), "decision": "approved", "approver": d["approver"],
                 "slug": W.session_slug(s["source_name"], s["id"])}
 
@@ -624,30 +700,36 @@ def make_router(get_principal, wconn, *, ontology=None, schema_name: str | None 
         return {"job_id": job.id}
 
     @r.get("/workspaces")
-    def workspaces(p: Principal = Depends(admin)):
-        return W.list_workspaces(workspaces_root)
+    def workspaces(p: Principal = Depends(admin), conn=Depends(wconn)):
+        try:
+            with conn.transaction():
+                rows = conn.execute("SELECT nspname FROM pg_namespace WHERE nspname LIKE 'ws\\_%'").fetchall()
+            existing = {r[0] for r in rows}
+        except Exception:  # noqa: BLE001
+            existing = None
+        return W.list_workspaces(workspaces_root, existing)
 
     # ------------------------------------------------------------ jobs
-    def get_job(job_id: str):
-        j = registry.get(job_id)
+    def get_job(job_id: str, p: Principal):
+        j = registry.get(job_id, p.user)
         if j is None:
             raise ApiErr(404, "not_found", "job not found")
         return j
 
     @r.get("/ingest/jobs/{job_id}")
     def job_status(job_id: str, after: int = Query(0, ge=0), p: Principal = Depends(admin)):
-        return get_job(job_id).to_dict(after)
+        return get_job(job_id, p).to_dict(after)
 
     @r.post("/ingest/jobs/{job_id}/cancel")
     def job_cancel(job_id: str, p: Principal = Depends(admin)):
-        j = get_job(job_id)
+        j = get_job(job_id, p)
         if not j.finished:
             j.cancel.set()
         return {"job_id": j.id, "status": "cancelling" if not j.finished else j.status}
 
     @r.get("/ingest/jobs/{job_id}/stream")
     def job_stream(job_id: str, after: int = Query(0, ge=0), p: Principal = Depends(admin)):
-        j = get_job(job_id)
+        j = get_job(job_id, p)
         if not registry.open_stream(j):
             raise ApiErr(429, "rate_limited", "too many open streams", retry_after=2)
 

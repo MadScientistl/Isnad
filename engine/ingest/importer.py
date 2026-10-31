@@ -128,6 +128,17 @@ def _host_import_row(conn, decision_id) -> dict | None:
     return r[0] if r else None
 
 
+def _host_import_for_slug(conn, slug: str) -> bool:
+    """True when the audit shows a completed import into workspace ``slug`` (by any decision)."""
+    try:
+        with conn.transaction():
+            r = conn.execute("SELECT 1 FROM audit_event WHERE name = %s AND source = 'import' AND "
+                             "params->>'workspace' = %s LIMIT 1", (IMPORT_NAME, slug)).fetchone()
+    except Exception:  # noqa: BLE001
+        return True      # cannot tell: be conservative and keep the directory
+    return r is not None
+
+
 def _result_from_row(params: dict, root) -> ImportResult:
     slug = params["workspace"]
     rep = W.read_report(slug, root)
@@ -181,6 +192,18 @@ def run_import(conn_factory, decision_id, principal, *, validate_fn=None, materi
             raise IngestError(403, "approver_not_admin", "only an admin approval can trigger an import")
         if auth_on() and d["approver"] == s["created_by"]:
             raise IngestError(403, "self_approval", "the approver must not be the session creator")
+        ctx = scoped(host, principal) if principal is not OWNER else None
+        with host.transaction():
+            if ctx is not None:
+                ctx.__enter__()
+            try:
+                late_reject = S.latest_rejection_after(host, p["id"], d["at"])
+            finally:
+                if ctx is not None:
+                    ctx.__exit__(None, None, None)
+        host.commit()
+        if late_reject:
+            raise IngestError(409, "rejected_after_approval", "the proposal was rejected after it was approved")
         prior = _host_import_row(host, decision_id)
         host.commit()
         if prior is not None:
@@ -256,9 +279,11 @@ def _transaction(conn_factory, host_schema, schema, slug, ns, d, p, s, c, ddl, y
             if exists:
                 raise IngestError(409, "workspace_exists", "a workspace for this session already exists")
             if final.exists():
-                if (final / "import_report.json").exists():
-                    raise IngestError(409, "workspace_exists", "a workspace directory for this session already exists")
-                shutil.rmtree(final, ignore_errors=True)   # stale leftover of a crashed import (no report, no schema)
+                # The schema does not exist (checked above), so this directory is an orphan. It may be replaced only
+                # when the audit shows no completed import for this workspace (a crashed or hand-made leftover).
+                if _host_import_for_slug(w, slug):
+                    raise IngestError(409, "workspace_exists", "an orphaned workspace directory exists for a completed import")
+                shutil.rmtree(final, ignore_errors=True)
             now = w.execute("SELECT now()").fetchone()[0]
             w.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
             w.execute(sql.SQL("SET LOCAL search_path TO {}, public").format(sql.Identifier(schema)))

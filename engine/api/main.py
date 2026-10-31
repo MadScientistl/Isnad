@@ -657,6 +657,7 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
         except Exception:  # noqa: BLE001
             ok = False
         return {"status": "ok" if ok else "degraded", "db": ok, "schema": schema,
+                "import_enabled": import_enabled, "auth": auth_svc is not None,
                 "pipeline": state["pipeline"] not in (False, None),
                 "simulation": state["runner"] is not None}
 
@@ -1746,16 +1747,21 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
     from engine.api import ontology_routes
     app.include_router(ontology_routes.make_router(get_principal, wconn))
 
-    # Optional ingest router (admin only, written by another module; absent module => nothing mounted).
-    if auth_svc is not None or os.environ.get("ISNAD_ALLOW_IMPORT", "0") == "1":
+    # Ingest + workspace routes: mounted ONLY when ISNAD_ALLOW_IMPORT=1 (in every mode, auth or not). A workspace process
+    # (ISNAD_ALLOW_IMPORT=0) exposes neither /ingest nor /workspaces.
+    import_enabled = os.environ.get("ISNAD_ALLOW_IMPORT", "0") == "1"
+    app.state.import_enabled = import_enabled
+    if import_enabled:
+        if auth_svc is None:
+            logging.getLogger("isnad.api").warning(
+                "ISNAD_ALLOW_IMPORT=1 with ISNAD_AUTH off: the x-role header is trusted, so ANY client that can reach this "
+                "port can act as admin and import datasets. Bind to 127.0.0.1 only, or enable ISNAD_AUTH=1.")
         try:
             from engine.api import ingest_routes
 
-            def _ingest_model():
-                try:
-                    return app.state.agent_model_factory(make_principal("admin", "ingest", comp))
-                except Exception:  # noqa: BLE001
-                    return None
+            def _ingest_model(principal=None):
+                """factory(principal) -> model client; raises when no model is configured (the route answers 503)."""
+                return app.state.agent_model_factory(principal or make_principal("admin", "ingest", comp))
 
             app.include_router(ingest_routes.make_router(get_principal, wconn, ontology=om, schema_name=schema,
                                                         model_factory=_ingest_model))

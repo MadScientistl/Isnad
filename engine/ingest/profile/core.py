@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass, field
 from itertools import combinations
 
-from ..names import clean_text, safe_prop, safe_type
+from ..names import INJECTION_RE, clean_text, safe_prop, safe_type
 from ..sources.base import Source, SourceError, SourceTable
 from . import textsim
 from .caps import Caps
@@ -18,10 +18,6 @@ BLOCK = 2000
 KEY_TYPES = ("int", "string", "timestamp")
 LAT_RE = re.compile(r"^(?:(?P<pre>.*?)_)?(?P<role>lat|latitude)(?:_(?P<post>.*))?$")
 LON_RE = re.compile(r"^(?:(?P<pre>.*?)_)?(?P<role>lon|lng|long|longitude)(?:_(?P<post>.*))?$")
-INJECTION_RE = re.compile(
-    r"(ignore (all |any )?(the )?(previous|prior|above)|disregard (the )?(previous|above)|system prompt|"
-    r"you are now|new instructions|reveal your|as an ai|<\s*/?\s*(system|assistant|tool)|assistant:|BEGIN (SYSTEM|INSTRUCTION))",
-    re.I)
 HASH_FIELD = "profile_hash"
 
 

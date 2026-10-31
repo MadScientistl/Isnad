@@ -24,8 +24,9 @@ def test_non_admin_is_404_and_disabled_gate(h, monkeypatch):
     monkeypatch.delenv("ISNAD_ALLOW_IMPORT")
     r = h.client.get("/ingest/sessions")
     assert r.status_code == 404 and r.json()["code"] == "import_disabled"
-    monkeypatch.setenv("ISNAD_AUTH", "1")                    # auth on: the allow flag is not needed
-    assert h.client.get("/ingest/sessions").status_code == 200
+    monkeypatch.setenv("ISNAD_AUTH", "1")                    # M3: the allow flag is needed in every mode
+    r = h.client.get("/ingest/sessions")
+    assert r.status_code == 404 and r.json()["code"] == "import_disabled"
 
 
 def test_upload_size_limit_413(h, monkeypatch):
@@ -122,7 +123,8 @@ def test_failure_mid_import_leaves_nothing(make_harness):
     c = h.conn()
     try:
         assert c.execute("SELECT 1 FROM pg_namespace WHERE nspname=%s", (schema,)).fetchone() is None
-        assert c.execute("SELECT count(*) FROM audit_event WHERE name='import_dataset'").fetchone()[0] == 0
+        assert c.execute("SELECT count(*) FROM audit_event WHERE name='import_dataset' AND params->>'decision_id' = %s",
+                         (did,)).fetchone()[0] == 0
     finally:
         c.close()
     assert not h.ws.exists() or not list(h.ws.iterdir())

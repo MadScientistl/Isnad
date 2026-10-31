@@ -16,6 +16,11 @@ from .base import (MAX_CELL_CHARS, ColumnInfo, Source, SourceError, SourceLimits
 csv.field_size_limit(MAX_CELL_CHARS * 4)
 
 SNIFF_BYTES = 256 * 1024
+# A record is read through a line iterator that refuses absurd lines before the csv module splits them: a few MB of
+# bare delimiters would otherwise become millions of fields in one list. Quoted multi-line fields stay bounded by
+# the csv field size limit.
+MAX_LINE_CHARS = 1 << 20          # 1 Mi characters per physical line
+MAX_DELIMS_PER_LINE = 5000        # more separators than any allowed column count (profiler caps are far smaller)
 DELIMS = [",", ";", "\t", "|"]
 
 
@@ -41,6 +46,17 @@ class _Limited(io.RawIOBase):
             self._inner.close()
         finally:
             super().close()
+
+
+def _bounded_lines(txt, delim: str, name: str):
+    """Yield physical lines of ``txt``; fail fast on a line that is too long or has too many separators."""
+    while True:
+        line = txt.readline(MAX_LINE_CHARS + 1)
+        if not line:
+            return
+        if len(line) > MAX_LINE_CHARS or line.count(delim) > MAX_DELIMS_PER_LINE:
+            raise SourceError(f"{clean_text(name, 40)}: a record is too wide (line or field count limit)")
+        yield line
 
 
 def sniff_encoding(head: bytes) -> str:
@@ -115,7 +131,7 @@ class CsvTable(SourceTable):
             def __enter__(s):
                 raw = io.BufferedReader(_Limited(outer._open(), outer._limits.max_bytes))
                 s.txt = io.TextIOWrapper(raw, encoding=outer.encoding, errors="replace", newline="")
-                return csv.reader(s.txt, delimiter=outer.delimiter)
+                return csv.reader(_bounded_lines(s.txt, outer.delimiter, outer.name), delimiter=outer.delimiter)
 
             def __exit__(s, *a):
                 s.txt.close()

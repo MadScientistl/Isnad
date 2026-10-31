@@ -181,9 +181,28 @@ def recent_sessions(conn, user: str, hours: int = 24) -> int:
                       "make_interval(hours => %s)", (user, hours))["n"]
 
 
+_OPEN_RESERVATION = ("NOT (s.status = 'reserved' AND EXISTS (SELECT 1 FROM ingest_spend t WHERE t.job_id = s.job_id "
+                     "AND t.status <> 'reserved'))")
+
+
 def daily_cost(conn, user: str) -> float:
-    return float(_one(conn, "SELECT coalesce(sum(cost_usd),0) AS usd FROM ingest_proposal WHERE created_by = %s AND "
-                            "created_at > now() - interval '24 hours'", (user,))["usd"])
+    """USD spent by ``user`` in the last 24 h: settled model jobs (success, failure, cancel, error) plus open reservations."""
+    return float(_one(conn, "SELECT coalesce(sum(s.cost_usd),0) AS usd FROM ingest_spend s WHERE s.username = %s AND "
+                            "s.at > now() - interval '24 hours' AND " + _OPEN_RESERVATION, (user,))["usd"])
+
+
+def daily_cost_global(conn) -> float:
+    return float(_one(conn, "SELECT coalesce(sum(s.cost_usd),0) AS usd FROM ingest_spend s WHERE "
+                            "s.at > now() - interval '24 hours' AND " + _OPEN_RESERVATION)["usd"])
+
+
+def lock_spend(conn) -> None:
+    conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", ("ingest-spend",))
+
+
+def record_spend(conn, user: str, job_id: str, cost_usd: float, status: str) -> None:
+    conn.execute("INSERT INTO ingest_spend (id, username, job_id, cost_usd, status) VALUES (%s,%s,%s,%s,%s)",
+                 (uuid.uuid4(), user, str(job_id), round(max(0.0, float(cost_usd)), 6), status))
 
 
 def insert_proposal(conn, session_id, user: str, kind: str, proposal: dict, yaml_text: str, mapping: dict,
@@ -223,6 +242,11 @@ def insert_decision(conn, proposal_id, decision: str, approver: str, approver_ro
 
 def get_decision(conn, decision_id) -> dict | None:
     return _one(conn, "SELECT * FROM ingest_decision WHERE id = %s", (decision_id,))
+
+
+def latest_rejection_after(conn, proposal_id, at) -> bool:
+    return bool(_one(conn, "SELECT 1 AS x FROM ingest_decision WHERE proposal_id = %s AND decision = 'rejected' AND "
+                           "at > %s LIMIT 1", (proposal_id, at)))
 
 
 def decisions_for(conn, proposal_id) -> list[dict]:

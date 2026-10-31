@@ -28,6 +28,8 @@ from typing import Annotated, Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
 
+from engine.ingest import names as _names
+
 PROPOSAL_VERSION = 1
 SCALAR_TYPES = ("string", "int", "float", "bool", "timestamp", "point", "linestring")
 GENERIC = ("create_object", "update_object", "delete_object", "create_link", "end_link")
@@ -46,6 +48,21 @@ _TRANSFORM_RE = re.compile(
     r"^(none|int|float|bool|geojson|timestamp:[^\x00-\x1f\x7f]{1,40}|enum_map:.{1,4000}|"
     r"point\(t[0-9]{1,4}\.c[0-9]{1,4},t[0-9]{1,4}\.c[0-9]{1,4}\))$", re.DOTALL)
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+_LOC_OK = re.compile(r"[A-Za-z_0-9]{1,40}")
+
+
+def summarize_validation_error(e: BaseException) -> str:
+    """Pydantic error codes and field paths only: the library's own text quotes the offending input value."""
+    try:
+        parts = []
+        for er in e.errors()[:3]:                       # type: ignore[attr-defined]
+            loc = ".".join(str(x) if _LOC_OK.fullmatch(str(x)) else "?" for x in er.get("loc", ())[:6])
+            parts.append(f"{loc or '?'}: {str(er.get('type', 'invalid'))[:40]}")
+        return "; ".join(parts) or type(e).__name__
+    except Exception:  # noqa: BLE001
+        return type(e).__name__
 
 
 class ProposalError(ValueError):
@@ -69,8 +86,10 @@ def _canon(kind: str, v: str) -> str:
 
 
 def _text(v: str, n: int, *, allow_empty=True) -> str:
-    if _CTRL.search(v):
+    if _CTRL.search(v) or _names.has_hidden_chars(v):
         raise ValueError("control characters are not allowed")
+    if _names.looks_injected(v):
+        raise ValueError("instruction-like text is not allowed here")
     if len(v) > n:
         raise ValueError(f"too long (max {n})")
     if not allow_empty and not v.strip():
@@ -136,6 +155,8 @@ class PropertyP(_Strict):
                     isinstance(a, str) and isinstance(b, str) and len(a) <= 80 and len(b) <= MAX_ENUM_LEN
                     and not _CTRL.search(a + b) for a, b in m.items()):
                 raise ValueError("enum_map must be a JSON object of short strings")
+            if any(_names.has_hidden_chars(b) or _names.looks_injected(b) for a, b in m.items()):
+                raise ValueError("enum_map values must not contain hidden characters or instruction-like text")
         return v
 
     @field_validator("label")
@@ -490,7 +511,7 @@ def _resolve(proposal: Proposal, profile) -> dict:
                 vals = set(p.type.enum)
                 for v in [a.params["value"], *(a.params.get("from") or [])]:
                     if v not in vals:
-                        errs.append(f"{w}: {v!r} is not a value of {t.name}.{p.name}")
+                        errs.append(f"{w}: a value is not in the enum of {t.name}.{p.name}")
         else:
             ln = next((l for l in proposal.linkTypes if l.name == a.params["link"]), None)
             if ln is None:
@@ -521,6 +542,8 @@ def _prop_yaml(p: PropertyP):
 def _display_name(profile: dict) -> str:
     n = str((profile.get("source") or {}).get("name") or "")
     n = _CTRL.sub(" ", n).strip()[:80]
+    if _names.has_hidden_chars(n) or _names.looks_injected(n):    # reaches the agent prompt: never instruction-like
+        return "Imported ontology"
     return n or "Imported ontology"
 
 
@@ -574,18 +597,17 @@ def to_yaml(proposal: Proposal, profile, *, slug: str | None = None) -> tuple[st
 
     roles: dict[str, Any] = {}
     all_types_rw = {t: {"read": True, "write": True} for t in sorted(types)}
-    admin_decl = next((r for r in proposal.roles if r.name == "admin"), None)
     admin_agent: dict[str, Any] = {"tools": [*READ_TOOLS]}
     if declared:
         admin_agent = {"allowlist": declared, "tools": [*READ_TOOLS, "propose_action"],
                        "instructions": "Administrator assistant. Prefer read-only analysis; propose only when "
                                        "evidence is clear. You cannot approve your own proposals."}
-    roles["admin"] = {"description": (admin_decl.description if admin_decl and admin_decl.description
-                                      else "Administrator. Full access, approves every approval-gated action."),
+    # Role and action descriptions are fixed template text: model-written prose would reach the runtime agent's prompt.
+    roles["admin"] = {"description": "Administrator. Full access, approves every approval-gated action.",
                       "types": "all", "links": "all", "actions": "all", "approves": "all", "agent": admin_agent}
     for n in sorted(rroles):
         r = rroles[n]
-        d = {"description": r.description or f"{r.access.capitalize()} access to all data."}
+        d = {"description": f"{r.access.capitalize()} access to all data."}
         if r.access == "write":
             d["types"] = {t: {"read": True, "write": True} for t in sorted(types)}
             d["links"] = sorted(proposal_l.name for proposal_l in proposal.linkTypes)
@@ -617,14 +639,20 @@ def to_yaml(proposal: Proposal, profile, *, slug: str | None = None) -> tuple[st
         from engine.compiler import CompiledOntology, OntologyError
         CompiledOntology.from_text(text)
     except Exception as e:  # noqa: BLE001 - OntologyError or anything the compiler raises
-        raise ProposalError(f"generated ontology does not compile: {e}") from e
+        raise ProposalError(f"generated ontology does not compile ({type(e).__name__})") from e
     return text, _mapping(proposal, prof, ix)
+
+
+_ACTION_TEXT = {"update_props": "Update properties of a {type} (proposed, needs approval).",
+                "set_status": "Change the status of a {type} (proposed, needs approval).",
+                "link": "Link a {type} to another object (proposed, needs approval).",
+                "unlink": "End a link from a {type} (proposed, needs approval)."}
 
 
 def _declared_action(a: ActionP, types: dict[str, ObjectTypeP], proposal: Proposal, exec_roles: list[str]) -> dict:
     t = types[a.type]
     props = {p.name: p for p in t.properties}
-    d: dict[str, Any] = {"description": a.description or f"{a.kind} on {a.type}"}
+    d: dict[str, Any] = {"description": _ACTION_TEXT[a.kind].format(type=a.type)}
     base = {"approval": {"approvers": ["admin"]}, "roles": list(exec_roles)}
     if a.kind == "update_props":
         params = {"id": f"uuid({a.type})!"}

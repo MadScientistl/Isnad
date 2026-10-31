@@ -220,3 +220,55 @@ def test_named_sources_registry(tmp_path):
     with reg["local"].open() as s:
         assert s.kind == "sqlite" and s.name == "local"
     assert load_named_sources({}) == {}
+
+
+# ------------------------------------------------------------------ L1: row-width bomb
+class _EndlessCommas(io.RawIOBase):
+    """Binary stream: a normal header, then one record made only of delimiters, without end (never materialised)."""
+
+    def __init__(self, header: bytes = b"a,b\n", total: int = 400_000_000):
+        self._head, self._left = header, total
+
+    def readable(self):
+        return True
+
+    def readinto(self, b):
+        if self._head:
+            n = min(len(b), len(self._head))
+            b[:n] = self._head[:n]
+            self._head = self._head[n:]
+            return n
+        n = min(len(b), self._left)
+        b[:n] = b"," * n
+        self._left -= n
+        return n
+
+
+def _bomb_table(header=b"a,b\n"):
+    from engine.ingest.sources.csv_source import CsvTable
+    return CsvTable("bomb", lambda: io.BufferedReader(_EndlessCommas(header)), SourceLimits(max_bytes=1 << 30))
+
+
+def test_csv_record_with_millions_of_fields_fails_fast_and_bounded():
+    import time
+    import tracemalloc
+    tracemalloc.start()
+    t0 = time.monotonic()
+    t = _bomb_table()
+    with pytest.raises(SourceError):
+        list(t.rows())
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    assert peak < 64 * 1024 * 1024 and time.monotonic() - t0 < 10
+
+
+def test_csv_header_bomb_fails_at_open():
+    with pytest.raises(SourceError):
+        _bomb_table(header=b"")
+
+
+def test_zip_member_row_bomb_is_rejected(tmp_path):
+    z = make_zip([("t.csv", "a,b\n" + "," * 300_000 + "\n1,2\n")], zipfile.ZIP_STORED)
+    with open_source("zip", z, name="z.zip") as s:
+        with pytest.raises(SourceError):
+            list(s.tables()[0].rows())

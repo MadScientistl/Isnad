@@ -101,7 +101,7 @@ def _drop(name: str, dsn: str | None = None) -> str | None:
             c.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(name)))
             c.commit()
     except Exception as e:  # noqa: BLE001
-        return _s(f"{type(e).__name__}: {e}", 160)
+        return _cls(e)
     return None
 
 
@@ -223,11 +223,13 @@ class _Rep:
 
 
 def _pyd_msg(e) -> str:
-    try:
-        errs = e.errors()
-        return "; ".join(f"{'.'.join(str(x) for x in er.get('loc', ()))[:60]}: {er.get('msg', '')}" for er in errs[:3])
-    except Exception:  # noqa: BLE001
-        return type(e).__name__
+    from .proposal import summarize_validation_error
+    return summarize_validation_error(e)
+
+
+def _cls(e: BaseException) -> str:
+    """Stored/fed-back description of an unexpected exception: the class name only, never its text."""
+    return type(e).__name__
 
 
 def validate(profile, proposal, source, *, caps=None, namespace=None, slug=None, seed: int = 1,
@@ -242,7 +244,7 @@ def validate(profile, proposal, source, *, caps=None, namespace=None, slug=None,
     except _Budget:
         rep.add("time_budget", False, round(time.monotonic() - t0, 1), budget, "validation exceeded its time budget")
     except Exception as e:  # noqa: BLE001
-        rep.add("internal_error", False, None, None, f"{type(e).__name__}: {e}")
+        rep.add("internal_error", False, None, None, f"validation failed internally ({_cls(e)})")
     return ValidationReport(rep.ok, rep.checks, stats, time.monotonic() - t0)
 
 
@@ -268,9 +270,12 @@ def _run(profile, proposal, source, caps, namespace, slug, seed, dsn, rep: _Rep,
         mapping = M.enrich_mapping(mapping, yaml_text)
         ddl = comp.ddl()
     except Exception as e:  # noqa: BLE001
-        msg = str(e).splitlines()
-        rep.add("schema_ok", False, 0, 1, "proposal does not resolve: " + (msg[0] if msg else type(e).__name__),
-                [x.strip() for x in msg[1:4]])
+        if isinstance(e, (ProposalError, M.MappingError)):    # built by us from ids and canonical identifiers
+            msg = str(e).splitlines()
+            rep.add("schema_ok", False, 0, 1, "proposal does not resolve: " + (msg[0] if msg else _cls(e)),
+                    [x.strip() for x in msg[1:4]])
+        else:
+            rep.add("schema_ok", False, 0, 1, f"proposal does not compile ({_cls(e)})")
         return
     rep.add("schema_ok", True, 1, 1, "proposal resolves against the profile and compiles")
     # RDF predicates are global: a property and a link (or inverse) sharing a name would collide in the graph.
@@ -281,6 +286,8 @@ def _run(profile, proposal, source, caps, namespace, slug, seed, dsn, rep: _Rep,
     rep.add("name_collisions", not clash, len(clash), 0,
             "a property and a link share a name (they map to the same RDF predicate); rename one" if clash
             else "property and link names are distinct", clash)
+    ok, detail = codegen_check(comp)
+    rep.add("codegen_ok", ok, int(ok), 1, detail)
     if time.monotonic() > deadline:
         raise _Budget()
 
@@ -297,7 +304,7 @@ def _run(profile, proposal, source, caps, namespace, slug, seed, dsn, rep: _Rep,
             apply_schema(conn, ddl)
             conn.commit()
         except Exception as e:  # noqa: BLE001
-            rep.add("ddl_ok", False, 0, 1, f"DDL failed: {type(e).__name__}: {e}")
+            rep.add("ddl_ok", False, 0, 1, f"DDL failed ({_cls(e)})")
             return
         rep.add("ddl_ok", True, 1, 1, "generated schema applies")
         if time.monotonic() > deadline:
@@ -313,6 +320,46 @@ def _run(profile, proposal, source, caps, namespace, slug, seed, dsn, rep: _Rep,
             err = _drop(name, dsn)
             stats["scratch_cleanup_error"] = err
             stats["scratch_dropped"] = err is None
+
+
+_TS_DECL = re.compile(r"^export (?:interface|type|const|class|function) (\w+)", re.M)
+
+
+def codegen_check(comp) -> tuple[bool, str]:
+    """The workspace process compiles pydantic models and the TS SDK from this ontology at startup: do it here first,
+    so a name that breaks code generation (Python/pydantic reserved names, duplicate TS declarations ...) fails
+    validation instead of the workspace. Uses the compiler's own generators; the generated Python is exec'd in a
+    private throwaway module (the same thing ``CompiledOntology.pydantic_models`` does)."""
+    import sys
+    import types
+    try:
+        src = comp.pydantic_source()
+        modname = "isnad_models_chk_" + secrets.token_hex(4)
+        mod = types.ModuleType(modname)
+        sys.modules[modname] = mod
+        try:
+            exec(compile(src, f"<{modname}>", "exec"), mod.__dict__)   # noqa: S102 - compiler output, see docstring
+            for cls in getattr(mod, "OBJECT_MODELS", {}).values():
+                cls.model_json_schema()
+            for tname, cls in getattr(mod, "OBJECT_MODELS", {}).items():
+                if cls.__name__ != tname:
+                    return False, "a type name is shadowed in the generated Python module"
+                for f in cls.model_fields:
+                    if f.startswith("model_"):
+                        return False, "a property name uses a reserved pydantic namespace"
+        finally:
+            sys.modules.pop(modname, None)
+    except Exception as e:  # noqa: BLE001
+        return False, f"Python models do not build ({_cls(e)}); a type or property name is likely reserved"
+    try:
+        ts = comp.ts_sdk()
+        decls = _TS_DECL.findall(ts)
+        dup = {d for d in decls if decls.count(d) > 1}
+        if dup:
+            return False, "TypeScript declarations collide (a type name clashes with a generated name)"
+    except Exception as e:  # noqa: BLE001
+        return False, f"TypeScript SDK does not build ({_cls(e)})"
+    return True, "pydantic models and TypeScript SDK generate"
 
 
 def _sweep_quietly(conn):
@@ -344,13 +391,13 @@ def _load_and_check(comp, mapping, source, caps, seed, conn, rep: _Rep, stats: d
         conn.commit()
     except M.MappingError as e:
         conn.rollback()
-        rep.add("source_ok", False, 0, 1, f"mapping does not fit the source: {e}")
+        rep.add("source_ok", False, 0, 1, f"mapping does not fit the source ({_cls(e)}): {clean_text(e, 120)}")
         return
     except _Budget:
         raise
     except psycopg.Error as e:
         conn.rollback()
-        rep.add("load_ok", False, 0, 1, f"database refused the data: {type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}")
+        rep.add("load_ok", False, 0, 1, f"database refused the data ({_cls(e)})")
         return
     sd = ms.to_dict()
     stats.update({"rows_loaded": {t: ms.types[t].rows_loaded for t in types},
@@ -435,7 +482,7 @@ def _semantic_checks(comp, mapping, ms, conn, rep: _Rep, stats: dict, th: dict, 
             store = open_store(None, cfg)
             rebuild(conn, store, cfg)
         except Exception as e:  # noqa: BLE001
-            rep.add("shacl_conforms", False, None, None, f"graph build failed: {type(e).__name__}: {e}")
+            rep.add("shacl_conforms", False, None, None, f"graph build failed ({_cls(e)})")
             rep.add("reasoner_consistent", False, None, None, "skipped (graph build failed)")
             return
         if time.monotonic() > deadline:
@@ -462,7 +509,7 @@ def _semantic_checks(comp, mapping, ms, conn, rep: _Rep, stats: dict, th: dict, 
                     ex)
         except Exception as e:  # noqa: BLE001
             conn.rollback()
-            rep.add("shacl_conforms", False, None, None, f"SHACL run failed: {type(e).__name__}: {e}")
+            rep.add("shacl_conforms", False, None, None, f"SHACL run failed ({_cls(e)})")
         if time.monotonic() > deadline:
             raise _Budget()
         # reasoner
@@ -482,4 +529,4 @@ def _semantic_checks(comp, mapping, ms, conn, rep: _Rep, stats: dict, th: dict, 
                     ("inconsistent: owl:Nothing instances derived" if inconsistent else
                      f"{mr.backend}: {mr.inferred_triples} inferred for {asserted} asserted triples"))
         except Exception as e:  # noqa: BLE001
-            rep.add("reasoner_consistent", False, None, None, f"reasoner failed: {type(e).__name__}: {e}")
+            rep.add("reasoner_consistent", False, None, None, f"reasoner failed ({_cls(e)})")

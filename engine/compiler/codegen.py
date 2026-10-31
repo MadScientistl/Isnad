@@ -75,17 +75,17 @@ def ts_source(o: Ontology) -> str:
         out.append(f"/** Writable properties of {n}. */")
         out.append(f"export interface {n}Props {{")
         for p in o.object_types[n].properties:
-            t = " | ".join(repr(v).replace("'", '"') for v in p.enum) if p.type == "enum" else TS[p.type]
+            t = " | ".join(json.dumps(v) for v in p.enum) if p.type == "enum" else TS[p.type]
             out.append(f"  {p.name}{'' if p.required else '?'}: {t};")
         out += ["}", "", f"export interface {n} extends {n}Props {{",
                 "  id: string;", "  valid_from: string;", "  valid_to: string | null;",
                 "  changed_by: string;", "}", ""]
     types = sorted(o.object_types)
     links = sorted(o.link_types)
-    out.append("export type ObjectTypeName = " + (" | ".join(f'"{t}"' for t in types) or "never") + ";")
-    out.append("export type LinkTypeName = " + (" | ".join(f'"{t}"' for t in links) or "never") + ";")
+    out.append("export type ObjectTypeName = " + (" | ".join(json.dumps(t) for t in types) or "never") + ";")
+    out.append("export type LinkTypeName = " + (" | ".join(json.dumps(t) for t in links) or "never") + ";")
     acts = sorted(o.actions)
-    out.append("export type ActionName = " + (" | ".join(f'"{a}"' for a in acts) or "never") + ";")
+    out.append("export type ActionName = " + (" | ".join(json.dumps(a) for a in acts) or "never") + ";")
     out.append("export interface ActionParams {")
     for a in acts:
         ps = []
@@ -135,7 +135,7 @@ def _agent_meta(o: Ontology) -> dict:
 
 def _ts_governance(o: Ontology) -> list[str]:
     roles = sorted(o.roles)
-    out = ["export type RoleName = " + (" | ".join(f'"{r}"' for r in roles) or "never") + ";",
+    out = ["export type RoleName = " + (" | ".join(json.dumps(r) for r in roles) or "never") + ";",
            "/** Roles a user may pick in the UI (the system role `sim` is excluded). */",
            "export const SELECTABLE_ROLES: RoleName[] = " + json.dumps([r for r in roles if r != "sim"]) + ";",
            "export interface ActionParamMeta { name: string; type: string; ref: string | null; required: boolean }",

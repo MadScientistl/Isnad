@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 
-from ..names import clean_text, safe_link, safe_prop
+from ..names import clean_text, looks_injected, safe_link, safe_prop
 from . import textsim
 
 TYPE_MAP = {"int": "int", "float": "float", "bool": "bool", "timestamp": "timestamp", "string": "string"}
@@ -53,13 +53,13 @@ def baseline_proposal(profile: dict) -> dict:
                 transform = "enum_map:" + json.dumps(mapping, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
                 ptype = {"enum": sorted(mapping.values())}
             props.append({"name": safe_prop(c["ident"], taken), "type": ptype, "required": c["id"] in keyset and c["null_rate"] == 0.0,
-                          "column": c["id"], "transform": transform, "label": clean_text(c["name"], 64)})
+                          "column": c["id"], "transform": transform, "label": _label(c["name"], c["id"])})
         for c in t["columns"]:
             if c["geo"] and c["geo"]["role"] == "lat" and c["geo"]["pair"]:
                 props.append({"name": safe_prop("location", taken), "type": "point", "required": False, "column": None,
                               "transform": f"point({c['id']},{c['geo']['pair']})", "label": "location"})
                 break
-        object_types.append({"name": t["ident"], "label": clean_text(t["name"], 64), "extends": None, "key": key,
+        object_types.append({"name": t["ident"], "label": _label(t["name"], t["id"]), "extends": None, "key": key,
                              "source_table": tid, "properties": props})
 
     # A link and a property share one RDF predicate (namespace + name): link names must never equal any property name.
@@ -121,6 +121,12 @@ def baseline_proposal(profile: dict) -> dict:
     }
 
 
+def _label(name: str, fallback: str) -> str:
+    """Display label from the source name; instruction-like text is replaced by the column / table id."""
+    lab = clean_text(name, 64)
+    return fallback if looks_injected(lab) else lab
+
+
 def _prop_type(c: dict, enum_ok: bool = True):
     t = c["type"]
     if t == "geojson":
@@ -130,7 +136,8 @@ def _prop_type(c: dict, enum_ok: bool = True):
         if gt == "LineString":
             return "linestring", "geojson"
         return "string", "none"
-    if enum_ok and c["enum_candidate"] and t == "string" and len(c["enum_candidate"]) >= 2:
+    if (enum_ok and c["enum_candidate"] and t == "string" and len(c["enum_candidate"]) >= 2
+            and not any(looks_injected(v) for v in c["enum_candidate"])):
         return {"enum": list(c["enum_candidate"])}, "none"
     if t == "timestamp":
         return "timestamp", f"timestamp:{c['format'] or 'iso8601'}"

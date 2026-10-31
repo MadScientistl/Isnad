@@ -20,8 +20,9 @@ log = logging.getLogger("isnad.ingest_jobs")
 MAX_STREAMS_PER_JOB = 4
 MAX_STREAMS_GLOBAL = 16
 KEEP_FINISHED = 200
-MAX_EVENTS = 2000
-PAYLOAD_CHARS = 4000
+KEEP_PER_USER = 50
+MAX_EVENTS = 500
+PAYLOAD_CHARS = 2000
 
 
 class JobLimit(Exception):
@@ -41,7 +42,8 @@ def limits() -> dict:
     return {"max_concurrent": _env("ISNAD_AGENT_MAX_CONCURRENT", 1, int),
             "runs_per_minute": _env("ISNAD_AGENT_RUNS_PER_MIN", 6, int),
             "max_global": _env("ISNAD_AGENT_MAX_GLOBAL", 4, int),
-            "daily_usd": _env("ISNAD_AGENT_DAILY_USD", 5.0, float)}
+            "daily_usd": _env("ISNAD_AGENT_DAILY_USD", 5.0, float),
+            "global_daily_usd": _env("ISNAD_INGEST_GLOBAL_DAILY_USD", _env("ISNAD_AGENT_DAILY_USD", 5.0, float) * 2, float)}
 
 
 def _clip(payload):
@@ -54,8 +56,8 @@ def _clip(payload):
 
 
 class Job:
-    def __init__(self, kind: str, user: str):
-        self.id = str(uuid.uuid4())
+    def __init__(self, kind: str, user: str, job_id: str | None = None):
+        self.id = job_id or str(uuid.uuid4())
         self.kind, self.user = kind, user
         self.status = "queued"            # queued | running | done | failed | cancelled
         self.events: list[dict] = []
@@ -109,9 +111,20 @@ class JobRegistry:
         done = [j for j in self.jobs.values() if j.finished]
         for j in sorted(done, key=lambda j: j.created)[: max(0, len(done) - KEEP_FINISHED)]:
             self.jobs.pop(j.id, None)
+        by_user: dict[str, list[Job]] = {}
+        for j in self.jobs.values():
+            if j.finished:
+                by_user.setdefault(j.user, []).append(j)
+        for js in by_user.values():
+            for j in sorted(js, key=lambda j: j.created)[: max(0, len(js) - KEEP_PER_USER)]:
+                self.jobs.pop(j.id, None)
 
-    def get(self, job_id: str) -> Job | None:
-        return self.jobs.get(job_id)
+    def get(self, job_id: str, user: str | None = None) -> Job | None:
+        """The job, or None. With ``user`` only the job's owner gets it (everyone else sees "not found")."""
+        j = self.jobs.get(job_id)
+        if j is not None and user is not None and j.user != user:
+            return None
+        return j
 
     def completed(self, kind: str, user: str, *, result: dict | None = None, proposal_id: str | None = None,
                   cost_usd: float = 0.0) -> Job:
@@ -125,7 +138,8 @@ class JobRegistry:
             self._evict()
         return j
 
-    def start(self, kind: str, user: str, work: Callable[[Job], None], *, lim: dict | None = None) -> Job:
+    def start(self, kind: str, user: str, work: Callable[[Job], None], *, lim: dict | None = None,
+              job_id: str | None = None) -> Job:
         lim = lim or limits()
         now = time.monotonic()
         with self.lock:
@@ -140,7 +154,7 @@ class JobRegistry:
             if len(dq) >= lim["runs_per_minute"]:
                 raise JobLimit("too many jobs started this minute", max(1, int(60 - (now - dq[0]))))
             dq.append(now)
-            job = Job(kind, user)
+            job = Job(kind, user, job_id)
             self.jobs[job.id] = job
             self._evict()
 
