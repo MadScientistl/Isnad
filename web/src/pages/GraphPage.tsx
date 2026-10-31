@@ -5,7 +5,7 @@ import { useApp, useAsOf, usePolled, useTypeStyles, fmtT } from "../store";
 import { ALERT_STATUS } from "../palette";
 import { EmptyState, ErrorBanner, Spinner } from "../ui";
 
-const INFERRED = "#7b3fa0";
+const INFERRED = "#c79bff";
 const nm = (o: any, id: string) => (o && (o.name || o.ref || o.kind)) || id.slice(0, 8);
 const emph = (s: string | null) => !!s && ALERT_STATUS.has(s);
 
@@ -40,13 +40,13 @@ export default function GraphPage() {
     ];
     const cy = cytoscape({ container: ref.current, elements: els, layout: { name: "cose", animate: false, nodeRepulsion: () => 40000, idealEdgeLength: () => 130, nodeOverlap: 30, padding: 30 } as any,
       style: [
-        { selector: "node", style: { label: "data(label)", "font-size": 10, "background-color": "data(color)", color: "#1c2024", "text-valign": "bottom", "text-margin-y": 3, "border-width": 1, "border-color": "#fff", "text-background-color": "#fff", "text-background-opacity": 0.75, "text-background-padding": "1px" } },
+        { selector: "node", style: { label: "data(label)", "font-size": 10, "background-color": "data(color)", color: "#e6eeee", "text-valign": "bottom", "text-margin-y": 3, "border-width": 1, "border-color": "#02090b", "text-background-color": "#02090b", "text-background-opacity": 0.75, "text-background-padding": "1px" } },
         { selector: "node", style: { shape: "data(shape)" as any } },
         { selector: "node[emph = 1]", style: { "border-width": 4, "border-color": "#D55E00", width: 30, height: 30, "font-weight": "bold" } },
         { selector: "node[status = 'delayed']", style: { "border-color": "#E69F00" } },
         { selector: "node[status = 'flagged']", style: { "border-color": "#CC1F8A" } },
-        { selector: "node[centre = 1]", style: { width: 38, height: 38, "border-width": 4, "border-color": "#0f172a" } },
-        { selector: "edge", style: { label: "data(label)", "font-size": 8, color: "#334155", width: 1.6, "line-style": "solid", "line-color": "#334155", "target-arrow-shape": "triangle", "target-arrow-color": "#334155", "curve-style": "bezier", "text-background-color": "#fff", "text-background-opacity": 0.8, "text-background-padding": "1px" } },
+        { selector: "node[centre = 1]", style: { width: 38, height: 38, "border-width": 4, "border-color": "#d0f94a" } },
+        { selector: "edge", style: { label: "data(label)", "font-size": 8, color: "#a7b3b1", width: 1.6, "line-style": "solid", "line-color": "#4a5c5c", "target-arrow-shape": "triangle", "target-arrow-color": "#4a5c5c", "curve-style": "bezier", "text-background-color": "#02090b", "text-background-opacity": 0.8, "text-background-padding": "1px" } },
         { selector: "edge[inferred = 1]", style: { "line-style": "dashed", "line-dash-pattern": [6, 4], "line-color": INFERRED, "target-arrow-color": INFERRED, color: INFERRED, width: 2 } },
       ] });
     cy.on("tap", "node", (e) => { const d2 = e.target.data(); if (!d2.centre) recRef.current(d2.type, d2.id); });
@@ -81,7 +81,7 @@ export default function GraphPage() {
         <span><i />asserted edge</span>
         <span><i className="dash" />inferred (reasoner, current state only){g.data ? `: ${nInf} shown` : ""}</span>
         {TYPES.map((t) => <span key={t}><i className="sw circle" style={{ background: styles[t]?.color }} />{t}</span>)}
-        <span><i className="sw circle" style={{ background: "#fff", border: "3px solid #D55E00" }} />needs attention, e.g. closed, delayed, failed (thick border, status in label)</span>
+        <span><i className="sw circle" style={{ background: "#02090b", border: "3px solid #D55E00" }} />needs attention, e.g. closed, delayed, failed (thick border, status in label)</span>
         <span className="muted">Click a node to re-centre.</span>
       </div>
     </div>

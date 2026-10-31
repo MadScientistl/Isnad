@@ -1,6 +1,7 @@
 import { createRoot } from "react-dom/client";
 import "maplibre-gl/dist/maplibre-gl.css";
 import "./style.css";
+import "./theme.css";
 import { MOCK, BASE, installScenarioFetch } from "./api";
 
 async function boot() {
