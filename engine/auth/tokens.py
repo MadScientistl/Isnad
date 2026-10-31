@@ -45,6 +45,9 @@ def verify(secret: bytes, token: str, *, now: float | None = None) -> dict | Non
         si = f"{parts[0]}.{parts[1]}"
         if not hmac.compare_digest(_sig(secret, si), _unb64(parts[2])):
             return None
+        # canonical encoding only: trailing base64 bits are otherwise malleable (same bytes, different token text)
+        if _b64(_unb64(parts[2])) != parts[2] or _b64(_unb64(parts[1])) != parts[1]:
+            return None
         d = json.loads(_unb64(parts[1]))
         if not (isinstance(d, dict) and isinstance(d.get("u"), str) and isinstance(d.get("r"), str)
                 and isinstance(d.get("jti"), str) and type(d.get("exp")) is int and type(d.get("iat")) is int):

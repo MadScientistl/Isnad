@@ -199,20 +199,6 @@ def _steps(d: Demo, ctx: Ctx, a, model_mode: str, tmp: Path, admin) -> None:
 
     state: dict = {}
 
-    # Compat shim: engine/api/main.py builds `_ingest_model()` with no parameter while ingest_routes calls
-    # `model_factory(principal)`, so model-mode proposals fail with 503 until that is fixed there. Accept both.
-    from engine.api import ingest_routes
-    _orig_make_router = ingest_routes.make_router
-
-    def _make_router(*args, model_factory=None, **kw):
-        def mf(p=None):
-            try:
-                return model_factory(p)
-            except TypeError:
-                return model_factory()
-        return _orig_make_router(*args, model_factory=mf if model_factory else None, **kw)
-    ingest_routes.make_router = _make_router
-
     # ---------------------------------------------------------------- (a)
     def step_seed_and_sim():
         from sim.runner import SimRunner
@@ -248,7 +234,7 @@ def _steps(d: Demo, ctx: Ctx, a, model_mode: str, tmp: Path, admin) -> None:
 
     def mk_client():
         def agent_model(p):
-            if p.user == "ingest":              # the ontology generator (ingest router asks with this identity)
+            if p.role == "admin" and "ingest_model" in state:   # the ontology generator (ingest router asks as the admin)
                 return state["ingest_model"]()
             if a.live:
                 from agent.model_anthropic import AnthropicModel
@@ -405,7 +391,8 @@ def _steps(d: Demo, ctx: Ctx, a, model_mode: str, tmp: Path, admin) -> None:
         if not pid:
             job = wait(lambda: c.get(f"/ingest/jobs/{body['job_id']}", headers=H["admin"]).json(),
                        lambda j: j["status"] in ("done", "failed", "cancelled"), timeout=900 if model_mode == "live" else 120)
-            check(job["status"] == "done" and job.get("proposal_id"), f"generator job: {job['status']} {job.get('error')}")
+            check(job["status"] == "done" and job.get("proposal_id"),
+                  f"generator job: {job['status']} {job.get('error')} events={str(job.get('events'))[-1500:]}")
             pid = job["proposal_id"]
             d.fact(f"generator ({model_mode}) finished, cost ${job.get('cost_usd', 0):.4f}")
         pr = c.get(f"/ingest/proposals/{pid}", headers=H["admin"]).json()
