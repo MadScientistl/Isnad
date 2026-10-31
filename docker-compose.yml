@@ -3,7 +3,7 @@ services:
     build: ./docker/postgres
     image: isnad-postgres:18-postgis
     environment: {POSTGRES_USER: isnad, POSTGRES_PASSWORD: isnad, POSTGRES_DB: isnad}
-    ports: ["55441:5432"]
+    ports: ["127.0.0.1:55441:5432"]   # dev credentials (isnad/isnad, superuser): never expose beyond localhost
     volumes: [pgdata:/var/lib/postgresql]
     command: ["postgres", "-c", "shared_buffers=1GB", "-c", "max_wal_size=4GB"]
 volumes: {pgdata: {}}

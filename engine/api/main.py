@@ -386,6 +386,11 @@ def create_app(ontology_path: str | None = None, schema: str | None = None,
 
     app = FastAPI(title="Isnad ontology API", lifespan=lifespan)
     app.add_middleware(_BodyLimit, max_bytes=MAX_BODY_BYTES)
+    # DNS-rebinding guard: a page on another hostname that rebinds to 127.0.0.1 would send same-origin requests
+    # with an arbitrary x-role. Only these Host headers are served (override with ISNAD_ALLOWED_HOSTS=a,b).
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=[
+        h.strip() for h in os.environ.get("ISNAD_ALLOWED_HOSTS", "localhost,127.0.0.1,[::1],testserver").split(",") if h.strip()])
     app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
                        allow_methods=["*"], allow_headers=["*", "Authorization"])
     app.state.ontology = comp
